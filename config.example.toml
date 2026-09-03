@@ -1,0 +1,26 @@
+# droidpoold 配置示例。控制面跑在 devopt（192.168.14.32），节点只跑 docker。
+listen  = "0.0.0.0:8600"
+token   = "换成一个随机串"          # agent 与设备墙共用
+db_path = "/var/lib/droidpool/droidpool.db"
+
+default_ttl    = "4h"
+max_ttl        = "24h"
+warm_pool      = 2
+# 节点 swap 超过此值即拒绝新 claim。Phase 1 实测 swap 从 0 变正就是性能断崖
+# （N=12 起失败率 5.6%、p95 冲到 2.66×），CPU 与温度都没有预警价值。
+swap_guard_mib = 256
+
+[edge_default]
+host = "192.168.14.53"
+port = 8090
+
+[[nodes]]
+name        = "3588-a"
+docker_host = "ssh://sa@192.168.14.54"
+port_range  = [5561, 5576]
+# 实测活跃并发上限 10 台，取 8 留余量给设备墙截图与人工放大的 scrcpy
+max_devices = 8
+data_root   = "/data/droidpool"
+# 分辨率与密度 = 收银机实机 Sunmi D1s 2nd 实测（1366×768 @ 160 dpi）
+# use_memfd 不可省：.54 内核无 ashmem
+boot_args = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366 androidboot.redroid_height=768 androidboot.redroid_dpi=160 androidboot.redroid_gpu_mode=guest"
