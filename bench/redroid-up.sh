@@ -5,7 +5,8 @@
 set -eu
 NAME=$1; PORT=$2; DATA=${3:-/data/droidpool/$NAME}
 IMAGE=${IMAGE:-redroid/redroid:14.0.0_64only-latest}
-WIDTH=${WIDTH:-2560}; HEIGHT=${HEIGHT:-1600}; DPI=${DPI:-320}
+# 默认 profile = 收银机实机 Sunmi D1s 2nd 实测（2026-09-03 adb：wm size 1366x768，wm density 160）
+WIDTH=${WIDTH:-1366}; HEIGHT=${HEIGHT:-768}; DPI=${DPI:-160}
 ARGS=${ARGS:-"androidboot.use_memfd=true androidboot.redroid_width=$WIDTH androidboot.redroid_height=$HEIGHT androidboot.redroid_dpi=$DPI androidboot.redroid_gpu_mode=guest"}
 
 mkdir -p "$DATA"
