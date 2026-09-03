@@ -191,7 +191,17 @@ func parseHealth(out string) (*Health, error) {
 	}, nil
 }
 
-// UnderPressure 报告节点是否已进入换页状态，是则应拒绝新的 claim。
-func (h *Health) UnderPressure(swapGuardMiB int) bool {
-	return h.SwapUsedMiB > swapGuardMiB
+// UnderPressure 报告节点是否已没有余量再放一台设备进来。
+//
+// 判据是**可用内存**，不是 swap。Phase 1 里 swap 与失败率同时出现，一度让人
+// 以为 swap 是准入指标，但 swap_used 是滞后且黏滞的症状：一旦换出，页面不会
+// 自己换回来，压测结束几小时后读数依然很高，闸门会在盒子空着时一直关着
+// （实测残留 426 MiB，而当时可用内存有 10.9 GB）。
+// 真正的因果变量是「还装不装得下一台设备」——实测每台常驻约 1 GB，
+// 因此 minAvailMiB 取一台的量再留些余量。swap 仍然值得显示，但不做闸。
+func (h *Health) UnderPressure(minAvailMiB int) bool {
+	if minAvailMiB <= 0 {
+		return false
+	}
+	return h.MemAvailMiB < minAvailMiB
 }

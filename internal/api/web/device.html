@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>droidpool 设备</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#272b35;--fg:#e6e8ee;--dim:#8b93a7;
+      --ok:#3fb950;--busy:#d29922;--bad:#f85149;--acc:#58a6ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+a.back{color:var(--acc);text-decoration:none}
+h1{font-size:15px;margin:0;font-weight:600}
+.wrap{display:flex;gap:18px;padding:16px;align-items:flex-start;flex-wrap:wrap}
+.screen{position:relative;background:#000;border:1px solid var(--line);border-radius:8px;
+        overflow:hidden;cursor:crosshair;line-height:0;
+        /* 可收缩：宽屏时给侧栏让位，窄屏时占满并换行。
+           img 用百分比宽度，点击坐标按实际显示尺寸换算，缩放不影响准确性。 */
+        flex:1 1 640px;min-width:320px;max-width:1366px}
+.screen img{display:block;width:100%;height:auto}
+.side{flex:0 1 300px;min-width:260px;display:flex;flex-direction:column;gap:12px}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
+.panel h2{font-size:12px;margin:0 0 8px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;
+       padding:6px 11px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc)}
+button.warn{border-color:var(--busy);color:var(--busy)}
+.keys{display:flex;gap:6px;flex-wrap:wrap}
+input[type=text]{background:#0d1117;border:1px solid var(--line);color:var(--fg);
+                 border-radius:6px;padding:6px 9px;width:100%}
+dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
+dt{color:var(--dim)} dd{margin:0;word-break:break-all}
+.hint{color:var(--dim);font-size:12px;margin-top:6px}
+#flash{position:fixed;right:16px;bottom:16px;background:var(--card);border:1px solid var(--acc);
+       border-radius:6px;padding:8px 12px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
+#flash.show{opacity:1}
+#flash.err{border-color:var(--bad);color:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/">← 设备墙</a>
+  <h1 id="title">…</h1>
+  <label style="margin-left:auto;color:var(--dim);font-size:12px">
+    刷新 <select id="fps"><option value="0">暂停</option><option value="1000">1s</option>
+    <option value="600" selected>0.6s</option><option value="300">0.3s</option></select>
+  </label>
+</header>
+
+<div class="wrap">
+  <div class="screen" id="screen"><img id="shot" alt="设备画面"></div>
+  <div class="side">
+    <div class="panel">
+      <h2>租约</h2>
+      <dl id="info"><dt>加载中</dt><dd></dd></dl>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+        <button id="takeover" class="warn">接管</button>
+        <button id="release">强制释放</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>按键</h2>
+      <div class="keys">
+        <button data-key="back">返回</button>
+        <button data-key="home">主页</button>
+        <button data-key="apps">任务</button>
+        <button data-key="enter">回车</button>
+        <button data-key="del">退格</button>
+        <button data-key="up">↑</button>
+        <button data-key="down">↓</button>
+        <button data-key="left">←</button>
+        <button data-key="right">→</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>文本输入</h2>
+      <input type="text" id="text" placeholder="输入后回车发送（不支持中文，需设备端 IME）">
+      <div class="hint">点击画面 = 点按；按住拖动 = 滑动。坐标自动换算到设备分辨率。</div>
+    </div>
+  </div>
+</div>
+<div id="flash"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const id = decodeURIComponent(location.pathname.split('/').pop());
+$('#title').textContent = id;
+let devW = 0, devH = 0, timer = null, lease = null, sizeShown = false;
+
+function flash(msg, isErr){
+  const f = $('#flash'); f.textContent = msg; f.className = 'show' + (isErr ? ' err' : '');
+  setTimeout(() => f.className = '', 1400);
+}
+
+// 全分辨率取图（w=0），放大视图要看清细节
+let refreshing = false;
+async function refresh(){
+  if(refreshing) return;   // 上一帧还没回来就跳过，避免请求堆积
+  refreshing = true;
+  try{
+    const r = await fetch(`/api/devices/${encodeURIComponent(id)}/screenshot.jpg?w=0&q=75&t=${Date.now()}`);
+    if(!r.ok) throw new Error(r.status);
+    devW = +r.headers.get('X-Device-Width') || devW;
+    devH = +r.headers.get('X-Device-Height') || devH;
+    const url = URL.createObjectURL(await r.blob());
+    const next = new Image();
+    next.src = url;
+    await next.decode();          // 解码完成才换，避免闪烁
+    const img = $('#shot'), old = img.src;
+    img.src = url;
+    if(old.startsWith('blob:')) URL.revokeObjectURL(old);
+    if(!sizeShown && devW){ sizeShown = true; loadInfo(); }  // 首帧才知道分辨率
+  }catch(e){ /* 设备可能在重建，下一帧再说 */ }
+  finally{ refreshing = false; }
+}
+
+// 把浏览器里的点击换算成设备坐标：显示尺寸可能被 CSS 缩放过
+function toDevice(ev){
+  const img = $('#shot'), rect = img.getBoundingClientRect();
+  if(!devW || !rect.width) return null;
+  return {
+    x: Math.round((ev.clientX - rect.left) / rect.width * devW),
+    y: Math.round((ev.clientY - rect.top) / rect.height * devH)
+  };
+}
+
+async function send(body){
+  const r = await fetch(`/api/devices/${encodeURIComponent(id)}/input`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  if(!r.ok){ flash('操作失败: ' + r.status, true); return false; }
+  setTimeout(refresh, 250); // 操作后立刻看结果
+  return true;
+}
+
+let down = null;
+$('#screen').addEventListener('mousedown', e => { down = {...toDevice(e), t: Date.now()}; });
+$('#screen').addEventListener('mouseup', async e => {
+  const up = toDevice(e);
+  if(!down || !up) { down = null; return; }
+  const dist = Math.hypot(up.x - down.x, up.y - down.y);
+  const dt = Date.now() - down.t;
+  if(dist > 12){
+    await send({type:'swipe', x:down.x, y:down.y, x2:up.x, y2:up.y, ms:Math.max(120, Math.min(dt, 1200))});
+    flash(`滑动 ${down.x},${down.y} → ${up.x},${up.y}`);
+  }else{
+    await send({type:'tap', x:up.x, y:up.y});
+    flash(`点击 ${up.x},${up.y}`);
+  }
+  down = null;
+});
+
+document.querySelectorAll('[data-key]').forEach(b => {
+  b.onclick = async () => { if(await send({type:'key', key:b.dataset.key})) flash('按键 ' + b.textContent); };
+});
+$('#text').addEventListener('keydown', async e => {
+  if(e.key !== 'Enter') return;
+  const v = e.target.value;
+  if(!v) return;
+  if(await send({type:'text', text:v})){ flash('已输入'); e.target.value = ''; }
+});
+
+async function loadInfo(){
+  const r = await fetch('/api/wall');
+  if(!r.ok) return;
+  const j = await r.json();
+  const d = (j.devices||[]).find(x => x.id === id);
+  if(!d) return;
+  lease = d.lease_id || null;
+  $('#info').innerHTML = `
+    <dt>状态</dt><dd>${d.state}</dd>
+    <dt>adb</dt><dd>${d.adb_addr}</dd>
+    <dt>分辨率</dt><dd>${devW ? devW+'×'+devH : '读取中…'}</dd>
+    ${d.worktree ? `<dt>worktree</dt><dd>${d.worktree}</dd>
+    <dt>分支</dt><dd>${d.branch||''} ${d.head_sha||''}</dd>
+    <dt>持有者</dt><dd>${d.owner||''}</dd>` : '<dt>租约</dt><dd>空闲</dd>'}
+    ${d.human ? `<dt>接管</dt><dd style="color:var(--busy)">进行中 ${d.note||''}</dd>` : ''}`;
+  $('#takeover').textContent = d.human ? '交还' : '接管';
+  $('#takeover').disabled = !lease;
+  $('#release').disabled = !lease;
+  $('#takeover').dataset.on = d.human ? '1' : '';
+}
+
+$('#takeover').onclick = async () => {
+  if(!lease) return;
+  const on = !$('#takeover').dataset.on;
+  const r = await fetch(`/api/leases/${encodeURIComponent(lease)}/human`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({takeover: on, note: on ? '设备墙人工接管' : ''})
+  });
+  flash(r.ok ? (on ? '已接管，agent 应停手' : '已交还') : '操作失败', !r.ok);
+  loadInfo();
+};
+$('#release').onclick = async () => {
+  if(!lease || !confirm('强制释放这台设备？持有它的 agent 会失去设备。')) return;
+  const r = await fetch(`/api/leases/${encodeURIComponent(lease)}`, {method:'DELETE'});
+  flash(r.ok ? '已释放' : '释放失败', !r.ok);
+  loadInfo();
+};
+
+function schedule(){
+  if(timer) clearInterval(timer);
+  const ms = +$('#fps').value;
+  if(ms) timer = setInterval(refresh, ms);
+}
+$('#fps').onchange = schedule;
+
+refresh(); loadInfo(); schedule();
+setInterval(loadInfo, 5000);
+</script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 package api
 
 import (
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,9 @@ import (
 	"github.com/fancyCachier/droidpool/internal/store"
 )
 
+//go:embed web/*.html
+var webFS embed.FS
+
 // Clock 便于测试注入时间。
 type Clock func() time.Time
 
@@ -24,15 +28,19 @@ type NodeHealth interface {
 }
 
 type Server struct {
-	Store        *store.Store
-	Token        string
-	DefaultTTL   time.Duration
-	MaxTTL       time.Duration
-	SwapGuardMiB int
-	Now          Clock
-	Health       NodeHealth // 可为 nil（无节点健康源时跳过准入检查）
-	NewID        func() string
-	Log          *slog.Logger
+	Store       *store.Store
+	Token       string
+	DefaultTTL  time.Duration
+	MaxTTL      time.Duration
+	MinAvailMiB int
+	Now         Clock
+	Health      NodeHealth // 可为 nil（无节点健康源时跳过准入检查）
+	NewID       func() string
+	Log         *slog.Logger
+	// Screen 提供截图与输入注入；为 nil 时设备墙的图像与操作接口返回 503，
+	// 租约接口不受影响。
+	Screen Screener
+	shots  shotCache
 }
 
 func (s *Server) now() time.Time {
@@ -59,7 +67,28 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/leases/{id}/human", s.auth(s.handleHuman))
 	mux.Handle("DELETE /api/leases/{id}", s.auth(s.handleRelease))
 	mux.Handle("GET /api/devices", s.auth(s.handleListDevices))
+
+	// 设备墙：内网工具，不鉴权。
+	// agent 侧的租约接口仍要 token（它们会改变谁持有哪台机器）；
+	// 设备墙只是给同一内网的操作人员看画面、点屏幕，加 token 只会挡住自己人。
+	mux.HandleFunc("GET /api/wall", s.handleWallData)
+	mux.HandleFunc("GET /api/devices/{id}/screenshot.jpg", s.handleScreenshot)
+	mux.HandleFunc("POST /api/devices/{id}/input", s.handleInput)
+	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
+	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
 	return mux
+}
+
+func (s *Server) servePage(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		b, err := webFS.ReadFile(name)
+		if err != nil {
+			http.Error(w, "页面缺失", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(b)
+	}
 }
 
 // auth 校验 Bearer token。内网工具不做用户体系，agent 与设备墙共用一个 token。
@@ -106,7 +135,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	if s.Health != nil {
 		if h, err := s.Health.Health(); err == nil {
 			resp["node"] = h
-			resp["under_pressure"] = h.UnderPressure(s.SwapGuardMiB)
+			resp["under_pressure"] = h.UnderPressure(s.MinAvailMiB)
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -159,11 +188,11 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// 失败率立刻从 0 跳到 5.6%，再放人进来只会一起变慢。
 	// 幂等复用不受此限——那不占新设备。
 	if s.Health != nil {
-		if h, err := s.Health.Health(); err == nil && h.UnderPressure(s.SwapGuardMiB) {
+		if h, err := s.Health.Health(); err == nil && h.UnderPressure(s.MinAvailMiB) {
 			if _, err := s.Store.GetLeaseByWorktree(req.Host, req.Worktree); errors.Is(err, store.ErrNotFound) {
 				writeJSON(w, http.StatusServiceUnavailable, errBody{
 					Error:   "under_pressure",
-					Message: fmt.Sprintf("节点正在换页（swap %d MiB > %d MiB），暂不接受新租约", h.SwapUsedMiB, s.SwapGuardMiB),
+					Message: fmt.Sprintf("节点内存不足（可用 %d MiB < %d MiB），暂不接受新租约", h.MemAvailMiB, s.MinAvailMiB),
 				})
 				return
 			}

@@ -34,11 +34,12 @@ type Config struct {
 	// ReapInterval watchdog 巡检间隔。
 	ReapInterval Duration `toml:"reap_interval"`
 	WarmPool     int      `toml:"warm_pool"`
-	// SwapGuardMiB 节点 swap 超过此值即拒绝新 claim。Phase 1 实测 swap 从 0 变正
-	// 就是性能断崖（N=12 起失败率 5.6%），比 CPU / 温度更有预警价值。
-	SwapGuardMiB int        `toml:"swap_guard_mib"`
-	EdgeDefault  EdgeTarget `toml:"edge_default"`
-	Nodes        []Node     `toml:"nodes"`
+	// MinAvailMiB 节点可用内存低于此值即拒绝新 claim。
+	// 实测每台设备常驻约 1 GB，默认 2048 留一台的量加余量。
+	// 不用 swap 做闸——它是滞后且黏滞的症状，见 node.Health.UnderPressure。
+	MinAvailMiB int        `toml:"min_avail_mib"`
+	EdgeDefault EdgeTarget `toml:"edge_default"`
+	Nodes       []Node     `toml:"nodes"`
 }
 
 type EdgeTarget struct {
@@ -108,8 +109,8 @@ func (c *Config) applyDefaults() {
 	if c.ReapInterval.Duration == 0 {
 		c.ReapInterval.Duration = time.Minute
 	}
-	if c.SwapGuardMiB == 0 {
-		c.SwapGuardMiB = 256
+	if c.MinAvailMiB == 0 {
+		c.MinAvailMiB = 2048
 	}
 	if c.EdgeDefault.Port == 0 {
 		c.EdgeDefault.Port = 8090

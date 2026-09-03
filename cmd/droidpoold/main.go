@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fancyCachier/droidpool/internal/adb"
 	"github.com/fancyCachier/droidpool/internal/api"
 	"github.com/fancyCachier/droidpool/internal/config"
 	"github.com/fancyCachier/droidpool/internal/node"
@@ -79,12 +80,24 @@ func run() error {
 		"空闲超时", cfg.IdleTimeout.Duration, "生命周期上限", cfg.MaxLifetime.Duration)
 	go reaper.Run(ctx)
 
+	// 设备墙的截图与输入都走本机 adb。启动时把已知设备都 connect 一遍，
+	// 省得第一次看墙时全是空图。
+	adbc := adb.New(os.Getenv("ADB_BIN"))
+	if ds, err := st.ListDevices(); err == nil {
+		for _, d := range ds {
+			if err := adbc.Connect(ctx, d.ADBAddr); err != nil {
+				log.Warn("adb 连接失败", "device", d.ID, "addr", d.ADBAddr, "err", err)
+			}
+		}
+	}
+
 	srv := &api.Server{
 		Store: st, Token: cfg.Token,
 		DefaultTTL: cfg.DefaultTTL.Duration, MaxTTL: cfg.MaxTTL.Duration,
-		SwapGuardMiB: cfg.SwapGuardMiB,
-		Health:       healthAdapter{nd},
-		Log:          log,
+		MinAvailMiB: cfg.MinAvailMiB,
+		Health:      healthAdapter{nd},
+		Log:         log,
+		Screen:      adbc,
 	}
 	h := &http.Server{
 		Addr:              cfg.Listen,
