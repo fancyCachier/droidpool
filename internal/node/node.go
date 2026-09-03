@@ -32,7 +32,7 @@ func (r ExecRunner) Run(ctx context.Context, name string, args ...string) (strin
 // Node 一个设备节点。
 type Node struct {
 	Name       string
-	DockerHost string // ssh://sa@192.168.14.54
+	DockerHost string // 如 ssh://user@node-host
 	ADBHost    string
 	Image      string
 	DataRoot   string

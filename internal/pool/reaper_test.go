@@ -53,7 +53,7 @@ func (f *fakeResetter) Reset(_ context.Context, deviceID string) error {
 // expiredLease 造一条 TTL 已过期的租约（回收器应当收走它）。
 func expiredLease(id string) *Lease {
 	past := time.Now().Add(-time.Hour)
-	return &Lease{ID: id, Owner: "woo@mac", Worktree: "wt-" + id,
+	return &Lease{ID: id, Owner: "dev@mac", Worktree: "wt-" + id,
 		CreatedAt: past, ExpiresAt: past.Add(time.Minute), LastSeenAt: past}
 }
 
@@ -190,13 +190,13 @@ func TestRunReapsOnTick(t *testing.T) {
 func TestReaperIdleGateCatchesZombieAgent(t *testing.T) {
 	now := time.Now()
 	zombie := &Lease{
-		ID: "Z1", Owner: "woo@mac", Worktree: "wt-zombie",
+		ID: "Z1", Owner: "dev@mac", Worktree: "wt-zombie",
 		CreatedAt:  now.Add(-90 * time.Minute),
 		ExpiresAt:  now.Add(2 * time.Hour), // TTL 还剩 2 小时
 		LastSeenAt: now.Add(-45 * time.Minute),
 	}
 	busy := &Lease{
-		ID: "B1", Owner: "woo@linux", Worktree: "wt-busy",
+		ID: "B1", Owner: "dev@linux", Worktree: "wt-busy",
 		CreatedAt:  now.Add(-90 * time.Minute),
 		ExpiresAt:  now.Add(2 * time.Hour),
 		LastSeenAt: now.Add(-1 * time.Minute), // 一分钟前还在干活

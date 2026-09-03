@@ -49,7 +49,7 @@ type EdgeTarget struct {
 
 type Node struct {
 	Name       string `toml:"name"`
-	DockerHost string `toml:"docker_host"` // ssh://sa@192.168.14.54
+	DockerHost string `toml:"docker_host"` // 如 ssh://user@node-host
 	ADBHost    string `toml:"adb_host"`
 	PortRange  [2]int `toml:"port_range"`
 	MaxDevices int    `toml:"max_devices"`

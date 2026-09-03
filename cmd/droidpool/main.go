@@ -119,10 +119,14 @@ func main() {
 		usage()
 		return
 	}
-	base := envOr("DROIDPOOL_URL", "http://192.168.14.32:8600")
+	// 不给内网默认值：这是开源项目，偷偷回退到某个 IP 只会让外部用户连到别人的内网
+	base := os.Getenv("DROIDPOOL_URL")
+	if base == "" {
+		fatal("未设置 DROIDPOOL_URL（控制面地址，如 http://droidpool.example:8600）")
+	}
 	token := os.Getenv("DROIDPOOL_TOKEN")
 	if token == "" {
-		fatal("未设置 DROIDPOOL_TOKEN")
+		fatal("未设置 DROIDPOOL_TOKEN（在控制面的 /opt/droidpool/env 里）")
 	}
 	c := &client{base: strings.TrimRight(base, "/"), token: token}
 
@@ -268,10 +272,13 @@ const cashierPkg = "cn.daboshi.cashier_app.dev"
 // run-as 里相对路径的 cwd 不可靠，一律 push 到 /data/local/tmp 再用绝对路径 cp。
 func cmdSeedEdge(args []string) {
 	fs := flag.NewFlagSet("seed-edge", flag.ExitOnError)
-	host := fs.String("host", envOr("DROIDPOOL_EDGE_HOST", "192.168.14.53"), "Edge 主机")
+	host := fs.String("host", os.Getenv("DROIDPOOL_EDGE_HOST"), "Edge 主机（或设 DROIDPOOL_EDGE_HOST）")
 	port := fs.Int("port", 8090, "Edge 端口")
 	pkg := fs.String("pkg", cashierPkg, "应用包名")
 	fs.Parse(args)
+	if *host == "" {
+		fatal("未指定 Edge 主机：--host 或 DROIDPOOL_EDGE_HOST")
+	}
 
 	pin, err := edgeCertPin(*host, *port)
 	if err != nil {
@@ -457,13 +464,6 @@ func cmdDevices(c *client) {
 	}
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
 func fatal(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", a...)
 	os.Exit(1)
@@ -478,15 +478,16 @@ func usage() {
   release   归还设备
   devices   列出池中所有设备
   seed-edge 给已装的 cashier-app 写 Edge 端点 + 证书 pin（免走引导页）
-            [--host 192.168.14.53] [--port 8090]
+            [--host <edge-host>] [--port 8090]，或设 DROIDPOOL_EDGE_HOST
   run       一步到位：装包 → seed-edge → 启动 → 自动过引导页到登录页
             [--apk build/app/outputs/flutter-apk/app-debug.apk] [--no-seed] [--no-onboard]
   heartbeat 发一次心跳（告诉 watchdog 自己还活着）
   watch     持续心跳，跑长任务时后台挂着，防止被空闲闸回收
 
 环境变量:
-  DROIDPOOL_URL     控制面地址（默认 http://192.168.14.32:8600）
-  DROIDPOOL_TOKEN   鉴权 token（必填）
+  DROIDPOOL_URL       控制面地址（必填，如 http://droidpool.example:8600）
+  DROIDPOOL_TOKEN     鉴权 token（必填）
+  DROIDPOOL_EDGE_HOST seed-edge / run 写入的后端主机（或用 --host）
   DROIDPOOL_HEARTBEAT_SEC  watch 的心跳间隔秒数（默认 60）
 
 watchdog：控制面会回收「久未活动」的租约（默认空闲 30 分钟），防止 agent

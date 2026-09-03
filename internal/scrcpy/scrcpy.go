@@ -45,7 +45,7 @@ type Frame struct {
 
 // Options 会话参数。
 type Options struct {
-	Serial    string // adb 设备序列号，如 192.168.14.54:5561
+	Serial    string // adb 设备序列号，如 node-host:5561
 	ADBPath   string // 默认 "adb"
 	ServerJar string // 本机 scrcpy-server jar 路径
 	LocalPort int    // adb forward 用的本机端口

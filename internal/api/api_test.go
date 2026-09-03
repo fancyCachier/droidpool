@@ -80,7 +80,7 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 }
 
 func claimBody(host, wt string) map[string]any {
-	return map[string]any{"owner": "woo@" + host, "host": host, "worktree": wt, "branch": "fix/x", "head_sha": "abc"}
+	return map[string]any{"owner": "dev@" + host, "host": host, "worktree": wt, "branch": "fix/x", "head_sha": "abc"}
 }
 
 func TestAuthRequired(t *testing.T) {

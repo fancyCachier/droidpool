@@ -40,7 +40,7 @@ func seedReady(t *testing.T, s *Store, n int) {
 func newLease(id, host, wt string, ttl time.Duration) *pool.Lease {
 	now := time.Now().Truncate(time.Second)
 	return &pool.Lease{
-		ID: id, Owner: "woo@" + host, Host: host, Worktree: wt,
+		ID: id, Owner: "dev@" + host, Host: host, Worktree: wt,
 		Branch: "fix/x", HeadSHA: "abc1234",
 		CreatedAt: now, ExpiresAt: now.Add(ttl),
 	}
