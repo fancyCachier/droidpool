@@ -251,3 +251,37 @@ func TestReaperMaxLifetimeGate(t *testing.T) {
 		t.Errorf("持有超过 24h 应被硬上限回收，得到 n=%d released=%v", n, fs.released)
 	}
 }
+
+// watchdog 收走设备是 agent 看不到的变更（它已经僵死了），必须能推给设备墙。
+func TestReapOnceNotifiesWithReason(t *testing.T) {
+	now := time.Now()
+	fs := &fakeLeaseStore{active: []*Lease{
+		expiredLease("L1"),
+		{ID: "Z1", CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour), LastSeenAt: now.Add(-time.Hour)},
+	}}
+	type note struct {
+		lease, dev string
+		reason     ReapReason
+	}
+	var got []note
+	r := &Reaper{
+		Store: fs, IdleTimeout: 30 * time.Minute, Log: quietLogger(),
+		OnReap: func(l, d string, reason ReapReason) { got = append(got, note{l, d, reason}) },
+	}
+	if _, err := r.ReapOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("两条都该通知，得到 %+v", got)
+	}
+	// 原因要能区分：TTL 到期是正常收尾，空闲超时说明 agent 僵死了
+	if got[0].reason != ReapExpired {
+		t.Errorf("L1 应报 ttl_expired，得到 %q", got[0].reason)
+	}
+	if got[1].reason != ReapIdle {
+		t.Errorf("Z1 应报 idle_timeout，得到 %q", got[1].reason)
+	}
+	if got[0].dev != "dev-L1" {
+		t.Errorf("应带上设备 id，得到 %q", got[0].dev)
+	}
+}

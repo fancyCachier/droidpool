@@ -99,11 +99,9 @@ function updateCard(el, d){
   if(d.human) l3.textContent = `⚠ 人工接管中 ${d.note||''}`;
 }
 
-async function loadData(){
-  try{
-    const r = await fetch('/api/wall');
-    const j = await r.json();
-    devices = j.devices || [];
+function applySnapshot(j){
+  if(!j || j.error) return;
+  devices = j.devices || [];
     $('#empty').hidden = devices.length > 0;
     const n = j.node;
     $('#node').innerHTML = n
@@ -113,8 +111,40 @@ async function loadData(){
          <span>负载 <b>${n.Load1}</b></span>
          ${j.under_pressure?'<span class="warn">内存不足，暂不接受新租约</span>':''}`
       : '<span>节点数据不可用</span>';
-    reconcile();
-  }catch(e){ $('#node').innerHTML = `<span class="warn">控制面连不上：${e}</span>`; }
+  reconcile();
+}
+
+// 实时通道：状态变更立刻到，不必等下一次轮询。
+// 画面仍走 HTTP 拉取——图是二进制，塞进 SSE 要 base64 膨胀三分之一。
+let es = null, pollTimer = null;
+function connectSSE(){
+  es = new EventSource('/api/events');
+  es.onmessage = e => { try{ applySnapshot(JSON.parse(e.data).data); }catch(_){} };
+  ['snapshot','tick','claim','release','human','reap'].forEach(k =>
+    es.addEventListener(k, e => {
+      try{
+        const ev = JSON.parse(e.data);
+        applySnapshot(ev.data);
+        if(k === 'reap') toast(`watchdog 回收了 ${ev.data && ''}设备（${(ev.data&&ev.data.reason)||''}）`);
+      }catch(_){}
+    }));
+  es.onerror = () => {
+    $('#node').innerHTML = '<span class="warn">实时通道断开，改用轮询…</span>';
+    // EventSource 自己会重连；同时兜一层轮询，避免代理不透传 SSE 时整页不更新
+    if(!pollTimer) pollTimer = setInterval(fallbackPoll, 5000);
+  };
+  es.onopen = () => { if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } };
+}
+async function fallbackPoll(){
+  try{ applySnapshot(await (await fetch('/api/wall')).json()); }catch(_){}
+}
+function toast(msg){
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = 'position:fixed;right:16px;bottom:16px;background:#181b22;border:1px solid #58a6ff;'
+    + 'border-radius:6px;padding:8px 12px;font-size:13px;z-index:99';
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
 }
 
 // 只增删变化的卡片，其余原地更新
@@ -169,8 +199,7 @@ function schedule(){
 }
 $('#fps').onchange = schedule;
 
-loadData(); schedule();
-setInterval(loadData, 3000);   // 文字信息单独轮询，不影响画面
+connectSSE(); schedule();
 </script>
 </body>
 </html>

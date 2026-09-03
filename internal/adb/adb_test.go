@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeRunner struct {
@@ -211,8 +213,8 @@ func TestAlive(t *testing.T) {
 	}
 }
 
-// 并发截图必须串行化：多路并发打同一个 adb server 会拿到半截数据，
-// 设备墙上表现为花屏。
+// 保留：同一设备并发时的串行化（与 TestSameDeviceStillSerialized 互补，
+// 这条走 ScreencapPNG 的完整路径）。
 func TestConcurrentCallsAreSerialized(t *testing.T) {
 	var (
 		mu                sync.Mutex
@@ -246,4 +248,111 @@ type runnerFunc func(context.Context, ...string) ([]byte, error)
 
 func (f runnerFunc) Output(ctx context.Context, args ...string) ([]byte, error) {
 	return f(ctx, args...)
+}
+
+func TestPassthroughSkipsTranscode(t *testing.T) {
+	raw := pngOf(1366, 768)
+	f := &fakeRunner{out: map[string][]byte{"screencap": raw}}
+	c := newClient(f)
+	got, size, err := c.ScreenshotPassthrough(context.Background(), "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 必须是原样字节：任何再编码都会把每帧成本从 0.35s 推到 0.65s
+	if !bytes.Equal(got, raw) {
+		t.Errorf("应原样返回设备的 PNG，得到 %d 字节 vs 原始 %d", len(got), len(raw))
+	}
+	if size.X != 1366 || size.Y != 768 {
+		t.Errorf("应从 PNG 头读出 1366x768，得到 %v", size)
+	}
+}
+
+func TestPassthroughRejectsNonPNG(t *testing.T) {
+	for _, bad := range [][]byte{
+		{},
+		[]byte("not a png at all"),
+		append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 4)...), // 头对但被截断
+	} {
+		f := &fakeRunner{out: map[string][]byte{"screencap": bad}}
+		if _, _, err := newClient(f).ScreenshotPassthrough(context.Background(), "d"); err == nil {
+			t.Errorf("非法数据（%d 字节）应报错而不是当成有效帧推给浏览器", len(bad))
+		}
+	}
+}
+
+func TestPNGSizeParsesHeaderOnly(t *testing.T) {
+	sz, ok := pngSize(pngOf(800, 600))
+	if !ok || sz.X != 800 || sz.Y != 600 {
+		t.Errorf("pngSize = %v, %v，期望 800x600", sz, ok)
+	}
+	if _, ok := pngSize([]byte("\x89PNG\r\n\x1a\n")); ok {
+		t.Error("长度不足时应返回 false")
+	}
+}
+
+// 不同设备之间不该互相排队：用一把全局锁会让设备墙的帧率被除以设备数。
+func TestDifferentDevicesCaptureInParallel(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		inFlight int
+		maxSeen  int
+	)
+	c := &Client{Runner: runnerFunc(func(_ context.Context, _ ...string) ([]byte, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxSeen {
+			maxSeen = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return pngOf(64, 48), nil
+	})}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c.ScreencapPNG(context.Background(), fmt.Sprintf("dev-%d:5561", i))
+		}(i)
+	}
+	wg.Wait()
+	if maxSeen < 2 {
+		t.Errorf("不同设备应能并行抓图，实测最大并发只有 %d", maxSeen)
+	}
+}
+
+// 同一台设备仍必须串行：并发 screencap 会拿到半截数据，画面花屏。
+func TestSameDeviceStillSerialized(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		inFlight int
+		maxSeen  int
+	)
+	c := &Client{Runner: runnerFunc(func(_ context.Context, _ ...string) ([]byte, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxSeen {
+			maxSeen = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return pngOf(64, 48), nil
+	})}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); c.ScreencapPNG(context.Background(), "same:5561") }()
+	}
+	wg.Wait()
+	if maxSeen > 1 {
+		t.Errorf("同一设备上同时有 %d 个抓图在跑，会花屏", maxSeen)
+	}
 }

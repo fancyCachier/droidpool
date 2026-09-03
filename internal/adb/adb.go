@@ -38,9 +38,11 @@ func (r execRunner) Output(ctx context.Context, args ...string) ([]byte, error) 
 
 type Client struct {
 	Runner Runner
-	// mu 串行化对同一 adb server 的调用。多个截图并发跑时 adb server 容易
-	// 返回半截数据，设备墙上表现为花屏。
-	mu sync.Mutex
+	// 按设备加锁，而不是一把全局锁。同一台设备上并发 screencap 会拿到半截
+	// 数据（设备墙上表现为花屏），但不同设备之间没有这个问题——用全局锁会
+	// 把 N 台设备的抓图排成一队，设备墙的帧率被硬生生除以 N。
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
 }
 
 func New(bin string) *Client {
@@ -50,17 +52,31 @@ func New(bin string) *Client {
 	return &Client{Runner: execRunner{bin: bin}}
 }
 
-func (c *Client) run(ctx context.Context, serial string, args ...string) ([]byte, error) {
+// lockFor 取某台设备的锁，按需创建。
+func (c *Client) lockFor(serial string) *sync.Mutex {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.locks == nil {
+		c.locks = map[string]*sync.Mutex{}
+	}
+	m, ok := c.locks[serial]
+	if !ok {
+		m = &sync.Mutex{}
+		c.locks[serial] = m
+	}
+	return m
+}
+
+func (c *Client) run(ctx context.Context, serial string, args ...string) ([]byte, error) {
+	m := c.lockFor(serial)
+	m.Lock()
+	defer m.Unlock()
 	full := append([]string{"-s", serial}, args...)
 	return c.Runner.Output(ctx, full...)
 }
 
 // Connect 连接网络设备（幂等，已连时也返回成功）。
 func (c *Client) Connect(ctx context.Context, addr string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	out, err := c.Runner.Output(ctx, "connect", addr)
 	if err != nil {
 		return err
@@ -74,6 +90,37 @@ func (c *Client) Connect(ctx context.Context, addr string) error {
 // ScreencapPNG 抓一张全分辨率截图（PNG）。
 func (c *Client) ScreencapPNG(ctx context.Context, serial string) ([]byte, error) {
 	return c.run(ctx, serial, "exec-out", "screencap", "-p")
+}
+
+// pngSize 从 PNG 头部读出宽高，不做全图解码。
+// IHDR 紧跟 8 字节签名，宽高各 4 字节大端。
+func pngSize(b []byte) (image.Point, bool) {
+	if len(b) < 24 || string(b[1:4]) != "PNG" {
+		return image.Point{}, false
+	}
+	w := int(b[16])<<24 | int(b[17])<<16 | int(b[18])<<8 | int(b[19])
+	h := int(b[20])<<24 | int(b[21])<<16 | int(b[22])<<8 | int(b[23])
+	if w <= 0 || h <= 0 {
+		return image.Point{}, false
+	}
+	return image.Point{X: w, Y: h}, true
+}
+
+// ScreenshotPassthrough 原样返回设备给出的 PNG，只从头部读尺寸。
+//
+// 全分辨率场景（放大操作视图）不需要缩放，解码再编码是纯浪费：实测
+// adb 抓一帧 0.35 s，而服务端转码又要 0.3 s，帧率直接对半砍。
+// 直通后帧时间就等于 adb 的 0.35 s。
+func (c *Client) ScreenshotPassthrough(ctx context.Context, serial string) ([]byte, image.Point, error) {
+	raw, err := c.ScreencapPNG(ctx, serial)
+	if err != nil {
+		return nil, image.Point{}, err
+	}
+	size, ok := pngSize(raw)
+	if !ok {
+		return nil, image.Point{}, fmt.Errorf("设备返回的不是合法 PNG（可能正在重启），%d 字节", len(raw))
+	}
+	return raw, size, nil
 }
 
 // ScreenshotJPEG 抓图并缩放成 JPEG。设备墙上一屏几台设备，全分辨率 PNG

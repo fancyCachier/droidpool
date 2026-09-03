@@ -13,26 +13,38 @@ body{margin:0;background:var(--bg);color:var(--fg);
 header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 a.back{color:var(--acc);text-decoration:none}
 h1{font-size:15px;margin:0;font-weight:600}
+.live{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px}
+.live .dot{width:7px;height:7px;border-radius:50%;background:var(--bad)}
+.live.on .dot{background:var(--ok)}
 .wrap{display:flex;gap:18px;padding:16px;align-items:flex-start;flex-wrap:wrap}
 .screen{position:relative;background:#000;border:1px solid var(--line);border-radius:8px;
-        overflow:hidden;cursor:crosshair;line-height:0;
-        /* 可收缩：宽屏时给侧栏让位，窄屏时占满并换行。
-           img 用百分比宽度，点击坐标按实际显示尺寸换算，缩放不影响准确性。 */
-        flex:1 1 640px;min-width:320px;max-width:1366px}
-.screen img{display:block;width:100%;height:auto}
+        overflow:hidden;line-height:0;flex:1 1 640px;min-width:320px;max-width:1366px}
+canvas{display:block;width:100%;height:auto;cursor:crosshair;touch-action:none;user-select:none}
 .side{flex:0 1 300px;min-width:260px;display:flex;flex-direction:column;gap:12px}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}
-.panel h2{font-size:12px;margin:0 0 8px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.panel h2{font-size:12px;margin:0 0 9px;color:var(--dim);font-weight:600;letter-spacing:.04em}
 button{background:#21262d;color:var(--fg);border:1px solid var(--line);border-radius:6px;
-       padding:6px 11px;cursor:pointer;font-size:13px}
-button:hover{border-color:var(--acc)}
+       padding:7px 10px;cursor:pointer;font-size:13px;display:inline-flex;align-items:center;
+       justify-content:center;gap:5px}
+button:hover{border-color:var(--acc);background:#262c36}
+button:active{transform:scale(.95);border-color:var(--acc)}
+button:disabled{opacity:.4;cursor:not-allowed}
 button.warn{border-color:var(--busy);color:var(--busy)}
-.keys{display:flex;gap:6px;flex-wrap:wrap}
+button svg{width:16px;height:16px;flex:none}
+/* 三大金刚独占第一行 */
+.nav3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-bottom:7px}
+.nav3 button{padding:9px 0}
+.keys2{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}
+.dpad{display:grid;grid-template-columns:repeat(3,34px);grid-template-rows:repeat(3,34px);
+      gap:5px;justify-content:center;margin-top:9px}
+.dpad button{padding:0}
+.dpad .sp{visibility:hidden}
 input[type=text]{background:#0d1117;border:1px solid var(--line);color:var(--fg);
-                 border-radius:6px;padding:6px 9px;width:100%}
+                 border-radius:6px;padding:7px 9px;width:100%}
 dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13px}
 dt{color:var(--dim)} dd{margin:0;word-break:break-all}
-.hint{color:var(--dim);font-size:12px;margin-top:6px}
+.hint{color:var(--dim);font-size:12px;margin-top:7px;line-height:1.45}
+.fps{font-size:11px;color:var(--dim);margin-left:6px}
 #flash{position:fixed;right:16px;bottom:16px;background:var(--card);border:1px solid var(--acc);
        border-radius:6px;padding:8px 12px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
 #flash.show{opacity:1}
@@ -43,14 +55,12 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
 <header>
   <a class="back" href="/">← 设备墙</a>
   <h1 id="title">…</h1>
-  <label style="margin-left:auto;color:var(--dim);font-size:12px">
-    刷新 <select id="fps"><option value="0">暂停</option><option value="1000">1s</option>
-    <option value="600" selected>0.6s</option><option value="300">0.3s</option></select>
-  </label>
+  <span class="live" id="live"><span class="dot"></span><span class="txt">连接中</span></span>
+  <span class="fps" id="fpsnow"></span>
 </header>
 
 <div class="wrap">
-  <div class="screen" id="screen"><img id="shot" alt="设备画面"></div>
+  <div class="screen"><canvas id="cv" width="1366" height="768"></canvas></div>
   <div class="side">
     <div class="panel">
       <h2>租约</h2>
@@ -60,24 +70,77 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
         <button id="release">强制释放</button>
       </div>
     </div>
+
     <div class="panel">
-      <h2>按键</h2>
-      <div class="keys">
-        <button data-key="back">返回</button>
-        <button data-key="home">主页</button>
-        <button data-key="apps">任务</button>
-        <button data-key="enter">回车</button>
-        <button data-key="del">退格</button>
-        <button data-key="up">↑</button>
-        <button data-key="down">↓</button>
-        <button data-key="left">←</button>
-        <button data-key="right">→</button>
+      <h2>控制</h2>
+      <div class="nav3">
+        <button data-key="back" title="返回">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>
+          返回</button>
+        <button data-key="home" title="主页">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>
+          主页</button>
+        <button data-key="apps" title="任务">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+          任务</button>
+      </div>
+      <div class="keys2">
+        <button data-key="enter" title="回车">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="m9 10-5 5 5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg></button>
+        <button data-key="del" title="退格">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2"/><path d="m18 9-6 6"/><path d="m12 9 6 6"/></svg></button>
+        <button data-key="volup" title="音量+">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/></svg></button>
+        <button data-key="voldn" title="音量-">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="m23 9-6 6"/><path d="m17 9 6 6"/></svg></button>
+      </div>
+      <div class="dpad">
+        <span class="sp"></span>
+        <button data-key="up" title="上">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg></button>
+        <span class="sp"></span>
+        <button data-key="left" title="左">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
+        <button data-key="power" title="电源">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/></svg></button>
+        <button data-key="right" title="右">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
+        <span class="sp"></span>
+        <button data-key="down" title="下">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+        <span class="sp"></span>
       </div>
     </div>
+
+    <div class="panel">
+      <h2>截图</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button id="snap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/></svg>
+          保存 PNG</button>
+        <button id="copy">复制到剪贴板</button>
+      </div>
+      <div class="hint">保存当前这一帧的原始分辨率画面到浏览器下载目录。</div>
+    </div>
+
     <div class="panel">
       <h2>文本输入</h2>
-      <input type="text" id="text" placeholder="输入后回车发送（不支持中文，需设备端 IME）">
-      <div class="hint">点击画面 = 点按；按住拖动 = 滑动。坐标自动换算到设备分辨率。</div>
+      <input type="text" id="text" placeholder="输入后回车发送">
+      <div class="hint">点击画面 = 点按，按住拖动 = 滑动，滚轮 = 上下滑。<br>
+        文本不支持中文（需设备端 IME）。</div>
     </div>
   </div>
 </div>
@@ -87,42 +150,138 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
 const $ = s => document.querySelector(s);
 const id = decodeURIComponent(location.pathname.split('/').pop());
 $('#title').textContent = id;
-let devW = 0, devH = 0, timer = null, lease = null, sizeShown = false;
+
+const cv = $('#cv'), ctx = cv.getContext('2d', {alpha:false});
+let devW = 1366, devH = 768, lease = null;
 
 function flash(msg, isErr){
   const f = $('#flash'); f.textContent = msg; f.className = 'show' + (isErr ? ' err' : '');
   setTimeout(() => f.className = '', 1400);
 }
-
-// 全分辨率取图（w=0），放大视图要看清细节
-let refreshing = false;
-async function refresh(){
-  if(refreshing) return;   // 上一帧还没回来就跳过，避免请求堆积
-  refreshing = true;
-  try{
-    const r = await fetch(`/api/devices/${encodeURIComponent(id)}/screenshot.jpg?w=0&q=75&t=${Date.now()}`);
-    if(!r.ok) throw new Error(r.status);
-    devW = +r.headers.get('X-Device-Width') || devW;
-    devH = +r.headers.get('X-Device-Height') || devH;
-    const url = URL.createObjectURL(await r.blob());
-    const next = new Image();
-    next.src = url;
-    await next.decode();          // 解码完成才换，避免闪烁
-    const img = $('#shot'), old = img.src;
-    img.src = url;
-    if(old.startsWith('blob:')) URL.revokeObjectURL(old);
-    if(!sizeShown && devW){ sizeShown = true; loadInfo(); }  // 首帧才知道分辨率
-  }catch(e){ /* 设备可能在重建，下一帧再说 */ }
-  finally{ refreshing = false; }
+function setLive(on, txt){
+  const el = $('#live');
+  el.className = 'live' + (on ? ' on' : '');
+  el.querySelector('.txt').textContent = txt || (on ? '实时' : '画面中断');
 }
 
-// 把浏览器里的点击换算成设备坐标：显示尺寸可能被 CSS 缩放过
+// 画面走 MJPEG 连续流：每帧一次 HTTP 拉取的往返开销在人工操作时很明显，
+// 连续流把它降到零，帧率直接由设备侧 screencap 决定（实测约 3 fps）。
+// 流喂给一个隐藏 <img>，再逐帧画到 canvas —— 用 canvas 承接输入是因为
+// <img> 会触发浏览器原生图片拖拽，按住拖动的手势直接被吞掉，做不了滑动。
+// 画面走 MJPEG 连续流，但**不用 <img> 承接**：Chrome 对 <img> 里的 multipart
+// 流不会逐帧触发 load 事件，拿不到帧边界，canvas 只能画到首帧就停住。
+// 改为自己读流、按 Content-Length 切帧、逐帧转 ImageBitmap。
+// 这样帧事件精确（fps 是真数字），canvas 也能正常承接拖动手势——
+// <img> 会触发浏览器原生图片拖拽，按住拖动的手势直接被吞掉。
+let frames = 0, lastFpsAt = performance.now(), streamAbort = null, curBitmap = null;
+
+async function startStream(){
+  if(streamAbort) streamAbort.abort();
+  streamAbort = new AbortController();
+  try{
+    const res = await fetch(`/api/devices/${encodeURIComponent(id)}/stream.mjpg`,
+                            {signal: streamAbort.signal});
+    if(!res.ok) throw new Error(res.status);
+    const reader = res.body.getReader();
+    let buf = new Uint8Array(0);
+
+    const concat = (a, b) => { const c = new Uint8Array(a.length + b.length); c.set(a); c.set(b, a.length); return c; };
+    const find = (hay, needle, from = 0) => {
+      outer: for(let i = from; i <= hay.length - needle.length; i++){
+        for(let j = 0; j < needle.length; j++) if(hay[i+j] !== needle[j]) continue outer;
+        return i;
+      }
+      return -1;
+    };
+    const HDR_END = new TextEncoder().encode('\r\n\r\n');
+
+    for(;;){
+      const {done, value} = await reader.read();
+      if(done) break;
+      buf = concat(buf, value);
+
+      // 一次可能收到多帧，循环切完为止
+      for(;;){
+        const he = find(buf, HDR_END);
+        if(he < 0) break;
+        const header = new TextDecoder().decode(buf.subarray(0, he));
+        const m = /Content-Length:\s*(\d+)/i.exec(header);
+        if(!m) { buf = buf.subarray(he + 4); continue; }
+        const len = +m[1];
+        const start = he + 4;
+        if(buf.length < start + len) break;      // 这一帧还没收全
+
+        const w = +(/X-Device-Width:\s*(\d+)/i.exec(header)?.[1] || 0);
+        const h = +(/X-Device-Height:\s*(\d+)/i.exec(header)?.[1] || 0);
+        const type = /Content-Type:\s*(\S+)/i.exec(header)?.[1] || 'image/jpeg';
+        const bytes = buf.slice(start, start + len);
+        buf = buf.subarray(start + len);
+
+        try{
+          const bmp = await createImageBitmap(new Blob([bytes], {type}));
+          if(curBitmap) curBitmap.close();
+          curBitmap = bmp;
+          if(w && h && (w !== cv.width || h !== cv.height)){
+            cv.width = w; cv.height = h; devW = w; devH = h;
+            loadInfo();
+          }
+          drawFrame();
+          frames++;
+          setLive(true);
+        }catch(_){ /* 半截帧，丢掉等下一帧 */ }
+      }
+    }
+    setLive(false, '流已结束');
+  }catch(e){
+    if(e.name === 'AbortError') return;
+    setLive(false, '流中断，重连中');
+    setTimeout(startStream, 1500);
+  }
+}
+
+function drawFrame(){
+  if(!curBitmap) return;
+  ctx.drawImage(curBitmap, 0, 0);
+  drawRipples();
+}
+
+// 涟漪要按时间衰减，单靠帧到达（约 3 fps）画不出动画，用 rAF 补
+function animate(){
+  if(ripples.length) drawFrame();
+  const now = performance.now();
+  if(now - lastFpsAt >= 1000){
+    $('#fpsnow').textContent = frames ? `${frames} fps` : '';
+    frames = 0; lastFpsAt = now;
+  }
+  requestAnimationFrame(animate);
+}
+
+// 点击涟漪：设备画面要 0.3 s 后才反映出变化，没有即时反馈时
+// 操作人员会以为没点上而重复点，造成误操作。涟漪在本地立刻画出来。
+const ripples = [];
+function addRipple(x, y, kind){ ripples.push({x, y, kind, t: performance.now()}); drawFrame(); }
+function drawRipples(){
+  const now = performance.now();
+  for(let i = ripples.length - 1; i >= 0; i--){
+    const r = ripples[i], age = now - r.t;
+    if(age > 600){ ripples.splice(i, 1); continue; }
+    const p = age / 600;
+    ctx.save();
+    ctx.strokeStyle = r.kind === 'pending' ? `rgba(88,166,255,${1-p})` : `rgba(63,185,80,${1-p})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, 8 + p * 34, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// canvas 内部像素 = 设备像素，只需按 CSS 显示尺寸换算
 function toDevice(ev){
-  const img = $('#shot'), rect = img.getBoundingClientRect();
-  if(!devW || !rect.width) return null;
+  const r = cv.getBoundingClientRect();
   return {
-    x: Math.round((ev.clientX - rect.left) / rect.width * devW),
-    y: Math.round((ev.clientY - rect.top) / rect.height * devH)
+    x: Math.round((ev.clientX - r.left) / r.width * cv.width),
+    y: Math.round((ev.clientY - r.top) / r.height * cv.height)
   };
 }
 
@@ -132,29 +291,55 @@ async function send(body){
     body: JSON.stringify(body)
   });
   if(!r.ok){ flash('操作失败: ' + r.status, true); return false; }
-  setTimeout(refresh, 250); // 操作后立刻看结果
   return true;
 }
 
 let down = null;
-$('#screen').addEventListener('mousedown', e => { down = {...toDevice(e), t: Date.now()}; });
-$('#screen').addEventListener('mouseup', async e => {
-  const up = toDevice(e);
-  if(!down || !up) { down = null; return; }
-  const dist = Math.hypot(up.x - down.x, up.y - down.y);
-  const dt = Date.now() - down.t;
-  if(dist > 12){
-    await send({type:'swipe', x:down.x, y:down.y, x2:up.x, y2:up.y, ms:Math.max(120, Math.min(dt, 1200))});
-    flash(`滑动 ${down.x},${down.y} → ${up.x},${up.y}`);
-  }else{
-    await send({type:'tap', x:up.x, y:up.y});
-    flash(`点击 ${up.x},${up.y}`);
-  }
+cv.addEventListener('pointerdown', e => {
+  cv.setPointerCapture(e.pointerId);
+  down = {...toDevice(e), t: Date.now()};
+  addRipple(down.x, down.y, 'pending');   // 按下立刻给反馈
+  e.preventDefault();
+});
+cv.addEventListener('pointerup', async e => {
+  if(!down) return;
+  const up = toDevice(e), from = down;
   down = null;
+  const dist = Math.hypot(up.x - from.x, up.y - from.y);
+  const dt = Date.now() - from.t;
+  if(dist > 12){
+    addRipple(up.x, up.y, 'done');
+    if(await send({type:'swipe', x:from.x, y:from.y, x2:up.x, y2:up.y, ms:Math.max(120, Math.min(dt, 1200))}))
+      flash(`滑动 ${from.x},${from.y} → ${up.x},${up.y}`);
+  }else{
+    if(await send({type:'tap', x:up.x, y:up.y})){
+      addRipple(up.x, up.y, 'done');       // 服务端确认后再补一圈绿的
+      flash(`点击 ${up.x},${up.y}`);
+    }
+  }
+});
+cv.addEventListener('pointercancel', () => { down = null; });
+// 拖动中实时画出轨迹起点，让人看清将要发出的是滑动
+cv.addEventListener('pointermove', e => {
+  if(!down) return;
+  const p = toDevice(e);
+  if(Math.hypot(p.x - down.x, p.y - down.y) > 12) addRipple(p.x, p.y, 'pending');
 });
 
+let wheelLock = false;
+cv.addEventListener('wheel', async e => {
+  e.preventDefault();
+  if(wheelLock) return;
+  wheelLock = true;
+  const p = toDevice(e);
+  const dy = e.deltaY > 0 ? -300 : 300;   // 滚轮向下 = 内容上移
+  addRipple(p.x, p.y, 'pending');
+  await send({type:'swipe', x:p.x, y:p.y, x2:p.x, y2:Math.max(0, Math.min(cv.height, p.y + dy)), ms:200});
+  setTimeout(() => wheelLock = false, 240);
+}, {passive:false});
+
 document.querySelectorAll('[data-key]').forEach(b => {
-  b.onclick = async () => { if(await send({type:'key', key:b.dataset.key})) flash('按键 ' + b.textContent); };
+  b.onclick = async () => { if(await send({type:'key', key:b.dataset.key})) flash('按键 ' + (b.title||b.dataset.key)); };
 });
 $('#text').addEventListener('keydown', async e => {
   if(e.key !== 'Enter') return;
@@ -163,25 +348,57 @@ $('#text').addEventListener('keydown', async e => {
   if(await send({type:'text', text:v})){ flash('已输入'); e.target.value = ''; }
 });
 
+// 截图：canvas 里就是原始分辨率的那一帧。涟漪是叠加层，导出时要去掉，
+// 否则存下来的图上会多几个圈。
+function stamp(){
+  const d = new Date(), p = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+// 导出时不要带上涟漪叠加层
+function cleanFrame(){
+  const c = document.createElement('canvas');
+  c.width = cv.width; c.height = cv.height;
+  if(curBitmap) c.getContext('2d').drawImage(curBitmap, 0, 0);
+  return c;
+}
+$('#snap').onclick = () => {
+  cleanFrame().toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = `${id}-${stamp()}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    flash('已保存 ' + a.download);
+  }, 'image/png');
+};
+$('#copy').onclick = () => {
+  cleanFrame().toBlob(async b => {
+    try{
+      await navigator.clipboard.write([new ClipboardItem({'image/png': b})]);
+      flash('已复制到剪贴板');
+    }catch(e){ flash('复制失败（需 HTTPS 或 localhost）', true); }
+  }, 'image/png');
+};
+
 async function loadInfo(){
-  const r = await fetch('/api/wall');
-  if(!r.ok) return;
-  const j = await r.json();
-  const d = (j.devices||[]).find(x => x.id === id);
-  if(!d) return;
-  lease = d.lease_id || null;
-  $('#info').innerHTML = `
-    <dt>状态</dt><dd>${d.state}</dd>
-    <dt>adb</dt><dd>${d.adb_addr}</dd>
-    <dt>分辨率</dt><dd>${devW ? devW+'×'+devH : '读取中…'}</dd>
-    ${d.worktree ? `<dt>worktree</dt><dd>${d.worktree}</dd>
-    <dt>分支</dt><dd>${d.branch||''} ${d.head_sha||''}</dd>
-    <dt>持有者</dt><dd>${d.owner||''}</dd>` : '<dt>租约</dt><dd>空闲</dd>'}
-    ${d.human ? `<dt>接管</dt><dd style="color:var(--busy)">进行中 ${d.note||''}</dd>` : ''}`;
-  $('#takeover').textContent = d.human ? '交还' : '接管';
-  $('#takeover').disabled = !lease;
-  $('#release').disabled = !lease;
-  $('#takeover').dataset.on = d.human ? '1' : '';
+  try{
+    const j = await (await fetch('/api/wall')).json();
+    const d = (j.devices||[]).find(x => x.id === id);
+    if(!d) return;
+    lease = d.lease_id || null;
+    $('#info').innerHTML = `
+      <dt>状态</dt><dd>${d.state}</dd>
+      <dt>adb</dt><dd>${d.adb_addr}</dd>
+      <dt>分辨率</dt><dd>${devW}×${devH}</dd>
+      ${d.worktree ? `<dt>worktree</dt><dd>${d.worktree}</dd>
+      <dt>分支</dt><dd>${d.branch||''} ${d.head_sha||''}</dd>
+      <dt>持有者</dt><dd>${d.owner||''}</dd>` : '<dt>租约</dt><dd>空闲</dd>'}
+      ${d.human ? `<dt>接管</dt><dd style="color:var(--busy)">进行中 ${d.note||''}</dd>` : ''}`;
+    $('#takeover').textContent = d.human ? '交还' : '接管';
+    $('#takeover').disabled = !lease;
+    $('#release').disabled = !lease;
+    $('#takeover').dataset.on = d.human ? '1' : '';
+  }catch(_){}
 }
 
 $('#takeover').onclick = async () => {
@@ -201,15 +418,22 @@ $('#release').onclick = async () => {
   loadInfo();
 };
 
-function schedule(){
-  if(timer) clearInterval(timer);
-  const ms = +$('#fps').value;
-  if(ms) timer = setInterval(refresh, ms);
-}
-$('#fps').onchange = schedule;
+// 租约变更走 SSE，不必轮询
+const es = new EventSource('/api/events');
+['snapshot','tick','claim','release','human','reap'].forEach(k => es.addEventListener(k, loadInfo));
 
-refresh(); loadInfo(); schedule();
-setInterval(loadInfo, 5000);
+// 页面隐藏时断流，别让后台标签页一直占着节点 CPU 和流配额
+document.addEventListener('visibilitychange', () => {
+  if(document.hidden){
+    if(streamAbort) streamAbort.abort();
+    streamAbort = null;
+    setLive(false, '已暂停');
+  } else if(!streamAbort){
+    startStream();
+  }
+});
+
+startStream(); loadInfo(); requestAnimationFrame(animate);
 </script>
 </body>
 </html>

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fancyCachier/droidpool/internal/node"
@@ -41,6 +42,9 @@ type Server struct {
 	// 租约接口不受影响。
 	Screen Screener
 	shots  shotCache
+	// Events 为 nil 时不广播，SSE 端点仍可用但只有心跳。
+	Events  *Hub
+	streams atomic.Int32
 }
 
 func (s *Server) now() time.Time {
@@ -72,7 +76,9 @@ func (s *Server) Routes() http.Handler {
 	// agent 侧的租约接口仍要 token（它们会改变谁持有哪台机器）；
 	// 设备墙只是给同一内网的操作人员看画面、点屏幕，加 token 只会挡住自己人。
 	mux.HandleFunc("GET /api/wall", s.handleWallData)
+	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/devices/{id}/screenshot.jpg", s.handleScreenshot)
+	mux.HandleFunc("GET /api/devices/{id}/stream.mjpg", s.handleStream)
 	mux.HandleFunc("POST /api/devices/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
@@ -220,6 +226,10 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		s.logTouchFailure(got.ID, err)
 	}
 
+	if !reused {
+		s.Events.Publish("claim", map[string]any{"lease": got.ID, "device": got.DeviceID, "worktree": got.Worktree})
+	}
+
 	code := http.StatusCreated
 	if reused {
 		code = http.StatusOK
@@ -326,12 +336,14 @@ func (s *Server) handleHuman(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	s.Events.Publish("human", map[string]any{"lease": id, "takeover": req.Takeover})
 	writeJSON(w, http.StatusOK, map[string]any{"human_takeover": req.Takeover})
 }
 
 func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.Store.Release(id, s.now()); err != nil {
+	devID, err := s.Store.Release(id, s.now())
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not_found", "租约不存在或已归还")
 			return
@@ -339,5 +351,6 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	s.Events.Publish("release", map[string]any{"lease": id, "device": devID})
 	w.WriteHeader(http.StatusNoContent)
 }

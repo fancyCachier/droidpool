@@ -69,8 +69,12 @@ func run() error {
 		}
 	}
 
+	hub := api.NewHub()
 	reaper := &pool.Reaper{
 		Store: st, Resetter: mgr,
+		OnReap: func(leaseID, deviceID string, reason pool.ReapReason) {
+			hub.Publish("reap", map[string]any{"lease": leaseID, "device": deviceID, "reason": string(reason)})
+		},
 		Interval:    cfg.ReapInterval.Duration,
 		IdleTimeout: cfg.IdleTimeout.Duration,
 		MaxLifetime: cfg.MaxLifetime.Duration,

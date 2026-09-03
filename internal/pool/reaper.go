@@ -34,6 +34,9 @@ type Reaper struct {
 	MaxLifetime time.Duration
 	Now         func() time.Time
 	Log         *slog.Logger
+	// OnReap 回收成功后回调，用于把「设备被 watchdog 收走了」推给设备墙。
+	// 这是 agent 看不到的变更：它已经僵死了，不会自己来问。
+	OnReap func(leaseID, deviceID string, reason ReapReason)
 }
 
 func (r *Reaper) now() time.Time {
@@ -74,6 +77,9 @@ func (r *Reaper) ReapOnce(ctx context.Context) (int, error) {
 			"device", devID, "owner", l.Owner, "worktree", l.Worktree,
 			"idle", now.Sub(l.LastSeenAt).Round(time.Second),
 			"held", now.Sub(l.CreatedAt).Round(time.Second))
+		if r.OnReap != nil {
+			r.OnReap(l.ID, devID, reason)
+		}
 		if r.Resetter != nil {
 			if err := r.Resetter.Reset(ctx, devID); err != nil {
 				r.log().Error("复位设备失败", "device", devID, "err", err)
