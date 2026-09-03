@@ -63,7 +63,7 @@ app 停在桌台首页什么都不做，容器就吃 1.3 核。首页有每秒�
 - 首页导航 content-desc 是 `桌台包厢`（不是旧配方里的 `球台`）。
 - OTA 弹窗 `以后再说` 在登录后 1~3 s 内出现，流程要轮询处理。
 
-## 3.6 bench 脚本已端到端复验
+### 3.6 bench 脚本已端到端复验
 
 `pm clear` 清掉 app 数据后，`seed-edge.sh` → `login_flow.sh` 一次跑通（exit 0）：onboarding 17.5 s、登录到首页 41.3 s。这两个数含每次 `uiautomator dump` 约 2.6 s 的开销（流程里十余次），不是 app 本身的耗时；Phase 1 基线里 login_flow 要同时记「脚本墙钟」与「扣除 dump 的净值」。
 
