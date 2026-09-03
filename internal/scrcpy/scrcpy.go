@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -229,6 +230,16 @@ func (s *Session) ReadFrame() (*Frame, error) {
 	}, nil
 }
 
+// Alive 报告设备侧 scrcpy 进程是否还在。
+// 进程退出后 socket 未必立刻报错（adb 隧道会吞掉一段时间），靠它来兜底。
+func (s *Session) Alive() bool {
+	if s.closed.Load() || s.cmd == nil || s.cmd.Process == nil {
+		return false
+	}
+	// ProcessState 只在 Wait 过之后才有；这里用信号 0 探测
+	return s.cmd.Process.Signal(syscall.Signal(0)) == nil
+}
+
 // SetReadDeadline 给读操作设超时，用于「画面静止时不要永远挂着」。
 func (s *Session) SetReadDeadline(t time.Time) error {
 	if s.video == nil {
@@ -247,14 +258,23 @@ func (s *Session) Close() error {
 	if s.control != nil {
 		s.control.Close()
 	}
+	// 清理必须用独立的 ctx：调用方的 ctx 往往已经取消（HTTP 请求结束、
+	// 被新会话接管），exec.CommandContext 在取消的 ctx 下根本不会执行，
+	// 结果就是 forward 与设备侧进程全部泄漏——实测一次 reload 留下 3 个僵尸。
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// 杀本机的 adb shell 只是断了管道，设备上的 app_process 不一定跟着退。
+	// 用 scid 精确定位设备侧进程再杀，不误伤别的会话或别人手动跑的 scrcpy。
+	_ = exec.CommandContext(ctx, s.opt.adb(), "-s", s.opt.Serial, "shell",
+		"pkill", "-f", "scid="+s.scid).Run()
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 		_ = s.cmd.Wait()
 	}
 	if s.forwards {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = s.adbCmd(ctx, "forward", "--remove", "tcp:"+strconv.Itoa(s.opt.LocalPort)).Run()
+		_ = exec.CommandContext(ctx, s.opt.adb(), "-s", s.opt.Serial,
+			"forward", "--remove", "tcp:"+strconv.Itoa(s.opt.LocalPort)).Run()
 	}
 	return nil
 }

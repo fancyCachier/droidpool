@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"image"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/fancyCachier/droidpool/internal/scrcpy"
 )
 
 // Screener 是设备墙需要的 adb 能力子集（由 internal/adb.Client 实现）。
@@ -128,18 +131,18 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
 		return
 	}
-	ctx := r.Context()
-	switch req.Type {
-	case "tap":
-		err = s.Screen.Tap(ctx, d.ADBAddr, req.X, req.Y)
-	case "swipe":
-		err = s.Screen.Swipe(ctx, d.ADBAddr, req.X, req.Y, req.X2, req.Y2, req.MS)
-	case "key":
-		err = s.Screen.Key(ctx, d.ADBAddr, req.Key)
-	case "text":
-		err = s.Screen.Text(ctx, d.ADBAddr, req.Text)
-	default:
-		writeErr(w, http.StatusBadRequest, "bad_request", "type 必须是 tap/swipe/key/text 之一")
+	// 有活跃的 scrcpy 会话就走它的控制 socket：一条 32 字节消息直达设备，
+	// 省掉 adb shell 每次 70~120 ms 的进程启动开销。没有会话（只看缩略图墙、
+	// 或 H.264 不可用）才退回 adb。
+	via := "adb"
+	if ctrl := s.h264.controller(d.ID); ctrl != nil {
+		via = "scrcpy"
+		err = injectViaController(ctrl, req)
+	} else {
+		err = s.injectViaADB(r.Context(), d.ADBAddr, req)
+	}
+	if errors.Is(err, errBadInputType) {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	if err != nil {
@@ -148,7 +151,7 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 	}
 	// 操作过后缓存立刻失效，否则下一帧还是旧画面，点了像没反应
 	s.shots.invalidate(d.ADBAddr)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "via": via})
 }
 
 func (c *shotCache) invalidate(serial string) {
@@ -340,3 +343,46 @@ func checksum(b []byte) uint64 {
 }
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+var errBadInputType = errors.New("type 必须是 tap/swipe/key/text 之一")
+
+// keyToCode 把设备墙的按键名映射到 Android keycode（adb 路径用名字，scrcpy 路径用数字）。
+var keyToCode = map[string]uint32{
+	"back": scrcpy.KeycodeBack, "home": scrcpy.KeycodeHome, "apps": scrcpy.KeycodeAppSwitch,
+	"power": scrcpy.KeycodePower, "enter": scrcpy.KeycodeEnter, "del": scrcpy.KeycodeDel,
+	"up": scrcpy.KeycodeDpadUp, "down": scrcpy.KeycodeDpadDown,
+	"left": scrcpy.KeycodeDpadLeft, "right": scrcpy.KeycodeDpadRight,
+	"volup": scrcpy.KeycodeVolumeUp, "voldn": scrcpy.KeycodeVolumeDown,
+}
+
+func injectViaController(c inputInjector, req inputReq) error {
+	switch req.Type {
+	case "tap":
+		return c.Tap(req.X, req.Y)
+	case "swipe":
+		return c.Swipe(req.X, req.Y, req.X2, req.Y2, time.Duration(req.MS)*time.Millisecond)
+	case "key":
+		code, ok := keyToCode[req.Key]
+		if !ok {
+			return fmt.Errorf("不支持的按键 %q", req.Key)
+		}
+		return c.Key(code)
+	case "text":
+		return c.Text(req.Text)
+	}
+	return errBadInputType
+}
+
+func (s *Server) injectViaADB(ctx context.Context, serial string, req inputReq) error {
+	switch req.Type {
+	case "tap":
+		return s.Screen.Tap(ctx, serial, req.X, req.Y)
+	case "swipe":
+		return s.Screen.Swipe(ctx, serial, req.X, req.Y, req.X2, req.Y2, req.MS)
+	case "key":
+		return s.Screen.Key(ctx, serial, req.Key)
+	case "text":
+		return s.Screen.Text(ctx, serial, req.Text)
+	}
+	return errBadInputType
+}

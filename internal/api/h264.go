@@ -22,30 +22,72 @@ type ScrcpyConfig struct {
 
 // h264Sessions 保证同一台设备同时只有一个 scrcpy 会话：
 // scrcpy 服务端每个实例都会独占编码器，开两个只会互相拖慢。
+//
+// 但「已有会话就拒绝」在实践中是错的：操作人员按一次 reload，旧页面的流还没
+// 断干净新页面就来了，被自己上一次的会话挡在外面拿到 409。所以改成**后来者接管**：
+// 新连接到达时取消旧会话，旧的流循环收到取消信号后退出并清理。
 type h264Sessions struct {
-	mu    sync.Mutex
-	inUse map[string]bool
-	next  int32
+	mu   sync.Mutex
+	live map[string]*liveSession
+	next int32
 }
 
-func (h *h264Sessions) acquire(id string, portBase int) (port int, ok bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.inUse == nil {
-		h.inUse = map[string]bool{}
-	}
-	if h.inUse[id] {
-		return 0, false
-	}
-	h.inUse[id] = true
-	h.next = (h.next + 1) % 64
-	return portBase + int(h.next), true
+type liveSession struct {
+	cancel context.CancelFunc
+	ctrl   inputInjector
+	gen    uint64 // 代数：release 时用它确认清理的是自己那一代，不是接管者
 }
 
-func (h *h264Sessions) release(id string) {
+// inputInjector 是 /input 需要的最小能力，scrcpy.Controller 实现它。
+type inputInjector interface {
+	Tap(x, y int) error
+	Swipe(x1, y1, x2, y2 int, dur time.Duration) error
+	Key(keycode uint32) error
+	Text(s string) error
+}
+
+// acquire 为设备登记一个新会话，取消同设备上已有的旧会话。返回本会话的代数与端口。
+func (h *h264Sessions) acquire(id string, portBase int, cancel context.CancelFunc) (gen uint64, port int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.inUse, id)
+	if h.live == nil {
+		h.live = map[string]*liveSession{}
+	}
+	if old, ok := h.live[id]; ok {
+		old.cancel() // 让旧的流循环退出；它的 release 会因代数不符而不动新条目
+	}
+	h.next++
+	gen = uint64(h.next)
+	h.live[id] = &liveSession{cancel: cancel, gen: gen}
+	// 端口按代数轮换，避免旧会话还没放掉 forward 时新会话撞上同一个端口
+	return gen, portBase + int(gen%64)
+}
+
+func (h *h264Sessions) setController(id string, gen uint64, c inputInjector) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ls, ok := h.live[id]; ok && ls.gen == gen {
+		ls.ctrl = c
+	}
+}
+
+// controller 返回设备当前的快速输入通道，没有活跃会话时返回 nil。
+func (h *h264Sessions) controller(id string) inputInjector {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ls, ok := h.live[id]; ok {
+		return ls.ctrl
+	}
+	return nil
+}
+
+// release 只清理属于本代的条目：若已被接管，新条目不能被旧会话的收尾误删。
+func (h *h264Sessions) release(id string, gen uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ls, ok := h.live[id]; ok && ls.gen == gen {
+		delete(h.live, id)
+	}
 }
 
 // handleH264Stream 用 multipart 推 H.264 访问单元。
@@ -68,15 +110,10 @@ func (s *Server) handleH264Stream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", "不支持流式响应")
 		return
 	}
-	port, ok := s.h264.acquire(d.ID, s.Scrcpy.PortBase)
-	if !ok {
-		writeErr(w, http.StatusConflict, "session_busy", "这台设备已有一路 H.264 会话")
-		return
-	}
-	defer s.h264.release(d.ID)
-
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	gen, port := s.h264.acquire(d.ID, s.Scrcpy.PortBase, cancel)
+	defer s.h264.release(d.ID, gen)
 	sess, err := scrcpy.Start(ctx, scrcpy.Options{
 		Serial: d.ADBAddr, ServerJar: s.Scrcpy.ServerJar, LocalPort: port,
 		MaxFPS: s.Scrcpy.MaxFPS, BitRate: s.Scrcpy.BitRate,
@@ -86,6 +123,9 @@ func (s *Server) handleH264Stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer sess.Close()
+	if ctrl, err := sess.Control(); err == nil {
+		s.h264.setController(d.ID, gen, ctrl)
+	}
 
 	const boundary = "droidpoolh264"
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+boundary)
@@ -107,7 +147,13 @@ func (s *Server) handleH264Stream(w http.ResponseWriter, r *http.Request) {
 		f, err := sess.ReadFrame()
 		if err != nil {
 			if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() {
-				continue // 静止，不是故障
+				// 静止不是故障，但要确认服务端进程还活着——设备侧进程死了
+				// 视频 socket 不一定立刻报错，会一直「静止」下去，会话表里
+				// 留着一个僵尸控制器，/input 往死 socket 写还显示成功。
+				if !sess.Alive() {
+					return
+				}
+				continue
 			}
 			return
 		}
