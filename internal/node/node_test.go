@@ -194,17 +194,25 @@ func TestParseHealthRejectsGarbage(t *testing.T) {
 }
 
 func TestUnderPressure(t *testing.T) {
-	guard := 256
-	// swap 为 0 是健康态（Phase 1 的 N≤10）
-	if (&Health{SwapUsedMiB: 0}).UnderPressure(guard) {
-		t.Error("swap=0 不应判为有压力")
+	const minAvail = 2048
+	// 余量充足：放得下再一台
+	if (&Health{MemAvailMiB: 10926}).UnderPressure(minAvail) {
+		t.Error("可用内存充足不应判为有压力")
 	}
-	if (&Health{SwapUsedMiB: 256}).UnderPressure(guard) {
-		t.Error("swap 等于阈值不应判为有压力")
+	if (&Health{MemAvailMiB: minAvail}).UnderPressure(minAvail) {
+		t.Error("恰好等于阈值不应判为有压力")
 	}
-	// N=12 实测 swap 590 MiB，此时失败率已到 5.6%，必须拒绝新 claim
-	if !(&Health{SwapUsedMiB: 590}).UnderPressure(guard) {
-		t.Error("swap 超阈值应判为有压力")
+	// 装不下一台（每台实测约 1 GB）时必须拒绝新 claim
+	if !(&Health{MemAvailMiB: 900}).UnderPressure(minAvail) {
+		t.Error("可用内存低于阈值应判为有压力")
+	}
+	// swap 高但内存充足 ≠ 有压力：这正是压测残留会造成的误判
+	if (&Health{MemAvailMiB: 10926, SwapUsedMiB: 1023}).UnderPressure(minAvail) {
+		t.Error("swap 残留不应在内存充足时误判为有压力")
+	}
+	// 闸门关闭
+	if (&Health{MemAvailMiB: 10}).UnderPressure(0) {
+		t.Error("阈值为 0 表示不启用，不应判为有压力")
 	}
 }
 

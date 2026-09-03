@@ -44,7 +44,7 @@ func newServer(t *testing.T, devices int, health NodeHealth) (*Server, http.Hand
 	n := 0
 	s := &Server{
 		Store: st, Token: token,
-		DefaultTTL: time.Hour, MaxTTL: 4 * time.Hour, SwapGuardMiB: 256,
+		DefaultTTL: time.Hour, MaxTTL: 4 * time.Hour, MinAvailMiB: 2048,
 		Health: health,
 		NewID:  func() string { n++; return "L" + string(rune('0'+n)) },
 	}
@@ -241,10 +241,12 @@ func TestHumanTakeover(t *testing.T) {
 	}
 }
 
-// 节点一旦开始换页就不该再放新租约进来：Phase 1 实测 swap 从 0 变正的同时
-// 失败率从 0 跳到 5.6%，p95 冲到 2.66×。
+// 节点没有余量再装一台设备时就不该放新租约进来。
+// 判据用可用内存而非 swap：swap_used 是滞后且黏滞的症状，压测结束数小时后
+// 读数依然很高，拿它当闸会在盒子空着时一直拒人（实测残留 426 MiB / 可用 10.9 GB）。
 func TestClaimRejectedUnderMemoryPressure(t *testing.T) {
-	press := fakeHealth{h: &node.Health{MemTotalMiB: 15843, MemAvailMiB: 3000, SwapUsedMiB: 590}}
+	// 可用内存低于闸门（2048）即拒绝：再放一台进来就会开始换页
+	press := fakeHealth{h: &node.Health{MemTotalMiB: 15843, MemAvailMiB: 900, SwapUsedMiB: 590}}
 	_, h := newServer(t, 2, press)
 
 	rec := do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true)
@@ -259,13 +261,13 @@ func TestClaimRejectedUnderMemoryPressure(t *testing.T) {
 // 但已持有租约的 agent 重复 claim（幂等复用）不占新设备，必须放行，
 // 否则它在压力期间连自己的 adb 地址都查不到。
 func TestIdempotentClaimAllowedUnderPressure(t *testing.T) {
-	healthy := &fakeHealth{h: &node.Health{SwapUsedMiB: 0}}
+	healthy := &fakeHealth{h: &node.Health{MemAvailMiB: 10000}}
 	s, h := newServer(t, 2, healthy)
 
 	first := decode[claimResp](t, do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true))
 
 	// 之后节点进入换页
-	s.Health = fakeHealth{h: &node.Health{SwapUsedMiB: 990}}
+	s.Health = fakeHealth{h: &node.Health{MemAvailMiB: 800}}
 
 	rec := do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true)
 	if rec.Code != http.StatusOK {
@@ -301,12 +303,12 @@ func TestListEndpointsReturnArrayNotNull(t *testing.T) {
 }
 
 func TestHealthEndpointReportsPressure(t *testing.T) {
-	_, h := newServer(t, 2, fakeHealth{h: &node.Health{SwapUsedMiB: 590, TempC: 66.5}})
+	_, h := newServer(t, 2, fakeHealth{h: &node.Health{MemAvailMiB: 900, SwapUsedMiB: 590, TempC: 66.5}})
 	rec := do(t, h, "GET", "/api/health", nil, false)
 	var body map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &body)
 	if body["under_pressure"] != true {
-		t.Errorf("swap 超阈值时 under_pressure 应为 true，得到 %v", body["under_pressure"])
+		t.Errorf("可用内存低于闸门时 under_pressure 应为 true，得到 %v", body["under_pressure"])
 	}
 	counts, _ := body["devices"].(map[string]any)
 	if counts["ready"] != float64(2) {

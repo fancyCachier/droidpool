@@ -37,8 +37,8 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if c.DefaultTTL.Duration != 4*time.Hour {
 		t.Errorf("DefaultTTL 默认值 = %v", c.DefaultTTL.Duration)
 	}
-	if c.SwapGuardMiB != 256 {
-		t.Errorf("SwapGuardMiB 默认值 = %d", c.SwapGuardMiB)
+	if c.MinAvailMiB != 2048 {
+		t.Errorf("MinAvailMiB 默认值 = %d", c.MinAvailMiB)
 	}
 	if c.EdgeDefault.Port != 8090 {
 		t.Errorf("Edge 默认端口 = %d", c.EdgeDefault.Port)
