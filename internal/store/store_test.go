@@ -198,6 +198,15 @@ func TestRenewAndExpiry(t *testing.T) {
 	if got, _ := s.ExpiredLeases(now); len(got) != 0 {
 		t.Errorf("未到期不应被列为过期，得到 %d 条", len(got))
 	}
+	// 边界：恰好到期的那一刻就应被回收，不能卡在临界点上多活一个巡检周期
+	exact := now.Add(time.Minute)
+	if got, _ := s.ExpiredLeases(exact); len(got) != 1 {
+		t.Errorf("恰好到期时刻应被判为过期，得到 %d 条", len(got))
+	}
+	if got, _ := s.ExpiredLeases(exact.Add(-time.Second)); len(got) != 0 {
+		t.Errorf("到期前 1s 不应被判为过期，得到 %d 条", len(got))
+	}
+
 	// 过期后应被捞出来（TTL 强制回收是唯一可靠的回收路径）
 	late := now.Add(2 * time.Minute)
 	got, err := s.ExpiredLeases(late)
