@@ -313,3 +313,67 @@ func TestHealthEndpointReportsPressure(t *testing.T) {
 		t.Errorf("应报告 2 台 ready，得到 %v", counts)
 	}
 }
+
+// claim 必须刷新活跃度：否则 agent 反复 claim（比如重启后重连）却不做别的操作时，
+// watchdog 会把它误判为僵死并收走设备。
+func TestClaimRefreshesActivity(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	t0 := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return t0 }
+	l := decode[claimResp](t, do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true))
+
+	// 半小时后再 claim（幂等复用路径）
+	t1 := t0.Add(30 * time.Minute)
+	s.Now = func() time.Time { return t1 }
+	do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true)
+
+	got, err := s.Store.GetLease(l.LeaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LastSeenAt.Equal(t1.UTC()) {
+		t.Errorf("复用 claim 应把活跃度刷新到 %v，得到 %v", t1.UTC(), got.LastSeenAt)
+	}
+}
+
+func TestHeartbeatRefreshesActivityWithoutExtendingTTL(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	t0 := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return t0 }
+	l := decode[claimResp](t, do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true))
+	before, _ := s.Store.GetLease(l.LeaseID)
+
+	t1 := t0.Add(20 * time.Minute)
+	s.Now = func() time.Time { return t1 }
+	if rec := do(t, h, "POST", "/api/leases/"+l.LeaseID+"/heartbeat", nil, true); rec.Code != http.StatusOK {
+		t.Fatalf("心跳应 200，得到 %d", rec.Code)
+	}
+	after, _ := s.Store.GetLease(l.LeaseID)
+	if !after.LastSeenAt.Equal(t1.UTC()) {
+		t.Errorf("心跳应刷新活跃度到 %v，得到 %v", t1.UTC(), after.LastSeenAt)
+	}
+	// 心跳只证明活着，不等于续租——否则 agent 一直心跳就能无限占机
+	if !after.ExpiresAt.Equal(before.ExpiresAt) {
+		t.Errorf("心跳不应延长到期时间：%v → %v", before.ExpiresAt, after.ExpiresAt)
+	}
+
+	if rec := do(t, h, "POST", "/api/leases/不存在/heartbeat", nil, true); rec.Code != http.StatusNotFound {
+		t.Errorf("对不存在的租约心跳应 404，得到 %d", rec.Code)
+	}
+}
+
+func TestRenewRefreshesActivity(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	t0 := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return t0 }
+	l := decode[claimResp](t, do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true))
+
+	t1 := t0.Add(15 * time.Minute)
+	s.Now = func() time.Time { return t1 }
+	do(t, h, "POST", "/api/leases/"+l.LeaseID+"/renew", map[string]any{"ttl_min": 60}, true)
+
+	got, _ := s.Store.GetLease(l.LeaseID)
+	if !got.LastSeenAt.Equal(t1.UTC()) {
+		t.Errorf("续约也应刷新活跃度，得到 %v", got.LastSeenAt)
+	}
+}

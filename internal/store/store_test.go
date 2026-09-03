@@ -331,3 +331,55 @@ func TestClaimConcurrentNoDoubleAllocation(t *testing.T) {
 		}
 	}
 }
+
+func TestTouchUpdatesLastSeen(t *testing.T) {
+	s := open(t)
+	seedReady(t, s, 1)
+	t0 := time.Now().Truncate(time.Second)
+	s.Claim(newLease("L1", "mac", "wt-a", time.Hour), t0)
+
+	l, _ := s.GetLease("L1")
+	// claim 本身算一次活动，否则新租约一上来就像僵死的
+	if !l.LastSeenAt.Equal(t0.UTC()) {
+		t.Errorf("claim 应把 LastSeenAt 设为 claim 时刻 %v，得到 %v", t0.UTC(), l.LastSeenAt)
+	}
+
+	t1 := t0.Add(10 * time.Minute)
+	if err := s.Touch("L1", t1); err != nil {
+		t.Fatal(err)
+	}
+	l, _ = s.GetLease("L1")
+	if !l.LastSeenAt.Equal(t1.UTC()) {
+		t.Errorf("Touch 后 LastSeenAt 应为 %v，得到 %v", t1.UTC(), l.LastSeenAt)
+	}
+
+	if err := s.Touch("不存在", t1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Touch 不存在的租约应返回 ErrNotFound，得到 %v", err)
+	}
+	// 已归还的租约不该还能被心跳续命
+	s.Release("L1", t1)
+	if err := s.Touch("L1", t1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("已归还的租约不应能 Touch，得到 %v", err)
+	}
+}
+
+func TestActiveLeasesExcludesReleased(t *testing.T) {
+	s := open(t)
+	seedReady(t, s, 2)
+	now := time.Now()
+	s.Claim(newLease("L1", "mac", "wt-a", time.Hour), now)
+	s.Claim(newLease("L2", "mac", "wt-b", time.Hour), now)
+
+	ls, err := s.ActiveLeases()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ls) != 2 {
+		t.Fatalf("应有 2 条活跃租约，得到 %d", len(ls))
+	}
+	s.Release("L1", now)
+	ls, _ = s.ActiveLeases()
+	if len(ls) != 1 || ls[0].ID != "L2" {
+		t.Errorf("归还的租约不应出现在活跃列表，得到 %+v", ls)
+	}
+}
