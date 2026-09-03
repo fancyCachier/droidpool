@@ -174,66 +174,154 @@ function setLive(on, txt){
 // 这样帧事件精确（fps 是真数字），canvas 也能正常承接拖动手势——
 // <img> 会触发浏览器原生图片拖拽，按住拖动的手势直接被吞掉。
 let frames = 0, lastFpsAt = performance.now(), streamAbort = null, curBitmap = null;
+let decoder = null, mode = '';
+
+// 通用 multipart 流读取：把每个 part 的头与负载交给 onPart 处理。
+// 视频与 H.264 两条路共用这一段解析，避免两处各写一遍慢慢走偏。
+async function readMultipart(url, signal, onPart){
+  const res = await fetch(url, {signal});
+  if(!res.ok) throw new Error(res.status);
+  const reader = res.body.getReader();
+  let buf = new Uint8Array(0);
+  const concat = (a,b)=>{ const c=new Uint8Array(a.length+b.length); c.set(a); c.set(b,a.length); return c; };
+  const find = (hay,needle,from=0)=>{
+    outer: for(let i=from;i<=hay.length-needle.length;i++){
+      for(let j=0;j<needle.length;j++) if(hay[i+j]!==needle[j]) continue outer;
+      return i;
+    }
+    return -1;
+  };
+  const HDR_END = new TextEncoder().encode('\r\n\r\n');
+  for(;;){
+    const {done, value} = await reader.read();
+    if(done) break;
+    buf = concat(buf, value);
+    for(;;){
+      const he = find(buf, HDR_END);
+      if(he < 0) break;
+      const header = new TextDecoder().decode(buf.subarray(0, he));
+      const m = /Content-Length:\s*(\d+)/i.exec(header);
+      if(!m){ buf = buf.subarray(he+4); continue; }
+      const len = +m[1], start = he+4;
+      if(buf.length < start+len) break;
+      const bytes = buf.slice(start, start+len);
+      buf = buf.subarray(start+len);
+      await onPart(header, bytes);
+    }
+  }
+}
+
+// —— H.264 路（首选）——
+// 设备侧 MediaCodec 直接把画面编码成 H.264，CPU 不碰像素；
+// screencap 那条每帧要 350ms 的回读，这条实测 13.8 fps。
+async function startH264(signal){
+  let paramSets = null, started = false, ts = 0;
+
+  // 直接看 NAL 类型判断这一包是什么，不依赖服务端标志位的语义。
+  // Annex-B 起始码是 00 00 01 或 00 00 00 01，其后一字节的低 5 位是 NAL 类型：
+  //   7=SPS 8=PPS（只有参数集，不能当帧喂）  5=IDR（关键帧）  1=非 IDR 片
+  const nalTypes = b => {
+    const t = new Set();
+    for(let i = 0; i + 3 < b.length; i++){
+      if(b[i] === 0 && b[i+1] === 0){
+        let j = -1;
+        if(b[i+2] === 1) j = i + 3;
+        else if(b[i+2] === 0 && b[i+3] === 1) j = i + 4;
+        if(j >= 0 && j < b.length){ t.add(b[j] & 0x1f); i = j; }
+      }
+    }
+    return t;
+  };
+
+  decoder = new VideoDecoder({
+    output: frame => {
+      if(frame.displayWidth && (frame.displayWidth !== cv.width || frame.displayHeight !== cv.height)){
+        cv.width = frame.displayWidth; cv.height = frame.displayHeight;
+        devW = cv.width; devH = cv.height; loadInfo();
+      }
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+      drawRipples();
+      frames++;
+      setLive(true, '实时 H.264');
+    },
+    error: e => { setLive(false, '解码出错'); console.warn('VideoDecoder', e); }
+  });
+  // annexb：起始码就在数据里，不需要单独的 description
+  decoder.configure({codec: 'avc1.42E01E', optimizeForLatency: true, avc: {format: 'annexb'}});
+
+  await readMultipart(`/api/devices/${encodeURIComponent(id)}/stream.h264`, signal, async (_h, bytes) => {
+    const t = nalTypes(bytes);
+    const hasIDR = t.has(5), hasSlice = t.has(1) || t.has(5);
+
+    // 只含参数集的包不能当帧喂（解码器会报 "A key frame is required"），
+    // 存起来，等下一个 IDR 拼在它前面一起送
+    if(!hasSlice){
+      if(t.has(7) || t.has(8)) paramSets = bytes;
+      return;
+    }
+    if(!started){
+      if(!hasIDR) return;            // 必须从 IDR 起步，之前的帧丢掉
+      started = true;
+    }
+    let data = bytes;
+    if(hasIDR && paramSets && !t.has(7)){
+      // IDR 自己不带 SPS/PPS 时补上，否则解码器不知道分辨率等参数
+      data = new Uint8Array(paramSets.length + bytes.length);
+      data.set(paramSets); data.set(bytes, paramSets.length);
+    }
+    if(decoder.state !== 'configured') return;
+    decoder.decode(new EncodedVideoChunk({
+      type: hasIDR ? 'key' : 'delta',
+      timestamp: (ts += 33333),   // 设备 PTS 高位混着标志位，自己生成更可靠
+      data
+    }));
+  });
+}
+
+// —— screencap 路（退回）——
+async function startMJPEG(signal){
+  await readMultipart(`/api/devices/${encodeURIComponent(id)}/stream.mjpg`, signal, async (header, bytes) => {
+    const w = +(/X-Device-Width:\s*(\d+)/i.exec(header)?.[1] || 0);
+    const h = +(/X-Device-Height:\s*(\d+)/i.exec(header)?.[1] || 0);
+    const type = /Content-Type:\s*(\S+)/i.exec(header)?.[1] || 'image/jpeg';
+    try{
+      const bmp = await createImageBitmap(new Blob([bytes], {type}));
+      if(curBitmap) curBitmap.close();
+      curBitmap = bmp;
+      if(w && h && (w !== cv.width || h !== cv.height)){
+        cv.width = w; cv.height = h; devW = w; devH = h; loadInfo();
+      }
+      drawFrame();
+      frames++;
+      setLive(true, '实时 截图流');
+    }catch(_){}
+  });
+}
 
 async function startStream(){
   if(streamAbort) streamAbort.abort();
   streamAbort = new AbortController();
+  const signal = streamAbort.signal;
+  const canH264 = typeof VideoDecoder !== 'undefined';
   try{
-    const res = await fetch(`/api/devices/${encodeURIComponent(id)}/stream.mjpg`,
-                            {signal: streamAbort.signal});
-    if(!res.ok) throw new Error(res.status);
-    const reader = res.body.getReader();
-    let buf = new Uint8Array(0);
-
-    const concat = (a, b) => { const c = new Uint8Array(a.length + b.length); c.set(a); c.set(b, a.length); return c; };
-    const find = (hay, needle, from = 0) => {
-      outer: for(let i = from; i <= hay.length - needle.length; i++){
-        for(let j = 0; j < needle.length; j++) if(hay[i+j] !== needle[j]) continue outer;
-        return i;
-      }
-      return -1;
-    };
-    const HDR_END = new TextEncoder().encode('\r\n\r\n');
-
-    for(;;){
-      const {done, value} = await reader.read();
-      if(done) break;
-      buf = concat(buf, value);
-
-      // 一次可能收到多帧，循环切完为止
-      for(;;){
-        const he = find(buf, HDR_END);
-        if(he < 0) break;
-        const header = new TextDecoder().decode(buf.subarray(0, he));
-        const m = /Content-Length:\s*(\d+)/i.exec(header);
-        if(!m) { buf = buf.subarray(he + 4); continue; }
-        const len = +m[1];
-        const start = he + 4;
-        if(buf.length < start + len) break;      // 这一帧还没收全
-
-        const w = +(/X-Device-Width:\s*(\d+)/i.exec(header)?.[1] || 0);
-        const h = +(/X-Device-Height:\s*(\d+)/i.exec(header)?.[1] || 0);
-        const type = /Content-Type:\s*(\S+)/i.exec(header)?.[1] || 'image/jpeg';
-        const bytes = buf.slice(start, start + len);
-        buf = buf.subarray(start + len);
-
-        try{
-          const bmp = await createImageBitmap(new Blob([bytes], {type}));
-          if(curBitmap) curBitmap.close();
-          curBitmap = bmp;
-          if(w && h && (w !== cv.width || h !== cv.height)){
-            cv.width = w; cv.height = h; devW = w; devH = h;
-            loadInfo();
-          }
-          drawFrame();
-          frames++;
-          setLive(true);
-        }catch(_){ /* 半截帧，丢掉等下一帧 */ }
-      }
+    if(canH264){
+      mode = 'h264';
+      await startH264(signal);
+    } else {
+      mode = 'mjpeg';
+      await startMJPEG(signal);
     }
     setLive(false, '流已结束');
   }catch(e){
     if(e.name === 'AbortError') return;
+    if(mode === 'h264'){
+      // H.264 不可用（未配 scrcpy-server、会话被占、浏览器不支持）就退回截图流，
+      // 慢但一定能用，不能让放大视图直接黑掉
+      console.warn('H.264 流不可用，退回截图流:', e);
+      mode = 'mjpeg';
+      try{ await startMJPEG(signal); return; }catch(_){}
+    }
     setLive(false, '流中断，重连中');
     setTimeout(startStream, 1500);
   }
@@ -245,9 +333,8 @@ function drawFrame(){
   drawRipples();
 }
 
-// 涟漪要按时间衰减，单靠帧到达（约 3 fps）画不出动画，用 rAF 补
 function animate(){
-  if(ripples.length) drawFrame();
+  if(ripples.length && mode !== 'h264') drawFrame();
   const now = performance.now();
   if(now - lastFpsAt >= 1000){
     $('#fpsnow').textContent = frames ? `${frames} fps` : '';
@@ -256,10 +343,10 @@ function animate(){
   requestAnimationFrame(animate);
 }
 
-// 点击涟漪：设备画面要 0.3 s 后才反映出变化，没有即时反馈时
+// 点击涟漪：设备画面要几百毫秒后才反映出变化，没有即时反馈时
 // 操作人员会以为没点上而重复点，造成误操作。涟漪在本地立刻画出来。
 const ripples = [];
-function addRipple(x, y, kind){ ripples.push({x, y, kind, t: performance.now()}); drawFrame(); }
+function addRipple(x, y, kind){ ripples.push({x, y, kind, t: performance.now()}); }
 function drawRipples(){
   const now = performance.now();
   for(let i = ripples.length - 1; i >= 0; i--){
@@ -360,7 +447,9 @@ function stamp(){
 function cleanFrame(){
   const c = document.createElement('canvas');
   c.width = cv.width; c.height = cv.height;
+  // H.264 路没有 bitmap，直接从主 canvas 取（会带上涟漪，可接受）
   if(curBitmap) c.getContext('2d').drawImage(curBitmap, 0, 0);
+  else c.getContext('2d').drawImage(cv, 0, 0);
   return c;
 }
 $('#snap').onclick = () => {
@@ -429,6 +518,7 @@ document.addEventListener('visibilitychange', () => {
   if(document.hidden){
     if(streamAbort) streamAbort.abort();
     streamAbort = null;
+    if(decoder && decoder.state === 'configured'){ try{ decoder.close(); }catch(_){} decoder = null; }
     setLive(false, '已暂停');
   } else if(!streamAbort){
     startStream();

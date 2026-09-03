@@ -102,6 +102,14 @@ func run() error {
 		Health:      healthAdapter{nd},
 		Log:         log,
 		Screen:      adbc,
+		Events:      hub,
+		Scrcpy: api.ScrcpyConfig{
+			// 未设置时 H.264 端点返回 503，前端自动退回截图流
+			ServerJar: os.Getenv("SCRCPY_SERVER_JAR"),
+			PortBase:  27200,
+			MaxFPS:    15,
+			BitRate:   4_000_000,
+		},
 	}
 	h := &http.Server{
 		Addr:              cfg.Listen,

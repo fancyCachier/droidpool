@@ -45,6 +45,9 @@ type Server struct {
 	// Events 为 nil 时不广播，SSE 端点仍可用但只有心跳。
 	Events  *Hub
 	streams atomic.Int32
+	// Scrcpy 为空时 H.264 端点返回 503，前端自动退回 screencap 流。
+	Scrcpy ScrcpyConfig
+	h264   h264Sessions
 }
 
 func (s *Server) now() time.Time {
@@ -79,6 +82,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/devices/{id}/screenshot.jpg", s.handleScreenshot)
 	mux.HandleFunc("GET /api/devices/{id}/stream.mjpg", s.handleStream)
+	mux.HandleFunc("GET /api/devices/{id}/stream.h264", s.handleH264Stream)
 	mux.HandleFunc("POST /api/devices/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
