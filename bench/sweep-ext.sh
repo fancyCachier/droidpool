@@ -28,7 +28,8 @@ for n in $LEVELS; do
     log "!! 剩余可用内存不足 ${MIN_AVAIL_MIB}MiB，停在 N=$n 之前"; break
   fi
   LEVELS="$n" ROUNDS="$ROUNDS" ROUNDS_N1="$ROUNDS" OUT="$OUT/N$n" bash "$HERE/sweep.sh" 2>&1 | tee -a "$OUT/ext.log"
-  oom=$(ssh "$NODE_SSH" "sudo -n dmesg 2>/dev/null | grep -ciE 'out of memory|oom-kill' || echo 0")
+  # grep -c 计数为 0 时退出码为 1，会额外触发 || echo 0 产生两行，故取首行
+  oom=$(ssh "$NODE_SSH" "sudo -n dmesg 2>/dev/null | grep -ciE 'out of memory|oom-kill'; true" | head -1)
   log "N=$n 完成 oom=$oom"
   [ "${oom:-0}" -gt 0 ] && { log "!! 出现 OOM，停手"; break; }
 done
