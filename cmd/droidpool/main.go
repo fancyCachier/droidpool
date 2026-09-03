@@ -10,13 +10,21 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -133,6 +141,12 @@ func main() {
 		cmdStatus(c)
 	case "release":
 		cmdRelease(c)
+	case "seed-edge":
+		touchIfLeased(c)
+		cmdSeedEdge(os.Args[2:])
+	case "run":
+		touchIfLeased(c)
+		cmdRun(os.Args[2:])
 	case "watch":
 		cmdWatch(c)
 	case "heartbeat":
@@ -221,6 +235,169 @@ func cmdWatch(c *client) {
 	}
 }
 
+// adbDev 对本租约设备跑 adb，等价于 `adb -s $(droidpool addr) ...`。
+func adbDev(args ...string) *exec.Cmd {
+	s, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	return exec.Command("adb", append([]string{"-s", s.ADBAddr}, args...)...)
+}
+
+// edgeCertPin 取 Edge 证书的 DER SHA-256，与 cashier-app 的 TOFU pin 格式一致。
+func edgeCertPin(host string, port int) (string, error) {
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp",
+		fmt.Sprintf("%s:%d", host, port), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // 自签证书，取指纹本就不该校验
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", errors.New("Edge 没有返回证书")
+	}
+	sum := sha256.Sum256(certs[0].Raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+const cashierPkg = "cn.daboshi.cashier_app.dev"
+
+// cmdSeedEdge 给已装的 cashier-app 写入 Edge 端点与证书 pin，免走引导页。
+//
+// 写的是 shared_prefs/FlutterSharedPreferences.xml 的两个 key，格式与 app 一致；
+// run-as 里相对路径的 cwd 不可靠，一律 push 到 /data/local/tmp 再用绝对路径 cp。
+func cmdSeedEdge(args []string) {
+	fs := flag.NewFlagSet("seed-edge", flag.ExitOnError)
+	host := fs.String("host", envOr("DROIDPOOL_EDGE_HOST", "192.168.14.53"), "Edge 主机")
+	port := fs.Int("port", 8090, "Edge 端口")
+	pkg := fs.String("pkg", cashierPkg, "应用包名")
+	fs.Parse(args)
+
+	pin, err := edgeCertPin(*host, *port)
+	if err != nil {
+		fatal("取 %s:%d 的证书 pin 失败: %v", *host, *port, err)
+	}
+	xml := fmt.Sprintf(`<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="flutter.edge_endpoint_v1">{"host":"%s","port":%d}</string>
+    <string name="flutter.edge_cert_pins_v1">{"%s:%d":"%s"}</string>
+</map>
+`, *host, *port, *host, *port, pin)
+	tmp, err := os.CreateTemp("", "fsp-*.xml")
+	if err != nil {
+		fatal("%v", err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.WriteString(xml)
+	tmp.Close()
+
+	if out, err := adbDev("push", tmp.Name(), "/data/local/tmp/fsp.xml").CombinedOutput(); err != nil {
+		fatal("push 失败: %v\n%s", err, out)
+	}
+	prefs := "/data/data/" + *pkg + "/shared_prefs"
+	sh := fmt.Sprintf("run-as %s mkdir -p %s && run-as %s cp /data/local/tmp/fsp.xml %s/FlutterSharedPreferences.xml && am force-stop %s",
+		*pkg, prefs, *pkg, prefs, *pkg)
+	if out, err := adbDev("shell", sh).CombinedOutput(); err != nil {
+		fatal("写入 shared_prefs 失败（包装了吗？）: %v\n%s", err, out)
+	}
+	fmt.Printf("已写入 Edge 端点 %s:%d（pin %s…）\n", *host, *port, pin[:12])
+}
+
+// cmdRun 一步到位：装包 → 写 Edge 端点 → 启动 → 自动过掉首启的两步引导。
+//
+// 设备每次 claim 都是干净的（上个租约归还时数据目录被清空），所以这几步每次都要做。
+// 首启引导：隐私政策「同意并继续」→ 设备角色「共享收银机」→ 登录页。
+// 这里只把 agent 送到登录页；登录要选员工、输 PIN，属于验证流程的一部分，由 agent 自己做。
+func cmdRun(args []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	apk := fs.String("apk", "build/app/outputs/flutter-apk/app-debug.apk", "apk 路径")
+	pkg := fs.String("pkg", cashierPkg, "应用包名")
+	activity := fs.String("activity", "cn.daboshi.cashier_app.MainActivity", "启动 Activity")
+	noSeed := fs.Bool("no-seed", false, "不写 Edge 端点（走引导页手填）")
+	noOnboard := fs.Bool("no-onboard", false, "不自动过引导页")
+	fs.Parse(args)
+
+	if _, err := os.Stat(*apk); err != nil {
+		fatal("找不到 apk %s（先 flutter build apk --debug --target-platform android-arm64）", *apk)
+	}
+	fmt.Printf("→ 安装 %s\n", *apk)
+	if out, err := adbDev("install", "-r", "-t", *apk).CombinedOutput(); err != nil {
+		fatal("安装失败: %v\n%s", err, out)
+	}
+	if !*noSeed {
+		fmt.Println("→ 写入 Edge 端点")
+		cmdSeedEdge(nil)
+	}
+	fmt.Println("→ 启动")
+	if out, err := adbDev("shell", "am", "start", "-W", "-n", *pkg+"/"+*activity).CombinedOutput(); err != nil {
+		fatal("启动失败: %v\n%s", err, out)
+	}
+	if *noOnboard {
+		return
+	}
+	fmt.Println("→ 过引导页")
+	for i := 0; i < 8; i++ {
+		time.Sleep(2 * time.Second)
+		descs := uiDescs()
+		switch {
+		case containsAny(descs, "jingli", "选择员工", "测试并连接"):
+			fmt.Println("已到登录页，接下来选员工、输 PIN 由你来")
+			return
+		case containsAny(descs, "同意并继续"):
+			tapDesc("同意并继续")
+		case containsAny(descs, "这台设备是"):
+			tapDescFragment("共享收银机")
+		}
+	}
+	fmt.Println("引导页状态未知，用 droidpool ui-dump 看一眼")
+}
+
+// uiDescs 取当前界面所有 content-desc（uiautomator dump，约 2.6 s）。
+func uiDescs() string {
+	out, _ := adbDev("shell", "rm -f /sdcard/ui.xml; uiautomator dump /sdcard/ui.xml >/dev/null 2>&1; cat /sdcard/ui.xml").Output()
+	return string(out)
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// boundsCenter 从 dump 里找 content-desc 匹配的节点，返回中心坐标。exact 决定精确还是片段匹配。
+func boundsCenter(dump, desc string, exact bool) (int, int, bool) {
+	var pat string
+	if exact {
+		pat = `content-desc="` + regexp.QuoteMeta(desc) + `"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`
+	} else {
+		pat = `content-desc="[^"]*` + regexp.QuoteMeta(desc) + `[^"]*"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"`
+	}
+	m := regexp.MustCompile(pat).FindStringSubmatch(dump)
+	if m == nil {
+		return 0, 0, false
+	}
+	x1, _ := strconv.Atoi(m[1])
+	y1, _ := strconv.Atoi(m[2])
+	x2, _ := strconv.Atoi(m[3])
+	y2, _ := strconv.Atoi(m[4])
+	return (x1 + x2) / 2, (y1 + y2) / 2, true
+}
+
+func tapDesc(desc string) {
+	if x, y, ok := boundsCenter(uiDescs(), desc, true); ok {
+		adbDev("shell", "input", "tap", strconv.Itoa(x), strconv.Itoa(y)).Run()
+	}
+}
+
+func tapDescFragment(desc string) {
+	if x, y, ok := boundsCenter(uiDescs(), desc, false); ok {
+		adbDev("shell", "input", "tap", strconv.Itoa(x), strconv.Itoa(y)).Run()
+	}
+}
+
 func cmdStatus(c *client) {
 	s, err := loadState()
 	if err != nil {
@@ -300,6 +477,10 @@ func usage() {
   status    查看租约；人工接管中时以退出码 10 结束
   release   归还设备
   devices   列出池中所有设备
+  seed-edge 给已装的 cashier-app 写 Edge 端点 + 证书 pin（免走引导页）
+            [--host 192.168.14.53] [--port 8090]
+  run       一步到位：装包 → seed-edge → 启动 → 自动过引导页到登录页
+            [--apk build/app/outputs/flutter-apk/app-debug.apk] [--no-seed] [--no-onboard]
   heartbeat 发一次心跳（告诉 watchdog 自己还活着）
   watch     持续心跳，跑长任务时后台挂着，防止被空闲闸回收
 

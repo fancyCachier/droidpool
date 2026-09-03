@@ -6,3 +6,5 @@
 /dist/
 bench/out/
 config.local.toml
+dist/
+scrcpy-probe

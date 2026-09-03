@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -48,6 +49,14 @@ type Server struct {
 	// Scrcpy 为空时 H.264 端点返回 503，前端自动退回 screencap 流。
 	Scrcpy ScrcpyConfig
 	h264   h264Sessions
+	// Resetter 在 release 后把设备洗干净放回池子。为 nil 时设备会卡在 resetting——
+	// 首次部署时踩到的坑：release 走通了但没人去复位。
+	Resetter Resetter
+}
+
+// Resetter 复位一台设备（由 pool.Manager 实现）。
+type Resetter interface {
+	Reset(ctx context.Context, deviceID string) error
 }
 
 func (s *Server) now() time.Time {
@@ -356,5 +365,20 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Events.Publish("release", map[string]any{"lease": id, "device": devID})
+	// 复位放后台：重建容器要十几秒，release 接口不该让 agent 干等。
+	// 用独立 ctx，请求结束后复位仍要继续。
+	if s.Resetter != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			if err := s.Resetter.Reset(ctx, devID); err != nil {
+				if s.Log != nil {
+					s.Log.Error("release 后复位失败", "device", devID, "err", err)
+				}
+				return
+			}
+			s.Events.Publish("device", map[string]any{"device": devID, "state": "ready"})
+		}()
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

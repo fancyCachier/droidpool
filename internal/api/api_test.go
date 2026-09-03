@@ -2,11 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -377,5 +379,50 @@ func TestRenewRefreshesActivity(t *testing.T) {
 	got, _ := s.Store.GetLease(l.LeaseID)
 	if !got.LastSeenAt.Equal(t1.UTC()) {
 		t.Errorf("续约也应刷新活跃度，得到 %v", got.LastSeenAt)
+	}
+}
+
+type recordingResetter struct {
+	mu    sync.Mutex
+	reset []string
+	done  chan string
+}
+
+func (r *recordingResetter) Reset(_ context.Context, id string) error {
+	r.mu.Lock()
+	r.reset = append(r.reset, id)
+	r.mu.Unlock()
+	if r.done != nil {
+		r.done <- id
+	}
+	return nil
+}
+
+// release 之后必须有人去复位，否则设备永远卡在 resetting——首次部署时就撞上了。
+func TestReleaseTriggersReset(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	rr := &recordingResetter{done: make(chan string, 1)}
+	s.Resetter = rr
+	l := decode[claimResp](t, do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true))
+
+	if rec := do(t, h, "DELETE", "/api/leases/"+l.LeaseID, nil, true); rec.Code != http.StatusNoContent {
+		t.Fatalf("release 应 204，得到 %d", rec.Code)
+	}
+	select {
+	case id := <-rr.done:
+		if id != l.DeviceID {
+			t.Errorf("应复位设备 %s，得到 %s", l.DeviceID, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("release 后 2s 内没有触发复位，设备会卡在 resetting")
+	}
+}
+
+// 没配 Resetter 时 release 仍要成功（只是设备留在 resetting 等别的机制处理），不能 panic。
+func TestReleaseWithoutResetter(t *testing.T) {
+	_, h := newServer(t, 1, nil)
+	l := decode[claimResp](t, do(t, h, "POST", "/api/leases", claimBody("mac", "wt-a"), true))
+	if rec := do(t, h, "DELETE", "/api/leases/"+l.LeaseID, nil, true); rec.Code != http.StatusNoContent {
+		t.Errorf("无 Resetter 时 release 也应 204，得到 %d", rec.Code)
 	}
 }

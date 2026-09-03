@@ -77,6 +77,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
+	// 先展开 ${VAR}：token 这类秘密不该进仓库，放 EnvironmentFile 里由 systemd 注入，
+	// 配置文件只留占位。未设置的变量展开为空串，随后会被 validate 拦下。
+	b = []byte(os.ExpandEnv(string(b)))
 	if err := toml.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("解析 %s: %w", path, err)
 	}

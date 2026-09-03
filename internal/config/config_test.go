@@ -145,3 +145,24 @@ func TestHostFromDockerHost(t *testing.T) {
 		}
 	}
 }
+
+// token 放 EnvironmentFile 由 systemd 注入，配置文件只留 ${DROIDPOOL_TOKEN} 占位。
+func TestLoadExpandsEnv(t *testing.T) {
+	t.Setenv("DROIDPOOL_TOKEN", "from-env-xyz")
+	c, err := Load(write(t, "token = \"${DROIDPOOL_TOKEN}\"\n"+minimal[len("\ntoken = \"secret\"\n"):]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Token != "from-env-xyz" {
+		t.Errorf("应从环境变量展开 token，得到 %q", c.Token)
+	}
+}
+
+func TestLoadRejectsUnsetEnvToken(t *testing.T) {
+	t.Setenv("DROIDPOOL_TOKEN", "")
+	// 占位符未设置时展开为空，必须被拦下而不是以空 token 启动
+	_, err := Load(write(t, "token = \"${DROIDPOOL_TOKEN}\"\n"+minimal[len("\ntoken = \"secret\"\n"):]))
+	if err == nil {
+		t.Fatal("环境变量未设置时 token 为空，应报错")
+	}
+}

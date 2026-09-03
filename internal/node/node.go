@@ -205,3 +205,122 @@ func (h *Health) UnderPressure(minAvailMiB int) bool {
 	}
 	return h.MemAvailMiB < minAvailMiB
 }
+
+// MakeGolden 生成 overlay 共享基底 /data-base。
+//
+// 路线图 §5.5：以普通 -v 挂载起一台裸容器，做完系统级设置后停掉，该目录即 base。
+// 之后所有设备以只读基底挂它，复位 = 删 diff，零拷贝。
+// **base 不预装 app**：多宿主机 debug keystore 不同，预装会让 `install -r` 报签名冲突。
+// 幂等：base 已有内容时直接返回，想重做先手动清空目录。
+func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
+	// 已有内容就不重做：boot 过一次的 /data 里必然有 system/ 目录
+	if out, err := n.sshRun(ctx, "test -d "+baseDir+"/system && echo yes || echo no"); err == nil && strings.TrimSpace(out) == "yes" {
+		return nil
+	}
+	const name = "droidpool-golden"
+	_, _ = n.docker(ctx, "rm", "-f", name)
+	args := []string{"run", "-d", "--privileged", "--name", name,
+		"-p", strconv.Itoa(port) + ":5555", "-v", baseDir + ":/data", n.Image}
+	args = append(args, strings.Fields(n.BootArgs)...)
+	// overlay 参数在造 base 时不能带：base 本身就是要写进去的普通 /data
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "androidboot.use_redroid_overlayfs") {
+			args = append(args[:i], args[i+1:]...)
+			i--
+		}
+	}
+	if _, err := n.docker(ctx, args...); err != nil {
+		return fmt.Errorf("起 golden 容器: %w", err)
+	}
+	defer n.docker(context.Background(), "rm", "-f", name)
+
+	if err := n.waitBootContainer(ctx, name, 90*time.Second); err != nil {
+		return err
+	}
+	// 系统级设置：关动画（截图与驱动都更稳）、常亮、中文与时区、关验证器
+	for _, cmd := range []string{
+		"settings put global window_animation_scale 0",
+		"settings put global transition_animation_scale 0",
+		"settings put global animator_duration_scale 0",
+		"svc power stayon true",
+		"setprop persist.sys.locale zh-CN",
+		"setprop persist.sys.timezone Asia/Shanghai",
+		"settings put global package_verifier_enable 0",
+	} {
+		if _, err := n.docker(ctx, "exec", name, "sh", "-c", cmd); err != nil {
+			return fmt.Errorf("golden 设置 %q: %w", cmd, err)
+		}
+	}
+	// 让设置落盘再停
+	_, _ = n.docker(ctx, "exec", name, "sync")
+	if _, err := n.docker(ctx, "stop", "-t", "10", name); err != nil {
+		return fmt.Errorf("停 golden 容器: %w", err)
+	}
+	return nil
+}
+
+// waitBootContainer 与 WaitBoot 相同但按容器名等待。
+func (n *Node) waitBootContainer(ctx context.Context, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := n.docker(ctx, "exec", name, "getprop", "sys.boot_completed")
+		if err == nil && strings.TrimSpace(out) == "1" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("容器 %s 在 %s 内未启动完成", name, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// sshRun 在节点宿主上跑一条 shell（不进容器）。
+func (n *Node) sshRun(ctx context.Context, cmd string) (string, error) {
+	r := n.Runner
+	if r == nil {
+		r = ExecRunner{}
+	}
+	return r.Run(ctx, "ssh", "-o", "BatchMode=yes", strings.TrimPrefix(n.DockerHost, "ssh://"), cmd)
+}
+
+// Reconcile 清掉节点上不在 keep 里的 droidpool- 容器（守护进程重启后的孤儿），
+// 以及**任何占用了池端口的非 droidpool 容器**——基线测试留下的 redroid-N 会让
+// 端口冲突，整个池一台都起不来。
+func (n *Node) Reconcile(ctx context.Context, keep map[string]bool, ports []int) (removed []string, err error) {
+	out, err := n.docker(ctx, "ps", "-a", "--format", "{{.Names}}\t{{.Ports}}")
+	if err != nil {
+		return nil, err
+	}
+	portSet := map[string]bool{}
+	for _, p := range ports {
+		portSet[":"+strconv.Itoa(p)+"->"] = true
+	}
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "\t", 2)
+		if parts[0] == "" {
+			continue
+		}
+		name := parts[0]
+		portsCol := ""
+		if len(parts) > 1 {
+			portsCol = parts[1]
+		}
+		stale := strings.HasPrefix(name, "droidpool-") && !keep[name] && name != "droidpool-golden"
+		hogging := false
+		for p := range portSet {
+			if strings.Contains(portsCol, p) && !keep[name] {
+				hogging = true
+			}
+		}
+		if stale || hogging {
+			if _, err := n.docker(ctx, "rm", "-f", name); err == nil {
+				removed = append(removed, name)
+			}
+		}
+	}
+	return removed, nil
+}

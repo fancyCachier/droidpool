@@ -1,0 +1,24 @@
+[Unit]
+Description=droidpool 控制面（redroid Android 设备池）
+Documentation=https://github.com/fancyCachier/droidpool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sa
+Group=sa
+Environment=HOME=/home/sa
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# scrcpy-server jar：H.264 流与控制通道用；缺失时自动退回截图流
+Environment=SCRCPY_SERVER_JAR=/opt/droidpool/scrcpy-server
+EnvironmentFile=-/opt/droidpool/env
+WorkingDirectory=/opt/droidpool
+ExecStart=/opt/droidpool/droidpoold -c /opt/droidpool/config.toml
+Restart=on-failure
+RestartSec=5
+# 停机时给设备复位留时间
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

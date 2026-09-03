@@ -17,7 +17,7 @@
 
 ```bash
 export DROIDPOOL_URL=http://192.168.14.32:8600      # 控制面
-export DROIDPOOL_TOKEN=<找 woo 要>
+export DROIDPOOL_TOKEN=<找管理员要，在 devopt 的 /opt/droidpool/env>
 
 cd .worktree/fix-3482                                # 必须在 worktree 里
 droidpool claim                                      # 拿设备，自动 adb connect
@@ -27,9 +27,7 @@ droidpool claim                                      # 拿设备，自动 adb co
 
 cd cashier-app
 flutter build apk --debug --target-platform android-arm64
-adb -s $(droidpool addr) install -r build/app/outputs/flutter-apk/app-debug.apk
-droidpool seed-edge                                  # 写 Edge 端点，免走引导页（见 §3）
-adb -s $(droidpool addr) shell am start -n cn.daboshi.cashier_app.dev/cn.daboshi.cashier_app.MainActivity
+droidpool run                                        # 装包 → 写 Edge 端点 → 启动 → 过引导页到登录页
 
 # …驱动 UI 做验证…
 
@@ -48,6 +46,8 @@ adb 会报 `more than one device`，或者更糟——命令打到别人的设�
 | `droidpool status` | 查租约。**人工接管中时以退出码 10 结束**（见 §4） |
 | `droidpool heartbeat` | 发一次心跳，告诉 watchdog 自己还活着 |
 | `droidpool watch &` | 持续心跳。跑长任务时挂后台 |
+| `droidpool run [--apk 路径]` | **装包 → seed-edge → 启动 → 自动过引导页**，一步到登录页。默认 apk 路径是 `build/app/outputs/flutter-apk/app-debug.apk` |
+| `droidpool seed-edge [--host --port]` | 单独写 Edge 端点 + 证书 pin（`run` 已包含） |
 | `droidpool release` | 归还设备 |
 | `droidpool devices` | 列出池里所有设备 |
 
@@ -56,15 +56,11 @@ adb 会报 `more than one device`，或者更糟——命令打到别人的设�
 **设备是干净的**：上一个租约归还时数据目录被清空并重建了容器。所以每次 claim 后
 都要自己装包、写 Edge 端点、走一遍首启引导。
 
-**首启有两步引导**，`droidpool seed-edge` 之后仍要处理：
-
-1. 隐私政策 → content-desc `同意并继续`
-2. 设备角色 → content-desc **片段** `共享收银机`（完整 desc 含换行，要用片段匹配）
-
-然后才是登录页。仓库里的 `bench/login_flow.sh` 把整条路走通了，可以直接抄：
+`droidpool run` 会自动过掉首启的两步引导（隐私政策「同意并继续」→ 设备角色「共享收银机」），
+把你送到登录页。**登录（选员工、输 PIN）属于验证流程，由你自己驱动**，
+参考 `bench/login_flow.sh`，它把从登录到首页走通了：
 
 ```bash
-bench/seed-edge.sh $(droidpool addr)                  # 写 Edge 端点 + 证书 pin
 bench/login_flow.sh $(droidpool addr) ./out           # 退出码 0 = 到首页
 ```
 

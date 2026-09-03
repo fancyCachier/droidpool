@@ -62,11 +62,45 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 设备墙的截图与输入都走本机 adb
+	adbc := adb.New(os.Getenv("ADB_BIN"))
+
+	// 补池放后台：Ensure 要在真实节点上建容器、等 boot，每台十几秒，
+	// 放在监听之前会让 HTTP 端口迟迟不开，systemd 探活直接判死。
+	// 顺序：先对账清孤儿（守护进程重启、基线测试残留都会留下占端口的容器），
+	// 再造 golden（base 空着 overlay 挂不起来），最后补齐。
 	if *ensure {
-		log.Info("补齐设备池", "node", nc.Name, "max_devices", nc.MaxDevices)
-		if err := mgr.Ensure(ctx); err != nil {
-			return fmt.Errorf("补齐设备池: %w", err)
-		}
+		go func() {
+			ports := make([]int, 0, nc.MaxDevices)
+			keep := map[string]bool{}
+			for i := 1; i <= nc.MaxDevices; i++ {
+				ports = append(ports, nc.PortRange[0]-1+i)
+				keep[node.ContainerName(mgr.DeviceID(i))] = true
+			}
+			if removed, err := nd.Reconcile(ctx, keep, ports); err != nil {
+				log.Warn("对账节点容器失败", "err", err)
+			} else if len(removed) > 0 {
+				log.Info("清理孤儿/占端口容器", "removed", removed)
+			}
+			goldenPort := nc.PortRange[1] // 用区间最后一个端口，不与设备端口重叠
+			if err := nd.MakeGolden(ctx, nc.DataRoot+"/base", goldenPort); err != nil {
+				log.Error("生成 golden 失败，设备将以空 base 启动", "err", err)
+			} else {
+				log.Info("golden 就绪", "base", nc.DataRoot+"/base")
+			}
+			log.Info("补齐设备池", "node", nc.Name, "max_devices", nc.MaxDevices)
+			if err := mgr.Ensure(ctx); err != nil {
+				log.Error("补齐设备池失败", "err", err)
+			}
+			// 补齐后把设备 adb connect 上，设备墙才有画面
+			if ds, err := st.ListDevices(); err == nil {
+				for _, d := range ds {
+					if err := adbc.Connect(ctx, d.ADBAddr); err != nil {
+						log.Warn("adb 连接失败", "device", d.ID, "err", err)
+					}
+				}
+			}
+		}()
 	}
 
 	hub := api.NewHub()
@@ -84,16 +118,10 @@ func run() error {
 		"空闲超时", cfg.IdleTimeout.Duration, "生命周期上限", cfg.MaxLifetime.Duration)
 	go reaper.Run(ctx)
 
-	// 设备墙的截图与输入都走本机 adb。启动时把已知设备都 connect 一遍，
-	// 省得第一次看墙时全是空图。
-	adbc := adb.New(os.Getenv("ADB_BIN"))
-	if ds, err := st.ListDevices(); err == nil {
-		for _, d := range ds {
-			if err := adbc.Connect(ctx, d.ADBAddr); err != nil {
-				log.Warn("adb 连接失败", "device", d.ID, "addr", d.ADBAddr, "err", err)
-			}
-		}
-	}
+	// 健康检查：连续 3 次 adb 探活失败即标 broken 并重建。
+	// 没有它，一台容器挂了池子不知道，会一直把它分给人。
+	hc := &pool.HealthChecker{Store: st, Prober: adbc, Resetter: mgr, Interval: 30 * time.Second, Log: log}
+	go hc.Run(ctx)
 
 	srv := &api.Server{
 		Store: st, Token: cfg.Token,
@@ -103,6 +131,7 @@ func run() error {
 		Log:         log,
 		Screen:      adbc,
 		Events:      hub,
+		Resetter:    mgr,
 		Scrcpy: api.ScrcpyConfig{
 			// 未设置时 H.264 端点返回 503，前端自动退回截图流
 			ServerJar: os.Getenv("SCRCPY_SERVER_JAR"),

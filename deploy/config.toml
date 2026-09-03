@@ -1,0 +1,28 @@
+# droidpoold 生产配置（devopt .32）。改动后 systemctl restart droidpoold。
+listen  = "0.0.0.0:8600"
+db_path = "/opt/droidpool/droidpool.db"
+# token 放 /opt/droidpool/env（DROIDPOOL_TOKEN=...），不进仓库
+token   = "${DROIDPOOL_TOKEN}"
+
+default_ttl   = "4h"
+max_ttl       = "24h"
+idle_timeout  = "30m"
+max_lifetime  = "24h"
+reap_interval = "1m"
+# 节点可用内存低于此值即拒绝新 claim（实测每台常驻约 1 GB）
+min_avail_mib = 2048
+
+[edge_default]
+host = "192.168.14.53"
+port = 8090
+
+[[nodes]]
+name        = "3588-a"
+docker_host = "ssh://sa@192.168.14.54"
+adb_host    = "192.168.14.54"
+port_range  = [5561, 5576]
+# 实测活跃上限 10 台，取 8 留余量给设备墙与人工操作
+max_devices = 8
+data_root   = "/data/droidpool"
+# 1366x768@160 = 收银机实机 Sunmi D1s 2nd；use_memfd 不可省（.54 无 ashmem）
+boot_args = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366 androidboot.redroid_height=768 androidboot.redroid_dpi=160 androidboot.redroid_gpu_mode=guest"

@@ -266,3 +266,98 @@ func TestWipeDataPropagatesError(t *testing.T) {
 		t.Errorf("清空失败应向上传递，得到 %v", err)
 	}
 }
+
+// 基线测试留下的 redroid-N 占着池端口，整个池一台都起不来——对账必须把它们清掉。
+func TestReconcileRemovesPortHogsAndOrphans(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{
+		match: "ps -a --format",
+		out: "redroid-1\t0.0.0.0:5561->5555/tcp\n" + // 非 droidpool 但占池端口 → 清
+			"droidpool-3588-a-2\t0.0.0.0:5562->5555/tcp\n" + // 在 keep 里 → 留
+			"droidpool-3588-a-9\t0.0.0.0:5569->5555/tcp\n" + // droidpool 前缀但不在 keep → 孤儿，清
+			"droidpool-golden\t\n" + // golden 构建容器 → 留
+			"some-other-app\t0.0.0.0:8080->80/tcp\n", // 无关且不占池端口 → 留
+	}}}
+	n := testNode(f)
+	keep := map[string]bool{"droidpool-3588-a-2": true}
+	removed, err := n.Reconcile(context.Background(), keep, []int{5561, 5562, 5563})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range removed {
+		got[r] = true
+	}
+	if !got["redroid-1"] {
+		t.Error("占池端口的 redroid-1 应被清掉")
+	}
+	if !got["droidpool-3588-a-9"] {
+		t.Error("不在 keep 里的 droidpool 孤儿应被清掉")
+	}
+	if got["droidpool-3588-a-2"] {
+		t.Error("在 keep 里的设备不应被清")
+	}
+	if got["droidpool-golden"] {
+		t.Error("golden 构建容器不应被清")
+	}
+	if got["some-other-app"] {
+		t.Error("不占池端口的无关容器不应被误伤")
+	}
+}
+
+func TestMakeGoldenSkipsWhenBaseExists(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{match: "test -d", out: "yes\n"}}}
+	n := testNode(f)
+	if err := n.MakeGolden(context.Background(), "/data/droidpool/base", 5576); err != nil {
+		t.Fatal(err)
+	}
+	// 幂等：已有 base 时不应起任何容器
+	if f.lastMatching("run -d") != nil {
+		t.Error("base 已存在时不应重新构建")
+	}
+}
+
+func TestMakeGoldenStripsOverlayFlagAndAppliesSettings(t *testing.T) {
+	f := &fakeRunner{replies: []reply{
+		{match: "test -d", out: "no\n"},
+		{match: "getprop", out: "1\n"},
+	}}
+	n := testNode(f)
+	n.BootArgs = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366"
+	if err := n.MakeGolden(context.Background(), "/data/droidpool/base", 5576); err != nil {
+		t.Fatal(err)
+	}
+	run := strings.Join(f.lastMatching("run -d"), " ")
+	// 造 base 时 /data 是普通挂载，带 overlay 参数会让容器去找不存在的 /data-base
+	if strings.Contains(run, "use_redroid_overlayfs") {
+		t.Errorf("构建 golden 时不应带 overlay 参数: %s", run)
+	}
+	if !strings.Contains(run, "/data/droidpool/base:/data") {
+		t.Errorf("应以普通 -v 挂到 /data: %s", run)
+	}
+	if !strings.Contains(run, "use_memfd=true") {
+		t.Errorf("其它启动参数应保留: %s", run)
+	}
+	// 系统设置必须落下：关动画是截图与驱动稳定的前提
+	for _, want := range []string{"window_animation_scale 0", "stayon true", "persist.sys.locale zh-CN", "package_verifier_enable 0"} {
+		if f.lastMatching(want) == nil {
+			t.Errorf("golden 应执行设置 %q", want)
+		}
+	}
+	// 结束要 stop 而非 kill，否则设置可能没落盘
+	if f.lastMatching("stop") == nil {
+		t.Error("应 docker stop 让 /data 落盘")
+	}
+}
+
+func TestMakeGoldenFailsIfBootTimesOut(t *testing.T) {
+	f := &fakeRunner{replies: []reply{
+		{match: "test -d", out: "no\n"},
+		{match: "getprop", out: "0\n"},
+	}}
+	n := testNode(f)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := n.MakeGolden(ctx, "/data/droidpool/base", 5576); err == nil {
+		t.Error("容器起不来时应报错，不能留下半成品 base")
+	}
+}
