@@ -230,6 +230,17 @@ func (s *Store) GetLease(id string) (*pool.Lease, error) {
 	return l, err
 }
 
+// GetLeaseByWorktree 按幂等键查活跃租约。用于 claim 前判断这次是「复用既有租约」
+// 还是「要占一台新设备」——前者在节点换页时仍应放行。
+func (s *Store) GetLeaseByWorktree(host, worktree string) (*pool.Lease, error) {
+	row := s.db.QueryRow(`SELECT `+leaseCols+` FROM leases WHERE host=? AND worktree=? AND released_at=0`, host, worktree)
+	l, err := scanLease(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return l, err
+}
+
 func (s *Store) ListLeases() ([]*pool.Lease, error) {
 	rows, err := s.db.Query(`SELECT ` + leaseCols + ` FROM leases WHERE released_at=0 ORDER BY created_at`)
 	if err != nil {
