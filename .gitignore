@@ -8,3 +8,8 @@ bench/out/
 config.local.toml
 dist/
 scrcpy-probe
+
+# 在仓库根目录直接 go build ./cmd/<x> 会把二进制落在这里
+/droidpool
+/droidpoold
+/droidpool-mcp
