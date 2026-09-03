@@ -11,6 +11,9 @@ import (
 type NodeDriver interface {
 	Create(ctx context.Context, deviceID string, port int, overlayBase string) error
 	Remove(ctx context.Context, deviceID string) error
+	// WipeData 清空设备数据目录。复位真正生效的一步——只重建容器的话，
+	// 宿主上的数据目录还在，上一个 agent 的状态会留给下一个。
+	WipeData(ctx context.Context, deviceID, overlayBase string) error
 	WaitBoot(ctx context.Context, deviceID string, timeout time.Duration) error
 }
 
@@ -115,9 +118,15 @@ func (m *Manager) Reset(ctx context.Context, deviceID string) error {
 	if err != nil {
 		return err
 	}
-	// 容器带着 diff 一起删掉，重建即回到 base 状态
 	if err := m.Driver.Remove(ctx, deviceID); err != nil {
 		m.log().Warn("删除容器失败，仍尝试重建", "device", deviceID, "err", err)
+	}
+	// 必须真的清空数据目录：删容器不删数据 = 假复位，脏状态原样留给下一个 agent。
+	// 清不干净就宁可把设备标 broken，也不能把「看起来干净」的设备放回池子。
+	if err := m.Driver.WipeData(ctx, deviceID, m.OverlayBase); err != nil {
+		d.State = StateBroken
+		_ = m.Store.UpsertDevice(d)
+		return fmt.Errorf("清空设备数据失败，已标记 broken: %w", err)
 	}
 	if err := m.Driver.Create(ctx, deviceID, m.Port(i), m.OverlayBase); err != nil {
 		d.State = StateBroken

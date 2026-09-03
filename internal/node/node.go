@@ -82,6 +82,30 @@ func (n *Node) Remove(ctx context.Context, deviceID string) error {
 	return err
 }
 
+// WipeData 清空设备的数据目录，这是「复位」真正生效的那一步。
+//
+// 只删容器再重建**不等于复位**：/data-diff（或 /data）挂在宿主目录上，
+// 容器没了目录还在，上一个 agent 装的包与登录态会原样留给下一个人。
+// 专项 C 实测该目录里大量文件属主是 root（Android 各 uid），
+// 普通用户 rm 会一路 Permission denied 只删掉一部分——留下一个「看起来复位了
+// 其实没干净」的状态，比不复位更危险。因此这里用一次性特权容器来删：
+// 不依赖宿主的 sudo 配置，删除动作和创建动作走同一条 docker 权限通道。
+func (n *Node) WipeData(ctx context.Context, deviceID, overlayBase string) error {
+	dir := n.DataRoot + "/data/" + deviceID
+	if overlayBase != "" {
+		dir = n.DataRoot + "/diff/" + deviceID
+	}
+	// busybox 足够小，且 redroid 镜像已在本地时也可换成它；这里显式用 busybox
+	// 保持与业务镜像解耦。挂父目录再删子目录，避免删除挂载点本身。
+	_, err := n.docker(ctx, "run", "--rm",
+		"-v", dir+":/wipe",
+		"busybox:stable", "sh", "-c", "rm -rf /wipe/* /wipe/.[!.]* 2>/dev/null; true")
+	if err != nil {
+		return fmt.Errorf("清空 %s: %w", dir, err)
+	}
+	return nil
+}
+
 // WaitBoot 轮询到 sys.boot_completed=1。Phase 1 实测约 11~13 s。
 func (n *Node) WaitBoot(ctx context.Context, deviceID string, timeout time.Duration) error {
 	name := ContainerName(deviceID)

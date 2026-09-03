@@ -216,3 +216,45 @@ func TestCreatePropagatesError(t *testing.T) {
 		t.Errorf("docker run 失败应向上传递，得到 %v", err)
 	}
 }
+
+func TestWipeDataUsesPrivilegedContainer(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	if err := n.WipeData(context.Background(), "d1", "/data/droidpool/base"); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(f.lastMatching("run --rm"), " ")
+	// overlay 模式清 diff 目录
+	if !strings.Contains(joined, "/data/droidpool/diff/d1:/wipe") {
+		t.Errorf("overlay 模式应清 diff 目录，实际: %s", joined)
+	}
+	// 必须删干净包括隐藏文件，否则残留状态会漏给下一个 agent
+	if !strings.Contains(joined, "/wipe/.[!.]*") {
+		t.Errorf("清空命令应覆盖隐藏文件，实际: %s", joined)
+	}
+	// 不能删挂载点本身，否则下次挂载会失败
+	if strings.Contains(joined, "rm -rf /wipe ") {
+		t.Errorf("不应删除挂载点本身，实际: %s", joined)
+	}
+}
+
+func TestWipeDataNonOverlayPath(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	if err := n.WipeData(context.Background(), "d2", ""); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(f.lastMatching("run --rm"), " ")
+	if !strings.Contains(joined, "/data/droidpool/data/d2:/wipe") {
+		t.Errorf("非 overlay 模式应清 data 目录，实际: %s", joined)
+	}
+}
+
+func TestWipeDataPropagatesError(t *testing.T) {
+	boom := errors.New("docker 不通")
+	f := &fakeRunner{replies: []reply{{match: "run --rm", err: boom}}}
+	n := testNode(f)
+	if err := n.WipeData(context.Background(), "d1", ""); !errors.Is(err, boom) {
+		t.Errorf("清空失败应向上传递，得到 %v", err)
+	}
+}

@@ -13,6 +13,8 @@ type fakeDriver struct {
 	mu          sync.Mutex
 	created     []string
 	removed     []string
+	wiped       []string
+	wipeErr     map[string]error
 	overlayArgs []string
 	ports       []int
 	createErr   map[string]error
@@ -35,6 +37,16 @@ func (f *fakeDriver) Remove(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = append(f.removed, id)
+	return nil
+}
+
+func (f *fakeDriver) WipeData(_ context.Context, id, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err, ok := f.wipeErr[id]; ok {
+		return err
+	}
+	f.wiped = append(f.wiped, id)
 	return nil
 }
 
@@ -236,6 +248,10 @@ func TestResetRecreatesContainer(t *testing.T) {
 	if len(drv.removed) != 1 || drv.removed[0] != "3588-a-1" {
 		t.Errorf("复位应先删容器，得到 %v", drv.removed)
 	}
+	// 关键：数据目录必须真的被清空。只删容器不清数据 = 假复位。
+	if len(drv.wiped) != 1 || drv.wiped[0] != "3588-a-1" {
+		t.Errorf("复位必须清空数据目录，得到 %v", drv.wiped)
+	}
 	if len(drv.created) != 1 {
 		t.Errorf("复位应重建容器，得到 %v", drv.created)
 	}
@@ -267,5 +283,32 @@ func TestIndexOf(t *testing.T) {
 		if _, err := m.indexOf(bad); err == nil {
 			t.Errorf("indexOf(%q) 应报错", bad)
 		}
+	}
+}
+
+// 数据清不干净时宁可把设备标 broken，也不能把「看起来干净」的设备放回池子——
+// 那正是本项目要消灭的失效：下一个 agent 上去看到的是别人的构建。
+func TestResetMarksBrokenWhenWipeFails(t *testing.T) {
+	drv := &fakeDriver{wipeErr: map[string]error{"3588-a-1": errors.New("目录被占用")}}
+	st := newMemStore()
+	m := newManager(drv, st, 1)
+	m.Ensure(context.Background())
+	drv.created = nil
+
+	d, _ := st.GetDevice("3588-a-1")
+	d.State = StateResetting
+	st.UpsertDevice(d)
+
+	err := m.Reset(context.Background(), "3588-a-1")
+	if err == nil {
+		t.Fatal("清空失败时 Reset 应报错")
+	}
+	d, _ = st.GetDevice("3588-a-1")
+	if d.State != StateBroken {
+		t.Errorf("清空失败的设备应标 broken，得到 %s", d.State)
+	}
+	// 绝不能重建成一台「可用」的脏设备
+	if len(drv.created) != 0 {
+		t.Errorf("清空失败后不应继续重建容器，得到 %v", drv.created)
 	}
 }
