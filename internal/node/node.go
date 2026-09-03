@@ -126,6 +126,19 @@ func (n *Node) WaitBoot(ctx context.Context, deviceID string, timeout time.Durat
 	}
 }
 
+// RunningSet 返回节点上正在运行的 droidpool 容器名集合。
+func (n *Node) RunningSet(ctx context.Context) (map[string]bool, error) {
+	names, err := n.Running(ctx)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(names))
+	for _, nm := range names {
+		set[nm] = true
+	}
+	return set, nil
+}
+
 // Running 列出节点上正在运行的 droidpool 容器名。
 func (n *Node) Running(ctx context.Context) ([]string, error) {
 	out, err := n.docker(ctx, "ps", "--format", "{{.Names}}")

@@ -107,6 +107,38 @@ func (m *Manager) createOne(ctx context.Context, i int) error {
 	return nil
 }
 
+// ReconcileStore 让库与节点对齐，在 Ensure 之前跑。
+//
+// 守护进程重启、上一版的 bug、有人手动 docker rm——都会让库里的状态和节点实况脱节。
+// 两种脱节各有后果：
+//   - 库说 ready/leased 但节点没容器：会一直把死设备分给人（health 循环 90 s 后才纠正）
+//   - 库说 resetting 但没人在复位（上一版 release 后无人接手）：永远卡住
+//
+// running 是节点上实际在跑的容器名集合。
+func (m *Manager) ReconcileStore(ctx context.Context, running map[string]bool) {
+	devices, err := m.Store.ListDevices()
+	if err != nil {
+		m.log().Error("对账读库失败", "err", err)
+		return
+	}
+	for _, d := range devices {
+		switch d.State {
+		case StateReady, StateLeased:
+			if !running[d.Container] {
+				m.log().Warn("库里活跃但节点无容器，标 broken", "device", d.ID, "was", d.State)
+				d.State = StateBroken
+				_ = m.Store.UpsertDevice(d)
+			}
+		case StateResetting, StateCreating:
+			// 没人在做这件事了（进程都重启了），直接重来
+			m.log().Warn("库里卡在中间态，重新复位", "device", d.ID, "was", d.State)
+			if err := m.Reset(ctx, d.ID); err != nil {
+				m.log().Error("对账复位失败", "device", d.ID, "err", err)
+			}
+		}
+	}
+}
+
 // Reset 复位一台设备：重建容器（overlay 模式下等价于丢弃 diff）→ 等 boot → 置 ready。
 // 实现 Reaper 的 Resetter 接口。
 func (m *Manager) Reset(ctx context.Context, deviceID string) error {

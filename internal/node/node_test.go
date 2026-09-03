@@ -361,3 +361,14 @@ func TestMakeGoldenFailsIfBootTimesOut(t *testing.T) {
 		t.Error("容器起不来时应报错，不能留下半成品 base")
 	}
 }
+
+func TestRunningSet(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{match: "ps --format", out: "droidpool-a\nother\ndroidpool-b\n"}}}
+	set, err := testNode(f).RunningSet(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !set["droidpool-a"] || !set["droidpool-b"] || set["other"] {
+		t.Errorf("集合内容不对: %v", set)
+	}
+}

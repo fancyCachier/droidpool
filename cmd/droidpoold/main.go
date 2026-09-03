@@ -88,6 +88,12 @@ func run() error {
 			} else {
 				log.Info("golden 就绪", "base", nc.DataRoot+"/base")
 			}
+			// 库与节点对账：清掉「库里活跃但节点没容器」和「卡在中间态」的脏记录
+			if running, err := nd.RunningSet(ctx); err != nil {
+				log.Warn("读节点容器列表失败，跳过库对账", "err", err)
+			} else {
+				mgr.ReconcileStore(ctx, running)
+			}
 			log.Info("补齐设备池", "node", nc.Name, "max_devices", nc.MaxDevices)
 			if err := mgr.Ensure(ctx); err != nil {
 				log.Error("补齐设备池失败", "err", err)

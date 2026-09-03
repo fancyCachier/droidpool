@@ -312,3 +312,69 @@ func TestResetMarksBrokenWhenWipeFails(t *testing.T) {
 		t.Errorf("清空失败后不应继续重建容器，得到 %v", drv.created)
 	}
 }
+
+// 库与节点脱节是守护进程重启后的常态。两种脱节各有后果：
+//   - 库说 ready 但节点没容器：会一直把死设备分给人
+//   - 库说 resetting 但没人在复位：永远卡住（首次部署真踩到了）
+func TestReconcileStoreMarksMissingContainersBroken(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	m := newManager(drv, st, 3)
+	m.Ensure(context.Background())
+	// 模拟节点上 2 号容器没了（有人 docker rm、或宿主重启）
+	running := map[string]bool{"droidpool-3588-a-1": true, "droidpool-3588-a-3": true}
+	m.ReconcileStore(context.Background(), running)
+
+	d2, _ := st.GetDevice("3588-a-2")
+	if d2.State != StateBroken {
+		t.Errorf("节点无容器的设备应标 broken，得到 %s", d2.State)
+	}
+	for _, id := range []string{"3588-a-1", "3588-a-3"} {
+		d, _ := st.GetDevice(id)
+		if d.State != StateReady {
+			t.Errorf("%s 容器还在，不应被动，得到 %s", id, d.State)
+		}
+	}
+}
+
+func TestReconcileStoreResetsStuckIntermediateStates(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	m := newManager(drv, st, 2)
+	m.Ensure(context.Background())
+	drv.created, drv.wiped = nil, nil
+	// 上一版 release 后无人复位，卡在 resetting；另一台卡在 creating（进程中途重启）
+	d1, _ := st.GetDevice("3588-a-1")
+	d1.State = StateResetting
+	st.UpsertDevice(d1)
+	d2, _ := st.GetDevice("3588-a-2")
+	d2.State = StateCreating
+	st.UpsertDevice(d2)
+
+	running := map[string]bool{"droidpool-3588-a-1": true, "droidpool-3588-a-2": true}
+	m.ReconcileStore(context.Background(), running)
+
+	for _, id := range []string{"3588-a-1", "3588-a-2"} {
+		d, _ := st.GetDevice(id)
+		if d.State != StateReady {
+			t.Errorf("%s 卡在中间态应被重新复位到 ready，得到 %s", id, d.State)
+		}
+	}
+	if len(drv.wiped) != 2 {
+		t.Errorf("两台都应真正复位（清数据），得到 %v", drv.wiped)
+	}
+}
+
+// leased 也一样：容器没了就是没了，持有它的 agent 下次 status 看到 broken 比对着死设备干等强。
+func TestReconcileStoreHandlesLeasedWithoutContainer(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	m := newManager(drv, st, 1)
+	m.Ensure(context.Background())
+	d, _ := st.GetDevice("3588-a-1")
+	d.State = StateLeased
+	st.UpsertDevice(d)
+
+	m.ReconcileStore(context.Background(), map[string]bool{})
+	d, _ = st.GetDevice("3588-a-1")
+	if d.State != StateBroken {
+		t.Errorf("leased 但节点无容器应标 broken，得到 %s", d.State)
+	}
+}

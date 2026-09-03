@@ -39,17 +39,32 @@
 1. **编译不过的变异等于没做变异。** 删掉一段 `if` 后 `d, err` 变成未使用变量，`go test` 输出的是构建错误而非测试结果，差点被当成「测试通过」。变异后必须先 `go build` 确认能编译，再看测试是否变红。
 2. **测试没覆盖到的边界，变异会沉默。** `expires_at<=?` 改成 `<` 时测试全绿，说明「恰好到期」这个边界没测。补上边界用例后变异才正确变红。不做变异校验就发现不了这个缺口。
 
-## 未完成
+## 2026-09-04 收尾：部署 + 三处真环境暴露的洞
+
+**已部署到 devopt**（192.168.14.32:8600，systemd `droidpoold`，`deploy/deploy.sh` 幂等）。
+token 在 `/opt/droidpool/env`，配置支持 `${VAR}` 展开，不进仓库。
+
+首次上真环境暴露三个本地测试发现不了的洞，都已修并有测试守着：
+
+| 洞 | 现象 | 修法 |
+|---|---|---|
+| **启动阻塞** | `Ensure` 在监听前建 8 台容器，端口迟迟不开，systemd 判死 | 先监听，补池放后台 goroutine |
+| **release 后卡 resetting** | `Release` 只改状态，没人去复位；设备永远 resetting | `Server.Resetter` 后台触发 `Reset` |
+| **库与节点脱节** | 重启后库说 ready 但节点没容器（一直分死设备给人）；卡在 resetting 无人接手 | 启动时 `ReconcileStore`：无容器的标 broken，中间态的重新复位 |
+
+另外补齐：
+- **golden 首次实现**（路线图写了但代码一直没有），空 base 会让 overlay 挂载失败
+- **Reconcile 节点容器**：清孤儿与占端口的容器（基线测试残留的 redroid-N 让整个池起不来）
+- **健康检查循环**：连续 3 次探活失败标 broken 并重建，中途恢复清零；真环境里 a-5 容器丢失后 90 s 内被正确判死重建
+- **CLI `run` / `seed-edge`**：装包 → 写 Edge 端点 → 启动 → 自动过两步引导，对真实 devopt 端到端 29 s 到登录页
+- 开源前审计（另一会话）：移除误提交的 3.5 MB 二进制、加 Apache-2.0、文档去人名
+
+## 仍未做
 
 | 项 | 说明 |
 |---|---|
-| 健康检查循环 | 连续 3 次 `adb shell true` 失败转 broken，模型里已有字段与阈值，循环未接 |
-| 设备墙（Phase 3） | htmx 页面、缩略图循环、SSE、ws-scrcpy 放大 |
-| `seed-edge` / `run` 子命令 | CLI 目前只做租约，装包与写 Edge 端点仍靠 `bench/` 脚本 |
-| `request-human` / `wait-human` | 服务端 `POST /api/leases/{id}/human` 已实现，CLI 侧未接 |
-| 工作流挂点 | big-boss 的 take-issue / merge skill、dsh-plugins 插件 |
-| 专项 C（overlayfs） | 已排队待跑，是零拷贝复位的前提；未验证前 `use_redroid_overlayfs` 只是配置默认值 |
-
-## 部署形态（待做）
-
-`droidpoold` 跑在 devopt（192.168.14.32:8600），systemd 常驻，bare 二进制（沿用 dev 环境 bare 部署约定）。CLI 分发 linux/amd64、linux/arm64、darwin/arm64 三个产物。
+| `request-human` / `wait-human` CLI | 服务端接口已有，CLI 未接 |
+| `shot` / `ui-dump` CLI | agent 现在直接用 adb，够用 |
+| dsh-plugins 插件 | Claude Code 侧 skill 已挂进 take-issue / merge，dsh 侧一行没写 |
+| H.264 路并发路数限制 | `maxStreams=4` 只在 MJPEG 路上；H.264 路同设备后来者接管，但跨设备无上限 |
+| 专项 B GPU host | 唯一能再压延迟的路径，Phase 4 |
