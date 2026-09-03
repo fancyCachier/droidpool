@@ -151,7 +151,7 @@ const $ = s => document.querySelector(s);
 const id = decodeURIComponent(location.pathname.split('/').pop());
 $('#title').textContent = id;
 
-const cv = $('#cv'), ctx = cv.getContext('2d', {alpha:false});
+const cv = $('#cv'), ctx = cv.getContext('2d', {alpha:false, willReadFrequently:true});
 let devW = 1366, devH = 768, lease = null;
 
 function flash(msg, isErr){
@@ -296,7 +296,9 @@ async function send(body){
 
 let down = null;
 cv.addEventListener('pointerdown', e => {
-  cv.setPointerCapture(e.pointerId);
+  // setPointerCapture 在某些情况下会抛（合成事件、指针已释放），
+  // 抛出来会中断整个处理函数，点击静默失效。捕获只是锦上添花，失败不该阻断操作。
+  try { cv.setPointerCapture(e.pointerId); } catch(_){}
   down = {...toDevice(e), t: Date.now()};
   addRipple(down.x, down.y, 'pending');   // 按下立刻给反馈
   e.preventDefault();

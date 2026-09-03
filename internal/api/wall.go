@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"io"
 	"net/http"
@@ -272,6 +273,13 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	quality := atoiDefault(r.URL.Query().Get("q"), 70)
 	maxW := atoiDefault(r.URL.Query().Get("w"), 0)
 
+	// 帧去重：借鉴 scrcpy「只在画面变化时出帧」。设备多数时间画面是静止的
+	// （等人操作、等网络），照推等同的帧只是白烧节点 CPU 和带宽。
+	// 但不能完全不发：浏览器要靠帧到达判断连接还活着，所以静止时降到每 2 s 一帧。
+	var lastSum uint64
+	lastSent := time.Now()
+	const idleKeepalive = 2 * time.Second
+
 	for {
 		select {
 		case <-r.Context().Done():
@@ -300,6 +308,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		sum := checksum(data)
+		if sum == lastSum && time.Since(lastSent) < idleKeepalive {
+			continue // 画面没变，不占带宽也不让浏览器白解一帧
+		}
+		lastSum, lastSent = sum, time.Now()
+
 		if _, err := fmt.Fprintf(w,
 			"--%s\r\nContent-Type: %s\r\nContent-Length: %d\r\nX-Device-Width: %d\r\nX-Device-Height: %d\r\n\r\n",
 			boundary, mime, len(data), size.X, size.Y); err != nil {
@@ -314,3 +328,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 }
+
+// checksum 是帧去重用的指纹。
+//
+// 用全量 crc32（Castagnoli，Go 会走 CPU 的 CRC 指令，约 GB/s 量级）而不是抽样：
+// 抽样会漏掉未采样位置的变化，把「画面变了」误判成「没变」而跳过该帧，
+// 表现为界面冻住——这比省下的那点 CPU 严重得多。
+// 10 万字节全量哈希约 0.1 ms，相对 0.35 s 的帧间隔可以忽略。
+func checksum(b []byte) uint64 {
+	return uint64(crc32.Checksum(b, crcTable))
+}
+
+var crcTable = crc32.MakeTable(crc32.Castagnoli)

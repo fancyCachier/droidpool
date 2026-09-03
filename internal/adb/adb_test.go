@@ -356,3 +356,35 @@ func TestSameDeviceStillSerialized(t *testing.T) {
 		t.Errorf("同一设备上同时有 %d 个抓图在跑，会花屏", maxSeen)
 	}
 }
+
+// 输入绝不能排在抓图后面：连续流几乎一直握着抓图锁，输入被拖到 1.7s 才发出，
+// 人点下去像没反应就会重复点，造成误操作。
+func TestInputNotBlockedByCapture(t *testing.T) {
+	release := make(chan struct{})
+	var capStarted sync.WaitGroup
+	capStarted.Add(1)
+	var once sync.Once
+
+	c := &Client{Runner: runnerFunc(func(_ context.Context, args ...string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "screencap") {
+			once.Do(capStarted.Done)
+			<-release // 模拟一次很慢的抓图（连续流就是这样长期占用）
+			return pngOf(64, 48), nil
+		}
+		return nil, nil
+	})}
+
+	go c.ScreencapPNG(context.Background(), "d:5561")
+	capStarted.Wait() // 确保抓图正在进行中
+
+	done := make(chan struct{})
+	go func() { c.Tap(context.Background(), "d:5561", 1, 2); close(done) }()
+
+	select {
+	case <-done: // 输入没被抓图挡住
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("输入被抓图阻塞了，人工操作会明显卡顿")
+	}
+	close(release)
+}

@@ -52,8 +52,13 @@ func New(bin string) *Client {
 	return &Client{Runner: execRunner{bin: bin}}
 }
 
-// lockFor 取某台设备的锁，按需创建。
-func (c *Client) lockFor(serial string) *sync.Mutex {
+// capLockFor 取某台设备的**抓图**锁。
+//
+// 只有 screencap 需要串行：同一设备并发抓图会拿到半截帧，画面花屏。
+// input（tap/swipe/key/text）不读帧缓冲，和抓图没有共享状态，**绝不能**
+// 跟抓图抢同一把锁——连续流几乎一直握着抓图锁，输入排在后面会被拖到
+// 1.7 s 才发出去（实测），人点下去像没反应，于是重复点造成误操作。
+func (c *Client) capLockFor(serial string) *sync.Mutex {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.locks == nil {
@@ -67,12 +72,18 @@ func (c *Client) lockFor(serial string) *sync.Mutex {
 	return m
 }
 
+// run 不加锁，供输入等不需要串行的操作使用。
 func (c *Client) run(ctx context.Context, serial string, args ...string) ([]byte, error) {
-	m := c.lockFor(serial)
-	m.Lock()
-	defer m.Unlock()
 	full := append([]string{"-s", serial}, args...)
 	return c.Runner.Output(ctx, full...)
+}
+
+// runCapture 串行化同一设备上的抓图。
+func (c *Client) runCapture(ctx context.Context, serial string, args ...string) ([]byte, error) {
+	m := c.capLockFor(serial)
+	m.Lock()
+	defer m.Unlock()
+	return c.run(ctx, serial, args...)
 }
 
 // Connect 连接网络设备（幂等，已连时也返回成功）。
@@ -89,7 +100,7 @@ func (c *Client) Connect(ctx context.Context, addr string) error {
 
 // ScreencapPNG 抓一张全分辨率截图（PNG）。
 func (c *Client) ScreencapPNG(ctx context.Context, serial string) ([]byte, error) {
-	return c.run(ctx, serial, "exec-out", "screencap", "-p")
+	return c.runCapture(ctx, serial, "exec-out", "screencap", "-p")
 }
 
 // pngSize 从 PNG 头部读出宽高，不做全图解码。
