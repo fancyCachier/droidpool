@@ -44,9 +44,16 @@ tapF "$EMP" || { echo "RESULT: 无员工卡 $EMP"; exit 3; }
 sleep 1
 for d in $(echo "$PIN" | grep -o .); do c=$(centerX "$d"); a shell input tap $c; sleep 0.3; done
 shot 11-pin
+# 登录按钮可能在首屏之下：按屏幕尺寸在卡片中线上滑，最多 3 次
 if ! tapX "登 录"; then
-  a shell input swipe 1280 1400 1280 500 300; sleep 1     # 登录按钮可能在首屏之下
-  tapX "登 录" || { echo "RESULT: 无登录按钮"; exit 4; }
+  read -r W H < <(a shell wm size | grep -oE "[0-9]+x[0-9]+" | tail -1 | tr x " ")
+  SX=$(centerX "PIN" | cut -d" " -f1); SX=${SX:-$((W/2))}
+  found=0
+  for _ in 1 2 3; do
+    a shell input swipe "$SX" $((H*85/100)) "$SX" $((H*35/100)) 300; sleep 1
+    tapX "登 录" && { found=1; break; }
+  done
+  [ $found = 1 ] || { echo "RESULT: 无登录按钮"; exit 4; }
 fi
 
 ok=0

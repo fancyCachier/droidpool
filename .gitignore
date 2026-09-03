@@ -1,8 +1,8 @@
+.droidpool
+*.db
+*.db-shm
+*.db-wal
 /bin/
 /dist/
-*.db
-*.db-wal
-*.db-shm
-.droidpool
-config.local.toml
 bench/out/
+config.local.toml
