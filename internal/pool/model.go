@@ -88,6 +88,9 @@ type Lease struct {
 
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// LastSeenAt 最后一次被 agent 碰到的时刻（watchdog 的活跃度信号）。
+	// 僵死的 agent 不再刷新它，空闲超时到了就被回收，不必等满整个 TTL。
+	LastSeenAt time.Time `json:"last_seen_at"`
 
 	// HumanTakeover 为真时 agent 应停手，等操作人员交还（设备墙上的接管开关）。
 	HumanTakeover bool     `json:"human_takeover"`
@@ -98,6 +101,39 @@ type Lease struct {
 // Expired 报告租约在 now 时是否已过期。
 func (l *Lease) Expired(now time.Time) bool {
 	return !now.Before(l.ExpiresAt)
+}
+
+// ReapReason 说明一条租约为何该被回收，空串表示不该回收。
+type ReapReason string
+
+const (
+	ReapExpired ReapReason = "ttl_expired"  // 到了约定的到期时刻
+	ReapIdle    ReapReason = "idle_timeout" // 久未活动，判定 agent 僵死
+	ReapTooLong ReapReason = "max_lifetime" // 一直有心跳但持有过久，硬上限兜底
+)
+
+// ShouldReap 判断租约是否该被 watchdog 回收，并给出原因。
+//
+// 三道闸各管一种失效：
+//   - TTL 到期：约定时间到了。
+//   - 空闲超时：agent 僵死（进程还在但不再干活），它不会再刷新 LastSeenAt。
+//     这是抓僵死的主力闸，比 TTL 快得多。
+//   - 生命周期上限：agent 卡在循环里一直心跳，TTL 与空闲闸都拦不住它，
+//     用持有总时长兜底。
+//
+// idleTimeout / maxLifetime 传 0 表示不启用该闸。
+// 人工接管中的租约豁免空闲闸——那时本来就该没有 agent 活动。
+func (l *Lease) ShouldReap(now time.Time, idleTimeout, maxLifetime time.Duration) ReapReason {
+	if maxLifetime > 0 && !l.CreatedAt.IsZero() && now.Sub(l.CreatedAt) >= maxLifetime {
+		return ReapTooLong
+	}
+	if l.Expired(now) {
+		return ReapExpired
+	}
+	if idleTimeout > 0 && !l.HumanTakeover && !l.LastSeenAt.IsZero() && now.Sub(l.LastSeenAt) >= idleTimeout {
+		return ReapIdle
+	}
+	return ""
 }
 
 // IdempotencyKey 同一 host 上同一 worktree 重复 claim 时复用既有租约。

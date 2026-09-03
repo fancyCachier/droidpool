@@ -105,6 +105,12 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+	// help 不该要 token —— 想看用法的人往往正是还没配好环境的人
+	switch os.Args[1] {
+	case "-h", "--help", "help":
+		usage()
+		return
+	}
 	base := envOr("DROIDPOOL_URL", "http://192.168.14.32:8600")
 	token := os.Getenv("DROIDPOOL_TOKEN")
 	if token == "" {
@@ -116,16 +122,23 @@ func main() {
 	case "claim":
 		cmdClaim(c)
 	case "addr":
+		go touchIfLeased(c) // 顺手证明自己还活着
 		s, err := loadState()
 		if err != nil {
 			fatal("%v", err)
 		}
 		fmt.Println(s.ADBAddr)
 	case "status":
+		touchIfLeased(c)
 		cmdStatus(c)
 	case "release":
 		cmdRelease(c)
+	case "watch":
+		cmdWatch(c)
+	case "heartbeat":
+		touchIfLeased(c)
 	case "devices":
+		touchIfLeased(c)
 		cmdDevices(c)
 	case "-h", "--help", "help":
 		usage()
@@ -172,6 +185,39 @@ func cmdClaim(c *client) {
 	// 顺手 adb connect，省掉 agent 一步
 	if out, err := exec.Command("adb", "connect", resp.ADBAddr).CombinedOutput(); err == nil {
 		fmt.Printf("  %s", out)
+	}
+}
+
+// heartbeat 告诉 watchdog「这个 agent 还活着」。失败只提示不中断——
+// 心跳失败最坏是设备被提前回收，不该让 agent 的正常操作也失败。
+func (c *client) heartbeat(leaseID string) {
+	if _, err := c.do("POST", "/api/leases/"+leaseID+"/heartbeat", nil, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "心跳失败（设备可能被提前回收）: %v\n", err)
+	}
+}
+
+// touchIfLeased 每条命令顺手发一次心跳，让「agent 在干活」这件事被看见。
+func touchIfLeased(c *client) {
+	if s, err := loadState(); err == nil && s.LeaseID != "" {
+		c.heartbeat(s.LeaseID)
+	}
+}
+
+func cmdWatch(c *client) {
+	s, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	every := 60 * time.Second
+	if v := os.Getenv("DROIDPOOL_HEARTBEAT_SEC"); v != "" {
+		if n, e := time.ParseDuration(v + "s"); e == nil && n > 0 {
+			every = n
+		}
+	}
+	fmt.Printf("持续心跳中（每 %s 一次，Ctrl-C 停止）：租约 %s 设备 %s\n", every, s.LeaseID, s.DeviceID)
+	for {
+		c.heartbeat(s.LeaseID)
+		time.Sleep(every)
 	}
 }
 
@@ -254,9 +300,16 @@ func usage() {
   status    查看租约；人工接管中时以退出码 10 结束
   release   归还设备
   devices   列出池中所有设备
+  heartbeat 发一次心跳（告诉 watchdog 自己还活着）
+  watch     持续心跳，跑长任务时后台挂着，防止被空闲闸回收
 
 环境变量:
   DROIDPOOL_URL     控制面地址（默认 http://192.168.14.32:8600）
   DROIDPOOL_TOKEN   鉴权 token（必填）
+  DROIDPOOL_HEARTBEAT_SEC  watch 的心跳间隔秒数（默认 60）
+
+watchdog：控制面会回收「久未活动」的租约（默认空闲 30 分钟），防止 agent
+僵死后一直占着机器。每条 droidpool 命令都会顺手发心跳；跑长任务时用
+droidpool watch & 挂个后台心跳。
 `)
 }

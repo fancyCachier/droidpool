@@ -68,7 +68,15 @@ func run() error {
 		}
 	}
 
-	reaper := &pool.Reaper{Store: st, Resetter: mgr, Interval: time.Minute, Log: log}
+	reaper := &pool.Reaper{
+		Store: st, Resetter: mgr,
+		Interval:    cfg.ReapInterval.Duration,
+		IdleTimeout: cfg.IdleTimeout.Duration,
+		MaxLifetime: cfg.MaxLifetime.Duration,
+		Log:         log,
+	}
+	log.Info("watchdog 启动", "巡检间隔", cfg.ReapInterval.Duration,
+		"空闲超时", cfg.IdleTimeout.Duration, "生命周期上限", cfg.MaxLifetime.Duration)
 	go reaper.Run(ctx)
 
 	srv := &api.Server{
@@ -76,6 +84,7 @@ func run() error {
 		DefaultTTL: cfg.DefaultTTL.Duration, MaxTTL: cfg.MaxTTL.Duration,
 		SwapGuardMiB: cfg.SwapGuardMiB,
 		Health:       healthAdapter{nd},
+		Log:          log,
 	}
 	h := &http.Server{
 		Addr:              cfg.Listen,

@@ -24,3 +24,12 @@ data_root   = "/data/droidpool"
 # 分辨率与密度 = 收银机实机 Sunmi D1s 2nd 实测（1366×768 @ 160 dpi）
 # use_memfd 不可省：.54 内核无 ashmem
 boot_args = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366 androidboot.redroid_height=768 androidboot.redroid_dpi=160 androidboot.redroid_gpu_mode=guest"
+
+# --- watchdog：防止 agent 僵死后一直占着机器 ---
+# 三道闸各管一种失效：
+#   default_ttl  约定的租期，到点回收
+#   idle_timeout 久未活动即判僵死（抓僵死的主力，比 TTL 快得多）
+#   max_lifetime 持有总时长硬上限，兜住「一直心跳但其实卡死」
+idle_timeout  = "30m"
+max_lifetime  = "24h"
+reap_interval = "1m"

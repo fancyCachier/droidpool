@@ -27,7 +27,13 @@ type Config struct {
 	DBPath     string   `toml:"db_path"`
 	DefaultTTL Duration `toml:"default_ttl"`
 	MaxTTL     Duration `toml:"max_ttl"`
-	WarmPool   int      `toml:"warm_pool"`
+	// IdleTimeout 租约多久没有 agent 活动就判定僵死并回收（watchdog 抓僵死的主力闸）。
+	IdleTimeout Duration `toml:"idle_timeout"`
+	// MaxLifetime 单个租约持有总时长的硬上限，兜住「一直心跳但其实卡死」的情况。
+	MaxLifetime Duration `toml:"max_lifetime"`
+	// ReapInterval watchdog 巡检间隔。
+	ReapInterval Duration `toml:"reap_interval"`
+	WarmPool     int      `toml:"warm_pool"`
 	// SwapGuardMiB 节点 swap 超过此值即拒绝新 claim。Phase 1 实测 swap 从 0 变正
 	// 就是性能断崖（N=12 起失败率 5.6%），比 CPU / 温度更有预警价值。
 	SwapGuardMiB int        `toml:"swap_guard_mib"`
@@ -92,6 +98,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxTTL.Duration == 0 {
 		c.MaxTTL.Duration = 24 * time.Hour
+	}
+	if c.IdleTimeout.Duration == 0 {
+		c.IdleTimeout.Duration = 30 * time.Minute
+	}
+	if c.MaxLifetime.Duration == 0 {
+		c.MaxLifetime.Duration = 24 * time.Hour
+	}
+	if c.ReapInterval.Duration == 0 {
+		c.ReapInterval.Duration = time.Minute
 	}
 	if c.SwapGuardMiB == 0 {
 		c.SwapGuardMiB = 256

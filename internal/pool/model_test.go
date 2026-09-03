@@ -98,3 +98,97 @@ func TestLeaseIdempotencyKey(t *testing.T) {
 		t.Error("分隔符可被绕过，键设计有歧义")
 	}
 }
+
+func TestShouldReapThreeGates(t *testing.T) {
+	base := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	// 一条正常租约：刚建、4h TTL、刚刚活动过
+	fresh := func() *Lease {
+		return &Lease{CreatedAt: base, ExpiresAt: base.Add(4 * time.Hour), LastSeenAt: base}
+	}
+	const idle = 30 * time.Minute
+	const maxLife = 24 * time.Hour
+
+	t.Run("健康租约不回收", func(t *testing.T) {
+		l := fresh()
+		l.LastSeenAt = base.Add(10 * time.Minute) // 10 分钟前还在活动
+		if r := l.ShouldReap(base.Add(20*time.Minute), idle, maxLife); r != "" {
+			t.Errorf("活跃租约不应回收，得到 %q", r)
+		}
+	})
+
+	t.Run("空闲超时抓僵死", func(t *testing.T) {
+		l := fresh() // 最后活动在 base，TTL 还有 4h
+		now := base.Add(31 * time.Minute)
+		if r := l.ShouldReap(now, idle, maxLife); r != ReapIdle {
+			t.Errorf("久未活动应判 idle_timeout，得到 %q", r)
+		}
+		// 这正是 watchdog 的价值：TTL 还远没到，但设备已经被白占了半小时
+		if l.Expired(now) {
+			t.Fatal("测试前提错了：此时 TTL 不应到期")
+		}
+	})
+
+	t.Run("空闲边界", func(t *testing.T) {
+		l := fresh()
+		if r := l.ShouldReap(base.Add(idle), idle, maxLife); r != ReapIdle {
+			t.Errorf("恰好到空闲阈值应回收，得到 %q", r)
+		}
+		if r := l.ShouldReap(base.Add(idle-time.Second), idle, maxLife); r != "" {
+			t.Errorf("差 1s 到阈值不应回收，得到 %q", r)
+		}
+	})
+
+	t.Run("TTL 到期", func(t *testing.T) {
+		l := fresh()
+		now := base.Add(4 * time.Hour)
+		l.LastSeenAt = now // 一直在活动，但约定时间到了
+		if r := l.ShouldReap(now, idle, maxLife); r != ReapExpired {
+			t.Errorf("TTL 到期应回收，得到 %q", r)
+		}
+	})
+
+	t.Run("生命周期上限兜底", func(t *testing.T) {
+		// 恶劣情形：agent 卡在循环里一直心跳、TTL 也被不断续，两道闸都拦不住
+		l := &Lease{CreatedAt: base, ExpiresAt: base.Add(100 * time.Hour), LastSeenAt: base.Add(25 * time.Hour)}
+		now := base.Add(25 * time.Hour)
+		if r := l.ShouldReap(now, idle, maxLife); r != ReapTooLong {
+			t.Errorf("超过生命周期上限应回收，得到 %q", r)
+		}
+	})
+
+	t.Run("人工接管豁免空闲闸", func(t *testing.T) {
+		// 人在设备墙上操作时本来就没有 agent 活动，不能因此把设备收走
+		l := fresh()
+		l.HumanTakeover = true
+		if r := l.ShouldReap(base.Add(2*time.Hour), idle, maxLife); r != "" {
+			t.Errorf("人工接管中不应因空闲被回收，得到 %q", r)
+		}
+		// 但 TTL 到期仍然回收，接管不是免死金牌
+		l2 := fresh()
+		l2.HumanTakeover = true
+		if r := l2.ShouldReap(base.Add(5*time.Hour), idle, maxLife); r != ReapExpired {
+			t.Errorf("接管中 TTL 到期仍应回收，得到 %q", r)
+		}
+	})
+
+	t.Run("闸可单独关闭", func(t *testing.T) {
+		l := fresh()
+		// idleTimeout=0 关掉空闲闸，久未活动也不收
+		if r := l.ShouldReap(base.Add(3*time.Hour), 0, maxLife); r != "" {
+			t.Errorf("空闲闸关闭时不应因空闲回收，得到 %q", r)
+		}
+		// maxLifetime=0 关掉硬上限
+		old := &Lease{CreatedAt: base, ExpiresAt: base.Add(1000 * time.Hour), LastSeenAt: base.Add(99 * time.Hour)}
+		if r := old.ShouldReap(base.Add(99*time.Hour), 0, 0); r != "" {
+			t.Errorf("两闸皆关时不应回收，得到 %q", r)
+		}
+	})
+
+	t.Run("从未活动过的租约不误判", func(t *testing.T) {
+		// LastSeenAt 为零值（老数据迁移上来）时不该被空闲闸秒杀
+		l := &Lease{CreatedAt: base, ExpiresAt: base.Add(4 * time.Hour)}
+		if r := l.ShouldReap(base.Add(time.Hour), idle, maxLife); r != "" {
+			t.Errorf("LastSeenAt 为零值不应触发空闲回收，得到 %q", r)
+		}
+	})
+}

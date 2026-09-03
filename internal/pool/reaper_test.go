@@ -13,15 +13,15 @@ import (
 // fakeLeaseStore 只实现回收器需要的两个方法，不覆写业务逻辑。
 type fakeLeaseStore struct {
 	mu       sync.Mutex
-	expired  []*Lease
+	active   []*Lease
 	released []string
 	failOn   map[string]error
 }
 
-func (f *fakeLeaseStore) ExpiredLeases(time.Time) ([]*Lease, error) {
+func (f *fakeLeaseStore) ActiveLeases() ([]*Lease, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.expired, nil
+	return f.active, nil
 }
 
 func (f *fakeLeaseStore) Release(id string, _ time.Time) (string, error) {
@@ -50,14 +50,20 @@ func (f *fakeResetter) Reset(_ context.Context, deviceID string) error {
 	return nil
 }
 
+// expiredLease 造一条 TTL 已过期的租约（回收器应当收走它）。
+func expiredLease(id string) *Lease {
+	past := time.Now().Add(-time.Hour)
+	return &Lease{ID: id, Owner: "woo@mac", Worktree: "wt-" + id,
+		CreatedAt: past, ExpiresAt: past.Add(time.Minute), LastSeenAt: past}
+}
+
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func TestReapOnceReleasesAndResets(t *testing.T) {
-	fs := &fakeLeaseStore{expired: []*Lease{
-		{ID: "L1", Owner: "woo@mac", Worktree: "wt-a"},
-		{ID: "L2", Owner: "woo@linux", Worktree: "wt-b"},
+	fs := &fakeLeaseStore{active: []*Lease{
+		expiredLease("L1"), expiredLease("L2"),
 	}}
 	fr := &fakeResetter{}
 	r := &Reaper{Store: fs, Resetter: fr, Log: quietLogger()}
@@ -95,8 +101,8 @@ func TestReapOnceNothingExpired(t *testing.T) {
 func TestReapOnceContinuesAfterReleaseFailure(t *testing.T) {
 	boom := errors.New("库锁住了")
 	fs := &fakeLeaseStore{
-		expired: []*Lease{{ID: "L1"}, {ID: "L2"}, {ID: "L3"}},
-		failOn:  map[string]error{"L2": boom},
+		active: []*Lease{expiredLease("L1"), expiredLease("L2"), expiredLease("L3")},
+		failOn: map[string]error{"L2": boom},
 	}
 	fr := &fakeResetter{}
 	r := &Reaper{Store: fs, Resetter: fr, Log: quietLogger()}
@@ -115,7 +121,7 @@ func TestReapOnceContinuesAfterReleaseFailure(t *testing.T) {
 
 // 复位失败同样不能中断后续回收。
 func TestReapOnceContinuesAfterResetFailure(t *testing.T) {
-	fs := &fakeLeaseStore{expired: []*Lease{{ID: "L1"}, {ID: "L2"}}}
+	fs := &fakeLeaseStore{active: []*Lease{expiredLease("L1"), expiredLease("L2")}}
 	fr := &fakeResetter{failOn: map[string]error{"dev-L1": errors.New("容器起不来")}}
 	r := &Reaper{Store: fs, Resetter: fr, Log: quietLogger()}
 
@@ -132,7 +138,7 @@ func TestReapOnceContinuesAfterResetFailure(t *testing.T) {
 }
 
 func TestReapOnceWithoutResetter(t *testing.T) {
-	fs := &fakeLeaseStore{expired: []*Lease{{ID: "L1"}}}
+	fs := &fakeLeaseStore{active: []*Lease{expiredLease("L1")}}
 	r := &Reaper{Store: fs, Log: quietLogger()} // Resetter 为 nil
 	n, err := r.ReapOnce(context.Background())
 	if err != nil || n != 1 {
@@ -156,7 +162,7 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 }
 
 func TestRunReapsOnTick(t *testing.T) {
-	fs := &fakeLeaseStore{expired: []*Lease{{ID: "L1"}}}
+	fs := &fakeLeaseStore{active: []*Lease{expiredLease("L1")}}
 	fr := &fakeResetter{}
 	r := &Reaper{Store: fs, Resetter: fr, Interval: 5 * time.Millisecond, Log: quietLogger()}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -176,5 +182,72 @@ func TestRunReapsOnTick(t *testing.T) {
 			t.Fatal("Run 在 2s 内没有触发任何回收")
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+}
+
+// watchdog 的核心场景：agent 僵死（进程还在但不再干活），TTL 远未到期，
+// 空闲闸必须把设备收回来，否则机器被白占到 TTL 结束。
+func TestReaperIdleGateCatchesZombieAgent(t *testing.T) {
+	now := time.Now()
+	zombie := &Lease{
+		ID: "Z1", Owner: "woo@mac", Worktree: "wt-zombie",
+		CreatedAt:  now.Add(-90 * time.Minute),
+		ExpiresAt:  now.Add(2 * time.Hour), // TTL 还剩 2 小时
+		LastSeenAt: now.Add(-45 * time.Minute),
+	}
+	busy := &Lease{
+		ID: "B1", Owner: "woo@linux", Worktree: "wt-busy",
+		CreatedAt:  now.Add(-90 * time.Minute),
+		ExpiresAt:  now.Add(2 * time.Hour),
+		LastSeenAt: now.Add(-1 * time.Minute), // 一分钟前还在干活
+	}
+	fs := &fakeLeaseStore{active: []*Lease{zombie, busy}}
+	fr := &fakeResetter{}
+	r := &Reaper{Store: fs, Resetter: fr, IdleTimeout: 30 * time.Minute, Log: quietLogger()}
+
+	n, err := r.ReapOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("应只回收僵死的那条，得到 %d", n)
+	}
+	if len(fs.released) != 1 || fs.released[0] != "Z1" {
+		t.Errorf("应回收 Z1（僵死），保留 B1（在忙），得到 %v", fs.released)
+	}
+	if len(fr.reset) != 1 || fr.reset[0] != "dev-Z1" {
+		t.Errorf("僵死租约的设备应被复位，得到 %v", fr.reset)
+	}
+}
+
+// 空闲闸关闭时，僵死 agent 只能等 TTL——这正是改造前的行为，用它守住回归。
+func TestReaperWithoutIdleGateKeepsZombie(t *testing.T) {
+	now := time.Now()
+	zombie := &Lease{
+		ID: "Z1", CreatedAt: now.Add(-90 * time.Minute),
+		ExpiresAt: now.Add(2 * time.Hour), LastSeenAt: now.Add(-89 * time.Minute),
+	}
+	fs := &fakeLeaseStore{active: []*Lease{zombie}}
+	r := &Reaper{Store: fs, Log: quietLogger()} // IdleTimeout 为 0
+
+	n, _ := r.ReapOnce(context.Background())
+	if n != 0 {
+		t.Errorf("空闲闸关闭时不应回收未到期的租约，得到 %d", n)
+	}
+}
+
+// 硬上限兜底：agent 一直心跳、TTL 也一直被续，仍不能永久占着机器。
+func TestReaperMaxLifetimeGate(t *testing.T) {
+	now := time.Now()
+	clingy := &Lease{
+		ID: "C1", CreatedAt: now.Add(-25 * time.Hour),
+		ExpiresAt: now.Add(4 * time.Hour), LastSeenAt: now, // 心跳很新鲜
+	}
+	fs := &fakeLeaseStore{active: []*Lease{clingy}}
+	r := &Reaper{Store: fs, IdleTimeout: 30 * time.Minute, MaxLifetime: 24 * time.Hour, Log: quietLogger()}
+
+	n, _ := r.ReapOnce(context.Background())
+	if n != 1 || len(fs.released) != 1 {
+		t.Errorf("持有超过 24h 应被硬上限回收，得到 n=%d released=%v", n, fs.released)
 	}
 }

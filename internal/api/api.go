@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ type Server struct {
 	Now          Clock
 	Health       NodeHealth // 可为 nil（无节点健康源时跳过准入检查）
 	NewID        func() string
+	Log          *slog.Logger
 }
 
 func (s *Server) now() time.Time {
@@ -53,6 +55,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("POST /api/leases", s.auth(s.handleClaim))
 	mux.Handle("GET /api/leases", s.auth(s.handleListLeases))
 	mux.Handle("POST /api/leases/{id}/renew", s.auth(s.handleRenew))
+	mux.Handle("POST /api/leases/{id}/heartbeat", s.auth(s.handleHeartbeat))
 	mux.Handle("POST /api/leases/{id}/human", s.auth(s.handleHuman))
 	mux.Handle("DELETE /api/leases/{id}", s.auth(s.handleRelease))
 	mux.Handle("GET /api/devices", s.auth(s.handleListDevices))
@@ -182,6 +185,12 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	// 刷新活跃度：claim 本身就是一次 agent 活动，复用路径同样算数，
+	// 否则 watchdog 会把「反复 claim 但没别的动作」的 agent 误判为僵死。
+	if err := s.Store.Touch(got.ID, now); err != nil {
+		s.logTouchFailure(got.ID, err)
+	}
+
 	code := http.StatusCreated
 	if reused {
 		code = http.StatusOK
@@ -239,7 +248,35 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	if err := s.Store.Touch(id, s.now()); err != nil {
+		s.logTouchFailure(id, err)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"expires_at": newExpiry})
+}
+
+// handleHeartbeat 只刷新活跃度，不动到期时间。
+// agent 用它告诉 watchdog「我还活着」，与「我要延长租期」是两回事：
+// 前者防僵死误杀，后者才是真的续租。
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	now := s.now()
+	if err := s.Store.Touch(id, now); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "租约不存在或已归还")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"last_seen_at": now})
+}
+
+func (s *Server) logTouchFailure(id string, err error) {
+	// 刷新活跃度失败不该让主流程失败——最坏结果是 watchdog 早一点回收，
+	// 不是把 agent 的正常操作打回。
+	if s.Log != nil {
+		s.Log.Warn("刷新租约活跃度失败", "lease", id, "err", err)
+	}
 }
 
 func (s *Server) handleHuman(w http.ResponseWriter, r *http.Request) {

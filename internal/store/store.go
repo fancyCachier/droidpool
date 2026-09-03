@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS leases (
   human_takeover INTEGER NOT NULL DEFAULT 0,
   human_note    TEXT NOT NULL DEFAULT '',
   edge_mode     TEXT NOT NULL DEFAULT 'shared',
-  released_at   INTEGER NOT NULL DEFAULT 0
+  released_at   INTEGER NOT NULL DEFAULT 0,
+  -- last_seen_at 是 watchdog 的活跃度信号：agent 每次经 CLI 碰这个租约就刷新。
+  -- 僵死的 agent 不会刷新，空闲超时到了就被回收，不必等满整个 TTL。
+  last_seen_at  INTEGER NOT NULL DEFAULT 0
 );
 -- 活跃租约里同一 (host, worktree) 只能有一条，保证 claim 幂等。
 -- 已归还的行 released_at 非 0，不参与唯一约束。
@@ -155,19 +158,20 @@ func (s *Store) SetDeviceState(id string, to pool.DeviceState) error {
 
 // ---------- 租约 ----------
 
-const leaseCols = `id, device_id, owner, host, worktree, branch, head_sha, created_at, expires_at, human_takeover, human_note, edge_mode`
+const leaseCols = `id, device_id, owner, host, worktree, branch, head_sha, created_at, expires_at, human_takeover, human_note, edge_mode, last_seen_at`
 
 func scanLease(sc interface{ Scan(...any) error }) (*pool.Lease, error) {
 	var l pool.Lease
-	var created, expires int64
+	var created, expires, lastSeen int64
 	var takeover int
 	var mode string
 	if err := sc.Scan(&l.ID, &l.DeviceID, &l.Owner, &l.Host, &l.Worktree, &l.Branch, &l.HeadSHA,
-		&created, &expires, &takeover, &l.HumanNote, &mode); err != nil {
+		&created, &expires, &takeover, &l.HumanNote, &mode, &lastSeen); err != nil {
 		return nil, err
 	}
 	l.CreatedAt = fromUnix(created)
 	l.ExpiresAt = fromUnix(expires)
+	l.LastSeenAt = fromUnix(lastSeen)
 	l.HumanTakeover = takeover != 0
 	l.EdgeMode = pool.EdgeMode(mode)
 	return &l, nil
@@ -208,14 +212,15 @@ func (s *Store) Claim(l *pool.Lease, now time.Time) (*pool.Lease, bool, error) {
 		return nil, false, err
 	}
 	l.DeviceID = devID
+	l.LastSeenAt = now
 	if l.EdgeMode == "" {
 		l.EdgeMode = pool.EdgeShared
 	}
 	if _, err := tx.Exec(`
-		INSERT INTO leases (id, device_id, owner, host, worktree, branch, head_sha, created_at, expires_at, human_takeover, human_note, edge_mode)
-		VALUES (?,?,?,?,?,?,?,?,?,0,'',?)`,
+		INSERT INTO leases (id, device_id, owner, host, worktree, branch, head_sha, created_at, expires_at, human_takeover, human_note, edge_mode, last_seen_at)
+		VALUES (?,?,?,?,?,?,?,?,?,0,'',?,?)`,
 		l.ID, l.DeviceID, l.Owner, l.Host, l.Worktree, l.Branch, l.HeadSHA,
-		unix(l.CreatedAt), unix(l.ExpiresAt), string(l.EdgeMode)); err != nil {
+		unix(l.CreatedAt), unix(l.ExpiresAt), string(l.EdgeMode), unix(now)); err != nil {
 		return nil, false, err
 	}
 	return l, false, tx.Commit()
@@ -307,6 +312,39 @@ func (s *Store) Release(id string, now time.Time) (deviceID string, err error) {
 		return "", err
 	}
 	return deviceID, tx.Commit()
+}
+
+// Touch 刷新租约的活跃度时间戳。agent 每次经 CLI 碰这个租约就调一次，
+// watchdog 靠它区分「agent 在忙」与「agent 僵死」。
+func (s *Store) Touch(id string, now time.Time) error {
+	res, err := s.db.Exec(`UPDATE leases SET last_seen_at=? WHERE id=? AND released_at=0`, unix(now), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ActiveLeases 返回全部未归还的租约，供 watchdog 逐条判定。
+// 判定逻辑放在 pool.Lease.ShouldReap 里（纯函数、好测），不下推成 SQL——
+// 三道闸的条件会变，散在 SQL 里改一处漏一处。
+func (s *Store) ActiveLeases() ([]*pool.Lease, error) {
+	rows, err := s.db.Query(`SELECT ` + leaseCols + ` FROM leases WHERE released_at=0 ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*pool.Lease
+	for rows.Next() {
+		l, err := scanLease(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
 }
 
 // ExpiredLeases 返回 now 时已过期的活跃租约。TTL 到期强制回收是唯一可靠的
