@@ -2,6 +2,7 @@
 
 redroid Android 设备池：给多个开发 agent（DeepSeek harness / Claude Code）并行验证 cashier-app 用的独占、干净、可丢弃的 Android 设备，附内网「设备墙」供操作人员观测、放大操作与接管。
 
+- **agent 怎么用：[docs/agent-guide.md](docs/agent-guide.md)** ← 先看这个
 - 路线图与全部决策：[docs/2026-09-03-roadmap.md](docs/2026-09-03-roadmap.md)
 - 组件：`droidpoold`（控制面，跑 devopt）· `droidpool`（agent CLI）· redroid 容器（跑 .54 节点）· ws-scrcpy（放大操作）
 - 语言：Go；面板 htmx 内嵌；全内网，不出公网
