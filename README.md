@@ -16,4 +16,18 @@ cmd/      droidpoold、droidpool（Phase 2 起）
 
 ## 状态
 
-Phase 0（节点与控制面就绪）进行中。
+- Phase 0 完成（2026-09-03）：.54 docker + 镜像、devopt SSH/docker CLI/adb、台账。
+- 首次发烟通过（2026-09-03）：13 s boot、binderfs 容器内自举、Impeller(Vulkan/SwiftShader) 渲染正常、登录到首页跑通。记录：[docs/2026-09-03-phase0-smoke.md](docs/2026-09-03-phase0-smoke.md)
+- Phase 1（性能基线与四个专项）进行中。
+
+## bench 脚本
+
+```bash
+# 节点 .54 上：起容器并等 boot（IMAGE/WIDTH/HEIGHT/DPI 可用环境变量覆盖）
+bench/redroid-up.sh redroid-1 5561
+# agent 宿主机上：装包 → 写 Edge 端点 → 登录到首页并计时
+adb connect 192.168.14.54:5561
+adb -s 192.168.14.54:5561 install -r app-debug.apk
+bench/seed-edge.sh 192.168.14.54:5561            # 默认 Edge 192.168.14.53:8090
+bench/login_flow.sh 192.168.14.54:5561 ./out     # 退出码 0 = 到首页
+```
