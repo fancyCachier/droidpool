@@ -129,6 +129,18 @@ including the UI-driving pitfalls we hit.
 | `release` | Return the device (it gets wiped and rebuilt) |
 | `devices` | List the pool |
 
+## Integrations
+
+| Agent runtime | Integration |
+|---|---|
+| Claude Code | a skill that wraps the CLI and hooks into the worktree lifecycle |
+| DeepSeek harness (dsh) | `/droidpool` command plugin; usage and pitfalls are injected into the system prompt |
+| Any MCP client | `droidpool-mcp` (stdio) exposes `droidpool_claim / run / status / heartbeat / release / devices` |
+
+```bash
+claude mcp add droidpool -e DROIDPOOL_URL=http://<control-plane>:8600 -e DROIDPOOL_TOKEN=<token> -- droidpool-mcp
+```
+
 ## HTTP API
 
 Lease endpoints require `Authorization: Bearer <token>`. Wall endpoints
@@ -161,6 +173,7 @@ POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …}
 ```
 cmd/droidpoold        control plane daemon
 cmd/droidpool         agent CLI
+cmd/droidpool-mcp     MCP server (stdio) wrapping the HTTP API
 internal/pool         lease model, state machine, watchdog, health checker, manager
 internal/store        SQLite persistence (idempotent claim, TTL queries)
 internal/node         docker-over-SSH node driver, golden image, reconciliation

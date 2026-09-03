@@ -167,7 +167,28 @@ CLI 会把这两种拒绝翻译成中文提示，不要当成错误往上抛。
 | 画面一直不变 | 设备墙上确认一下是不是 app 崩了 |
 | 操作没反应 | 看设备墙是否有人接管中 |
 
-## 10. 环境变量
+## 10. 三种接入方式
+
+| 你的 agent | 用什么 | 怎么装 |
+|---|---|---|
+| **Claude Code** | skill `droidpool`（big-boss 仓库 `.claude/skills/droidpool/`）+ CLI | 已挂进 take-issue / merge 流程，改 cashier-app 时自动触发 |
+| **dsh（DeepSeek harness）** | 指令插件 `@fancycachier/dsh-command-droidpool` | `dsh plugin --profile web add @fancycachier/dsh-command-droidpool`，之后 `/droidpool claim` 等；用法与坑已注入系统提示 |
+| **任何支持 MCP 的 agent** | `droidpool-mcp`（stdio） | 见下 |
+
+MCP 注册（以 Claude Code 为例，其它客户端同理）：
+
+```bash
+claude mcp add droidpool \
+  -e DROIDPOOL_URL=http://192.168.14.32:8600 \
+  -e DROIDPOOL_TOKEN=<token> \
+  -- droidpool-mcp
+```
+
+工具：`droidpool_claim` / `droidpool_run` / `droidpool_status` / `droidpool_heartbeat` /
+`droidpool_release` / `droidpool_devices`。server 的 instructions 里已写明流程与坑，
+agent 连上就知道该怎么用。三种方式背后是同一个控制面与同一份 CLI 逻辑，行为一致。
+
+## 11. 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
