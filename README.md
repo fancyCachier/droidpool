@@ -112,15 +112,22 @@ adb -s $(droidpool addr) shell ...   # drive the UI however you like
 droidpool release
 ```
 
-Long task? `droidpool watch &` keeps the heartbeat alive. See
-[`docs/agent-guide.md`](docs/agent-guide.md) (Chinese) for the full playbook,
-including the UI-driving pitfalls we hit.
+Long task? `droidpool watch &` keeps the heartbeat alive.
+
+Several agents on one machine sharing one checkout? Give each a distinct
+`DROIDPOOL_SESSION`: it becomes part of the idempotency key and of the local
+state file name, so the agents stop reusing one lease and piling onto a single
+device. The dsh plugin sets it automatically. `claim` warns on stderr whenever
+it reuses a lease that this directory did not create.
+
+See [`docs/agent-guide.md`](docs/agent-guide.md) (Chinese) for the full
+playbook, including the UI-driving pitfalls we hit.
 
 ## CLI
 
 | Command | Purpose |
 |---|---|
-| `claim [--ttl 4h]` | Lease a device for the current worktree (idempotent) |
+| `claim [--ttl 4h]` | Lease a device for the current worktree (idempotent per host + worktree, plus `DROIDPOOL_SESSION` when set) |
 | `addr` | Print the adb address, for `adb -s $(droidpool addr)` |
 | `run [--apk …]` | Install, seed backend endpoint, launch, auto-dismiss first-run dialogs |
 | `seed-edge [--host --port]` | Write backend endpoint + certificate pin into the app's prefs |
