@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -35,8 +36,8 @@ func newServer(t *testing.T, devices int, health NodeHealth) (*Server, http.Hand
 	t.Cleanup(func() { st.Close() })
 	for i := 1; i <= devices; i++ {
 		d := &pool.Device{
-			ID: "dev" + string(rune('0'+i)), Node: "n1", Container: "c",
-			ADBAddr: "192.168.14.54:556" + string(rune('0'+i)),
+			ID: fmt.Sprintf("dev%d", i), Node: "n1", Container: "c",
+			ADBAddr: fmt.Sprintf("192.168.14.54:%d", 5560+i),
 			State:   pool.StateReady, CreatedAt: time.Now(),
 		}
 		if err := st.UpsertDevice(d); err != nil {

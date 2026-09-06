@@ -64,6 +64,9 @@ type Resetter interface {
 	Reset(ctx context.Context, deviceID string) error
 }
 
+// CloseSessions 收尾所有设备墙实时会话，返回被取消的会话数。关停前调用。
+func (s *Server) CloseSessions() int { return s.h264.CloseAll() }
+
 func (s *Server) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -115,6 +118,10 @@ func (s *Server) servePage(name string) http.HandlerFunc {
 			http.Error(w, "页面缺失", http.StatusInternalServerError)
 			return
 		}
+		// 页面是内嵌的、只有几十 KB，但不能让浏览器缓存：没有缓存头时 Chrome 会按
+		// 启发式规则自己缓存，部署完新版本后操作人员仍在跑旧 JS，症状是「明明修好了
+		// 还是老样子」，而且普通刷新未必能拿到新的（实测踩过一次，排查花了很久）。
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(b)
 	}

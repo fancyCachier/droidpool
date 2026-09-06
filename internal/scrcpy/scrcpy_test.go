@@ -4,7 +4,10 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -303,5 +306,53 @@ func TestReadDeviceMessageRejectsGarbage(t *testing.T) {
 	}
 	if _, err := NewSession(nil, nil, 1, 1).ReadDeviceMessage(); err == nil {
 		t.Error("没有控制 socket 应报错")
+	}
+}
+
+// 起会话前必须先清掉设备上残留的服务端：一台设备只能有一个，残留的那个占着编码器，
+// 新会话连上却收不到帧，页面永远停在「等待首帧」。用一个把参数记到文件里的假 adb 验证
+// 清理确实发生、且发生在推 jar 之前。
+func TestStartKillsStaleServerBeforePush(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "adb.log")
+	fakeADB := filepath.Join(dir, "adb")
+	// push 让它失败，Start 会在那一步返回，此时清理应该已经跑过了
+	script := "#!/bin/sh\necho \"$@\" >> " + logFile + "\ncase \"$*\" in *push*) exit 1;; esac\nexit 0\n"
+	if err := os.WriteFile(fakeADB, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jar := filepath.Join(dir, "server.jar")
+	if err := os.WriteFile(jar, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Start(t.Context(), Options{
+		Serial: "1.2.3.4:5555", ServerJar: jar, ADBPath: fakeADB, LocalPort: 27998,
+	})
+	if err == nil {
+		t.Fatal("push 失败时 Start 应报错")
+	}
+	if !strings.Contains(err.Error(), "推送 scrcpy-server") {
+		t.Fatalf("清理是尽力而为，不该把流程截断在它那里，错误应来自推送：%v", err)
+	}
+	b, readErr := os.ReadFile(logFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	killAt, pushAt := -1, -1
+	for i, l := range lines {
+		if strings.Contains(l, "pkill") && strings.Contains(l, "com.genymobile.scrcpy.Server") {
+			killAt = i
+		}
+		if strings.Contains(l, "push") && pushAt < 0 {
+			pushAt = i
+		}
+	}
+	if killAt < 0 {
+		t.Fatalf("没有清理残留服务端，实际执行了：%v", lines)
+	}
+	if pushAt < 0 || killAt > pushAt {
+		t.Errorf("清理必须发生在推 jar 之前，实际顺序：%v", lines)
 	}
 }
