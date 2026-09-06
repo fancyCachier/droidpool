@@ -36,7 +36,12 @@ once, zoom into one, and take over when an agent needs help.
   Pointer down / move / up are forwarded as they happen through scrcpy's
   control socket, so drag, long-press and multi-touch (Alt/Ctrl + drag pinches)
   behave like a finger on the device; the wheel becomes a native scroll event.
-  Keys, text, screenshot to PNG or clipboard. **WebCodecs only exists in a
+  With the canvas focused the physical keyboard is forwarded too, modifiers
+  included, and the clipboard works both ways: the device's clipboard syncs up
+  to the page, and pasting sends text down — which is also how non-ASCII text
+  gets in, since Android's text injection silently drops characters the virtual
+  keyboard has no key for. Screenshot to PNG or clipboard. At most four devices
+  stream at once. **WebCodecs only exists in a
   secure context**: open the wall via HTTPS or `localhost` (an SSH port
   forward works); on a plain `http://<lan-ip>` URL the browser has no
   `VideoDecoder` and the page falls back to the 3 fps screenshot stream and
@@ -169,7 +174,8 @@ POST   /api/leases/{id}/human          {takeover: bool, note?}
 DELETE /api/leases/{id}                release → async reset
 GET    /api/devices · /api/leases · /api/health
 GET    /api/events                     SSE, full snapshot on every change
-GET    /api/devices/{id}/ws            WebSocket: H.264 access units down, live touch / scroll / key / text up
+GET    /api/devices/{id}/ws            WebSocket: H.264 access units and device clipboard down;
+                                       live touch / scroll / key / text / clipboard up
 GET    /api/devices/{id}/stream.h264   multipart H.264 (scrcpy), kept for curl-based measurements
 GET    /api/devices/{id}/stream.mjpg   multipart JPEG/PNG (screencap fallback)
 POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …} (fallback when no WebSocket session)

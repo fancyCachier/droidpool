@@ -255,6 +255,11 @@ func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
 		"settings put global window_animation_scale 0",
 		"settings put global transition_animation_scale 0",
 		"settings put global animator_duration_scale 0",
+		// 常亮要设两处。`svc power stayon true` 只在「已插电」时生效，而容器里没有
+		// 充电器，实测 stay_on_while_plugged_in 一直是 0，设备照样息屏——息屏就是
+		// 一片黑，agent 抓到的是黑图，操作人员看到的是黑屏，都难归因。
+		// screen_off_timeout 与是否插电无关，这条才是真正管用的。
+		"settings put system screen_off_timeout 2147483647",
 		"svc power stayon true",
 		"setprop persist.sys.locale zh-CN",
 		"setprop persist.sys.timezone Asia/Shanghai",

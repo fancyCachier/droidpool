@@ -311,6 +311,18 @@ func (r *recordingPointer) Scroll(x, y int, h, v float64) error {
 	r.scrolls = append(r.scrolls, fmt.Sprintf("%d,%d %.2f %.2f", x, y, h, v))
 	return nil
 }
+func (r *recordingPointer) KeyEvent(a scrcpy.KeyAction, code, meta uint32) error {
+	r.calls = append(r.calls, fmt.Sprintf("keyev %d %d %#x", a, code, meta))
+	return nil
+}
+func (r *recordingPointer) SetClipboard(text string, paste bool) error {
+	r.calls = append(r.calls, fmt.Sprintf("clip %q paste=%v", text, paste))
+	return nil
+}
+func (r *recordingPointer) GetClipboard(k scrcpy.CopyKey) error {
+	r.calls = append(r.calls, fmt.Sprintf("getclip %d", k))
+	return nil
+}
 
 func TestDispatchWSInputValidation(t *testing.T) {
 	r := &recordingPointer{}
@@ -376,4 +388,129 @@ func TestCloseReasonFitsRFCLimit(t *testing.T) {
 	if short := "no_control"; closeReason(short) != short {
 		t.Errorf("短 reason 不应被改动")
 	}
+}
+
+// 键盘直通、剪贴板与文本路由：纯 ASCII 短文本走 INJECT_TEXT，中文或超长走剪贴板粘贴。
+func TestDispatchWSInputKeyboardAndClipboard(t *testing.T) {
+	r := &recordingPointer{}
+	for _, in := range []wsInput{
+		{T: "keyev", A: "down", Code: 29, Meta: 0x3000},
+		{T: "keyev", A: "up", Code: 29, Meta: 0x3000},
+		{T: "text", Text: "hello"},
+		{T: "text", Text: "你好"},
+		{T: "text", Text: strings.Repeat("a", 301)},
+		{T: "text", Text: ""},
+		{T: "clip", Text: "abc", Paste: false},
+		{T: "clip", Text: "粘", Paste: true},
+		{T: "getclip", Copy: true},
+		{T: "getclip"},
+	} {
+		if err := dispatchWSInput(r, in); err != nil {
+			t.Errorf("%+v: %v", in, err)
+		}
+	}
+	want := []string{
+		"keyev 0 29 0x3000", "keyev 1 29 0x3000",
+		"text hello",
+		`clip "你好" paste=true`,
+		fmt.Sprintf("clip %q paste=true", strings.Repeat("a", 301)),
+		`clip "abc" paste=false`, `clip "粘" paste=true`,
+		"getclip 1", "getclip 0",
+	}
+	if len(r.calls) != len(want) {
+		t.Fatalf("calls = %q", r.calls)
+	}
+	for i := range want {
+		if r.calls[i] != want[i] {
+			t.Errorf("call[%d] = %q，期望 %q", i, r.calls[i], want[i])
+		}
+	}
+	if err := dispatchWSInput(r, wsInput{T: "keyev", A: "hold", Code: 1}); err == nil {
+		t.Error("未知按键动作应被拒绝")
+	}
+}
+
+// ping 在读循环里就地回 pong 并原样带回 ts，浏览器靠它算往返。
+// 设备侧推来的剪贴板要转成 clip 事件。
+func TestWSPingPongAndDeviceClipboard(t *testing.T) {
+	_, fd, url := wsTestServer(t)
+	c := wsDial(t, url)
+	wsHello(t, c)
+	<-fd.ready
+
+	wsSend(t, c, map[string]any{"t": "ping", "ts": 123456.5})
+	if m := wsReadText(t, c); m["t"] != "pong" || m["ts"] != 123456.5 {
+		t.Errorf("pong = %v", m)
+	}
+
+	// 设备侧：type 0 + len 4 + UTF-8
+	text := "来自设备"
+	msg := append([]byte{0, 0, 0, 0, byte(len(text))}, text...)
+	_ = fd.control.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fd.control.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	if m := wsReadText(t, c); m["t"] != "clip" || m["text"] != text {
+		t.Errorf("clip 事件 = %v", m)
+	}
+
+	// 中文文本上行 → 设备侧收到 SET_CLIPBOARD（type 9）带 paste
+	wsSend(t, c, map[string]any{"t": "text", "text": "你好"})
+	b := readExact(t, fd.control, 14+len("你好"))
+	if b[0] != 9 || b[9] != 1 || string(b[14:]) != "你好" {
+		t.Errorf("中文文本应走 SET_CLIPBOARD+paste，得到 % x", b)
+	}
+	// 物理键盘：Ctrl+A 按下
+	wsSend(t, c, map[string]any{"t": "keyev", "a": "down", "code": 29, "meta": 0x3000})
+	b = readExact(t, fd.control, 14)
+	if b[0] != 0 || b[1] != 0 || binary.BigEndian.Uint32(b[2:6]) != 29 || binary.BigEndian.Uint32(b[10:14]) != 0x3000 {
+		t.Errorf("keyev 应产生带 meta 的 INJECT_KEYCODE，得到 % x", b)
+	}
+}
+
+// 同时放大的设备数有上限；同设备的接管不算新增，释放后名额回来。
+func TestWSSessionCapCountsDevicesNotConnections(t *testing.T) {
+	s, h := newServer(t, 6, nil)
+	s.Scrcpy.ServerJar = "fake.jar"
+	s.StartScrcpy = func(context.Context, scrcpy.Options) (*scrcpy.Session, error) {
+		vc, vs := net.Pipe()
+		cc, cs := net.Pipe()
+		t.Cleanup(func() { vs.Close(); cs.Close() })
+		return scrcpy.NewSession(vc, cc, 1366, 768), nil
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	base := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/devices/"
+
+	var conns []*websocket.Conn
+	for i := 1; i <= wsMaxDevices; i++ {
+		c := wsDial(t, fmt.Sprintf("%sdev%d/ws", base, i))
+		wsHello(t, c)
+		conns = append(conns, c)
+	}
+	// 第 5 台被拒，带原因
+	c5 := wsDial(t, base+"dev5/ws")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	_, _, err := c5.Read(ctx)
+	cancel()
+	var ce websocket.CloseError
+	if !errors.As(err, &ce) || ce.Reason != "too_many_sessions" {
+		t.Fatalf("超出上限应收到 too_many_sessions，得到 %v", err)
+	}
+	// 同设备 reload（接管）不受上限影响
+	again := wsDial(t, base+"dev1/ws")
+	wsHello(t, again)
+	// 释放一台后名额回来
+	if err := conns[1].Close(websocket.StatusNormalClosure, ""); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for s.h264.controller("dev2") != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("dev2 断开后会话应被清掉")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c6 := wsDial(t, base+"dev6/ws")
+	wsHello(t, c6)
 }

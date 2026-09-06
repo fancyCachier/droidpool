@@ -48,19 +48,28 @@ type inputInjector interface {
 
 // acquire 为设备登记一个新会话，取消同设备上已有的旧会话。返回本会话的代数与端口。
 func (h *h264Sessions) acquire(id string, portBase int, cancel context.CancelFunc) (gen uint64, port int) {
+	gen, port, _ = h.acquireCapped(id, portBase, 0, cancel)
+	return gen, port
+}
+
+// acquireCapped 同 acquire，但同时开着会话的设备数不超过 maxDevices（0 = 不限）。
+// 按设备数而不是连接数算：同设备的接管（reload）不该被自己挡住。
+func (h *h264Sessions) acquireCapped(id string, portBase, maxDevices int, cancel context.CancelFunc) (gen uint64, port int, ok bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.live == nil {
 		h.live = map[string]*liveSession{}
 	}
-	if old, ok := h.live[id]; ok {
+	if old, exists := h.live[id]; exists {
 		old.cancel() // 让旧的流循环退出；它的 release 会因代数不符而不动新条目
+	} else if maxDevices > 0 && len(h.live) >= maxDevices {
+		return 0, 0, false
 	}
 	h.next++
 	gen = uint64(h.next)
 	h.live[id] = &liveSession{cancel: cancel, gen: gen}
 	// 端口按代数轮换，避免旧会话还没放掉 forward 时新会话撞上同一个端口
-	return gen, portBase + int(gen%64)
+	return gen, portBase + int(gen%64), true
 }
 
 func (h *h264Sessions) setController(id string, gen uint64, c inputInjector) {

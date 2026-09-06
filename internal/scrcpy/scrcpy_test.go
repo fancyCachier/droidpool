@@ -256,3 +256,52 @@ func TestNewSessionAliveUntilClosed(t *testing.T) {
 		t.Error("Close 后控制连接应已断开")
 	}
 }
+
+// 设备消息：剪贴板（type 0 + len 4 + UTF-8）、ACK（type 1 + seq 8）、UHID（type 2 + id 2 + len 2 + data）。
+func TestReadDeviceMessageParsesAllTypes(t *testing.T) {
+	cc, cs := net.Pipe()
+	t.Cleanup(func() { cc.Close(); cs.Close() })
+	s := NewSession(nil, cc, 1, 1)
+	go func() {
+		msg := []byte{0, 0, 0, 0, 6}
+		msg = append(msg, "你好"...)
+		msg = append(msg, 1, 0, 0, 0, 0, 0, 0, 0, 42)
+		msg = append(msg, 2, 0, 7, 0, 3, 9, 9, 9)
+		msg = append(msg, 0, 0, 0, 0, 2, 'o', 'k')
+		cs.Write(msg)
+	}()
+	m, err := s.ReadDeviceMessage()
+	if err != nil || m.Type != DeviceMsgClipboard || m.Text != "你好" {
+		t.Fatalf("剪贴板消息 = %+v, %v", m, err)
+	}
+	m, err = s.ReadDeviceMessage()
+	if err != nil || m.Type != DeviceMsgAckClipboard || m.Sequence != 42 {
+		t.Fatalf("ACK 消息 = %+v, %v", m, err)
+	}
+	m, err = s.ReadDeviceMessage()
+	if err != nil || m.Type != DeviceMsgUHIDOutput {
+		t.Fatalf("UHID 消息 = %+v, %v", m, err)
+	}
+	// UHID 的负载必须被整段跳过，否则下一条会错位
+	m, err = s.ReadDeviceMessage()
+	if err != nil || m.Type != DeviceMsgClipboard || m.Text != "ok" {
+		t.Fatalf("UHID 之后的剪贴板消息 = %+v, %v", m, err)
+	}
+}
+
+func TestReadDeviceMessageRejectsGarbage(t *testing.T) {
+	cc, cs := net.Pipe()
+	t.Cleanup(func() { cc.Close(); cs.Close() })
+	s := NewSession(nil, cc, 1, 1)
+	go func() { cs.Write([]byte{0, 0xff, 0xff, 0xff, 0xff}) }()
+	if _, err := s.ReadDeviceMessage(); err == nil {
+		t.Error("荒谬的长度应报错而不是申请 4 GB 内存")
+	}
+	go func() { cs.Write([]byte{9}) }()
+	if _, err := s.ReadDeviceMessage(); err == nil {
+		t.Error("未知类型应报错")
+	}
+	if _, err := NewSession(nil, nil, 1, 1).ReadDeviceMessage(); err == nil {
+		t.Error("没有控制 socket 应报错")
+	}
+}

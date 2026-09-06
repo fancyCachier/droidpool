@@ -99,7 +99,9 @@ func Start(ctx context.Context, opt Options) (*Session, error) {
 	}
 	s := &Session{opt: opt, scid: newSCID()}
 
-	if out, err := s.adbCmd(ctx, "push", opt.ServerJar, devicePath).CombinedOutput(); err != nil {
+	// --sync：设备上已有同样新的 jar 就不传了，每次开放大页省掉 700 KB 的传输。
+	// 设备复位会清掉 /data/local/tmp，届时自然会重传。
+	if out, err := s.adbCmd(ctx, "push", "--sync", opt.ServerJar, devicePath).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("推送 scrcpy-server: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	port := strconv.Itoa(opt.LocalPort)
@@ -306,4 +308,72 @@ func indexByte(b []byte, c byte) int {
 		}
 	}
 	return -1
+}
+
+// DeviceMessageType 是服务端经控制 socket 主动推来的消息类型。
+type DeviceMessageType byte
+
+const (
+	DeviceMsgClipboard    DeviceMessageType = 0 // 设备剪贴板内容（GET_CLIPBOARD 的回应，或设备侧复制时自动推送）
+	DeviceMsgAckClipboard DeviceMessageType = 1 // SET_CLIPBOARD 带 sequence 时的回执
+	DeviceMsgUHIDOutput   DeviceMessageType = 2 // UHID 设备输出，我们不用
+)
+
+// DeviceMessage 一条设备消息。
+type DeviceMessage struct {
+	Type     DeviceMessageType
+	Text     string // Clipboard
+	Sequence uint64 // AckClipboard
+}
+
+// maxDeviceMessageBytes 与服务端 MESSAGE_MAX_SIZE 一致，超过即视为流错位。
+const maxDeviceMessageBytes = 1 << 18
+
+// ReadDeviceMessage 读一条设备消息，没有就阻塞。
+//
+// 控制 socket 是双向的：Controller 往里写输入，这里读服务端推回来的东西。
+// 必须有人读——scrcpy 默认 clipboard_autosync=true，设备剪贴板一变就往 socket 里塞，
+// 没人读缓冲区终会堵死，到时设备侧的发送线程会卡住。
+func (s *Session) ReadDeviceMessage() (*DeviceMessage, error) {
+	if s.control == nil {
+		return nil, errors.New("控制 socket 未连接")
+	}
+	var t [1]byte
+	if _, err := io.ReadFull(s.control, t[:]); err != nil {
+		return nil, err
+	}
+	m := &DeviceMessage{Type: DeviceMessageType(t[0])}
+	switch m.Type {
+	case DeviceMsgClipboard:
+		var l [4]byte
+		if _, err := io.ReadFull(s.control, l[:]); err != nil {
+			return nil, err
+		}
+		n := binary.BigEndian.Uint32(l[:])
+		if n > maxDeviceMessageBytes {
+			return nil, fmt.Errorf("剪贴板消息长 %d 不合理，控制流已错位", n)
+		}
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(s.control, buf); err != nil {
+			return nil, err
+		}
+		m.Text = string(buf)
+	case DeviceMsgAckClipboard:
+		var b [8]byte
+		if _, err := io.ReadFull(s.control, b[:]); err != nil {
+			return nil, err
+		}
+		m.Sequence = binary.BigEndian.Uint64(b[:])
+	case DeviceMsgUHIDOutput:
+		var h [4]byte // id 2 字节 + 长度 2 字节
+		if _, err := io.ReadFull(s.control, h[:]); err != nil {
+			return nil, err
+		}
+		if _, err := io.CopyN(io.Discard, s.control, int64(binary.BigEndian.Uint16(h[2:4]))); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("未知设备消息类型 %d，控制流已错位", t[0])
+	}
+	return m, nil
 }

@@ -31,8 +31,14 @@ import (
 //	                 二进制     [flags 1 字节][H.264 访问单元]   flags: bit0 = 参数集(SPS/PPS)，bit1 = 关键帧
 //	浏览器 → 服务端  文本 JSON  {"t":"touch","a":"down|move|up","id":0,"x":..,"y":..,"p":1}
 //	                            {"t":"scroll","x":..,"y":..,"dx":0,"dy":-1}   dx/dy ∈ [-1,1]，与 Android AXIS_*SCROLL 同向
-//	                            {"t":"key","key":"back"}  {"t":"text","text":"…"}
+//	                            {"t":"key","key":"back"}  {"t":"text","text":"…"}   text 里的中文经设备剪贴板粘贴
+//	                            {"t":"keyev","a":"down|up","code":<Android keycode>,"meta":<META_* 位>}   物理键盘直通
+//	                            {"t":"clip","text":"…","paste":true}   写设备剪贴板（paste = 顺便粘贴）
+//	                            {"t":"getclip","copy":true}            取设备剪贴板，结果异步以下面的 clip 事件回来
+//	                            {"t":"ping","ts":…}                    服务端原样回 pong，浏览器算往返
 //	                            {"t":"tap",…} / {"t":"swipe",…}   与 /input 同义，给退化路径用
+//	服务端 → 浏览器  文本 JSON  {"t":"clip","text":"…"}   设备剪贴板（getclip 的回应，或设备侧复制时自动推送）
+//	                            {"t":"pong","ts":…}
 //
 // 前置失败（未配 scrcpy-server、设备侧起不来）用 close 帧的 reason 告诉浏览器，
 // 浏览器据此退回截图流——升级前的 HTTP 状态码在浏览器的 WebSocket API 里拿不到。
@@ -55,6 +61,11 @@ const (
 	wsReadLimit = 64 << 10
 	// wsCloseReasonMax 是 RFC 6455 对 close 帧 reason 的长度上限。
 	wsCloseReasonMax = 123
+	// wsMaxDevices 同时允许多少台设备开着实时通道。每路都占节点一个软件编码器，
+	// 与 MJPEG 的 maxStreams 同理；同设备的接管不算新增。
+	wsMaxDevices = 4
+	// injectTextMax 是 INJECT_TEXT 的服务端上限，超过或含非 ASCII 的文本改走剪贴板粘贴。
+	injectTextMax = 300
 )
 
 var (
@@ -88,6 +99,14 @@ type wsInput struct {
 	MS   int     `json:"ms"`
 	Key  string  `json:"key"`
 	Text string  `json:"text"`
+	// keyev
+	Code uint32 `json:"code"`
+	Meta uint32 `json:"meta"`
+	// clip / getclip
+	Paste bool `json:"paste"`
+	Copy  bool `json:"copy"`
+	// ping
+	TS float64 `json:"ts"`
 }
 
 // pointerInjector 是 WebSocket 通道需要的控制器能力，scrcpy.Controller 实现它。
@@ -95,6 +114,9 @@ type pointerInjector interface {
 	inputInjector
 	Touch(action scrcpy.TouchAction, pointerID uint64, x, y int, pressure float64) error
 	Scroll(x, y int, hscroll, vscroll float64) error
+	KeyEvent(action scrcpy.KeyAction, keycode, metaState uint32) error
+	SetClipboard(text string, paste bool) error
+	GetClipboard(key scrcpy.CopyKey) error
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +144,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// 浏览器自己走了 → 什么都不用说。
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
-	gen, port := s.h264.acquire(d.ID, s.Scrcpy.PortBase, func() { cancel(errTakenOver) })
+	started := time.Now()
+	defer func() {
+		// 会话为什么结束、活了多久：间歇性重连只能靠这行归因
+		if s.Log != nil {
+			s.Log.Info("设备墙实时会话结束", "device", d.ID,
+				"时长", time.Since(started).Round(time.Millisecond), "原因", context.Cause(ctx))
+		}
+	}()
+	gen, port, ok := s.h264.acquireCapped(d.ID, s.Scrcpy.PortBase, wsMaxDevices, func() { cancel(errTakenOver) })
+	if !ok {
+		_ = c.Close(websocket.StatusTryAgainLater, "too_many_sessions")
+		return
+	}
 	defer s.h264.release(d.ID, gen)
 
 	sess, err := s.scrcpyStart(ctx, scrcpy.Options{
@@ -165,6 +199,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		cancel(err)
 	}()
 	go wsKeepalive(ctx, c, cancel)
+	go wsPumpDeviceMessages(c, sess)
 
 	// 读循环故意不用会话 ctx（见文件头注释）：靠对端的 close 帧或 TCP 断开返回
 	for {
@@ -181,6 +216,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			_ = wsSendJSON(c, map[string]any{"t": "error", "msg": "不是合法 JSON"})
 			continue
 		}
+		if in.T == "ping" {
+			_ = wsSendJSON(c, map[string]any{"t": "pong", "ts": in.TS})
+			continue
+		}
 		if err := dispatchWSInput(ctrl, in); err != nil {
 			_ = wsSendJSON(c, map[string]any{"t": "error", "msg": err.Error()})
 			continue
@@ -188,6 +227,22 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if !(in.T == "touch" && in.A == "move") {
 			// 操作过后缩略图缓存立刻失效，墙面才能尽快反映变化；move 每秒几十条，不值得
 			s.shots.invalidate(d.ADBAddr)
+		}
+	}
+}
+
+// wsPumpDeviceMessages 把设备经控制 socket 推回来的剪贴板转给浏览器。
+// 会话关闭时控制 socket 一起关，这里读到错误就退出，不需要额外的取消信号。
+func wsPumpDeviceMessages(c *websocket.Conn, sess *scrcpy.Session) {
+	for {
+		m, err := sess.ReadDeviceMessage()
+		if err != nil {
+			return
+		}
+		if m.Type == scrcpy.DeviceMsgClipboard {
+			if err := wsSendJSON(c, map[string]any{"t": "clip", "text": m.Text}); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -296,13 +351,56 @@ func dispatchWSInput(ctrl pointerInjector, in wsInput) error {
 		return ctrl.Touch(a, uint64(in.ID), in.X, in.Y, p)
 	case "scroll":
 		return ctrl.Scroll(in.X, in.Y, in.DX, in.DY)
-	case "tap", "swipe", "key", "text":
+	case "keyev":
+		var a scrcpy.KeyAction
+		switch in.A {
+		case "down":
+			a = scrcpy.KeyDown
+		case "up":
+			a = scrcpy.KeyUp
+		default:
+			return fmt.Errorf("未知按键动作 %q", in.A)
+		}
+		return ctrl.KeyEvent(a, in.Code, in.Meta)
+	case "text":
+		return injectText(ctrl, in.Text)
+	case "clip":
+		return ctrl.SetClipboard(in.Text, in.Paste)
+	case "getclip":
+		key := scrcpy.CopyKeyNone
+		if in.Copy {
+			key = scrcpy.CopyKeyCopy
+		}
+		return ctrl.GetClipboard(key)
+	case "tap", "swipe", "key":
 		return injectViaController(ctrl, inputReq{
-			Type: in.T, X: in.X, Y: in.Y, X2: in.X2, Y2: in.Y2, MS: in.MS, Key: in.Key, Text: in.Text,
+			Type: in.T, X: in.X, Y: in.Y, X2: in.X2, Y2: in.Y2, MS: in.MS, Key: in.Key,
 		})
 	default:
 		return fmt.Errorf("%w: %q", errBadInputType, in.T)
 	}
+}
+
+// injectText 选一条能把文本送进设备的路：纯 ASCII 且不长走 INJECT_TEXT（逐字符按键，
+// 最像真打字）；含中文或太长的走「写剪贴板 + 粘贴」——INJECT_TEXT 遇到虚拟键盘上没有的
+// 字符会静默丢掉，之前页面上「文本不支持中文」就是这个原因。
+func injectText(ctrl pointerInjector, text string) error {
+	if text == "" {
+		return nil
+	}
+	if len(text) <= injectTextMax && isASCII(text) {
+		return ctrl.Text(text)
+	}
+	return ctrl.SetClipboard(text, true)
+}
+
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // closeReason 把 reason 截到 RFC 允许的长度，且不切坏 UTF-8。
