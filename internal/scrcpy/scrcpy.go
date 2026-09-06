@@ -13,11 +13,13 @@
 package scrcpy
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os/exec"
 	"strconv"
@@ -52,6 +54,8 @@ type Options struct {
 	MaxFPS    int    // 0 = 不限
 	BitRate   int    // 0 = 服务端默认
 	MaxSize   int    // 0 = 原始分辨率
+	// Log 非空时把设备端服务端的输出转记到这里，便于排查「连上了但没有帧」。
+	Log *slog.Logger
 }
 
 // Session 一次投屏会话。
@@ -99,6 +103,18 @@ func Start(ctx context.Context, opt Options) (*Session, error) {
 	}
 	s := &Session{opt: opt, scid: newSCID()}
 
+	// 起新会话前先清掉设备上残留的服务端。
+	//
+	// 一台设备同时只该有一个 scrcpy 服务端：它独占显示编码器，残留的那个会让新会话
+	// 连上却永远收不到帧，页面就一直停在「等待首帧」的黑屏，而且重开多少次都一样。
+	// 残留是常态而不是意外——droidpoold 一重启（每次部署都会），正在跑的 WebSocket
+	// 连接是被 hijack 出去的，http.Server.Shutdown 不等它们，进程直接退出，
+	// 设备侧的 app_process 就留在那里了。所以这里不做「假设上次清干净了」的假设。
+	//
+	// pkill 的退出码不能信：`pkill -f <pat>` 的自身命令行也含有该模式，会把自己
+	// 一起杀掉（实测退出码 143）。只要发出去就行，杀没杀到看后续能否收到帧。
+	_ = s.adbCmd(ctx, "shell", "pkill", "-f", "com.genymobile.scrcpy.Server").Run()
+
 	// --sync：设备上已有同样新的 jar 就不传了，每次开放大页省掉 700 KB 的传输。
 	// 设备复位会清掉 /data/local/tmp，届时自然会重传。
 	if out, err := s.adbCmd(ctx, "push", "--sync", opt.ServerJar, devicePath).CombinedOutput(); err != nil {
@@ -124,6 +140,16 @@ func Start(ctx context.Context, opt Options) (*Session, error) {
 		args = append(args, "max_size="+strconv.Itoa(opt.MaxSize))
 	}
 	s.cmd = s.adbCmd(ctx, args...)
+	// 设备端服务端自己的日志（log_level=info）走这条 adb shell 的 stdout/stderr。
+	// 之前直接丢掉，结果它报错时我们这边只看到「连上了但没有帧」，无从归因。
+	if opt.Log != nil {
+		if out, err := s.cmd.StdoutPipe(); err == nil {
+			go logLines(opt.Log, s.opt.Serial, "stdout", out)
+		}
+		if errp, err := s.cmd.StderrPipe(); err == nil {
+			go logLines(opt.Log, s.opt.Serial, "stderr", errp)
+		}
+	}
 	if err := s.cmd.Start(); err != nil {
 		s.Close()
 		return nil, fmt.Errorf("启动 scrcpy-server: %w", err)
@@ -376,4 +402,16 @@ func (s *Session) ReadDeviceMessage() (*DeviceMessage, error) {
 		return nil, fmt.Errorf("未知设备消息类型 %d，控制流已错位", t[0])
 	}
 	return m, nil
+}
+
+// logLines 把设备端服务端的输出按行转记，丢掉 scrcpy 每次都打的横幅噪声。
+func logLines(log *slog.Logger, serial, stream string, r io.Reader) {
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "[server] INFO: Device:") {
+			continue
+		}
+		log.Info("scrcpy 服务端", "device", serial, "流", stream, "行", line)
+	}
 }

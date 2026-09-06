@@ -172,6 +172,11 @@ func run() error {
 
 	go func() {
 		<-ctx.Done()
+		// 先收会话再收监听：WebSocket 是 hijack 出去的，Shutdown 不等它们，
+		// 不主动取消的话 handler 的 defer 不会跑，设备上会留下 scrcpy 服务端。
+		if n := srv.CloseSessions(); n > 0 {
+			log.Info("关停：取消设备墙实时会话", "数量", n)
+		}
 		sc, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		for _, h := range servers {

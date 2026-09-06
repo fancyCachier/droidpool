@@ -90,6 +90,20 @@ func (h *h264Sessions) controller(id string) inputInjector {
 	return nil
 }
 
+// CloseAll 取消所有活跃会话。进程退出前必须调用：设备墙的 WebSocket 连接是被
+// hijack 出去的，http.Server.Shutdown 根本不等它们，进程一退，handler 里那些
+// defer（其中就有 scrcpy.Session.Close）全都不会跑，设备上的 app_process 就留下了。
+// 留下的服务端占着显示编码器，下一个会话连上也收不到帧——每次部署都会踩一遍。
+func (h *h264Sessions) CloseAll() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := len(h.live)
+	for _, ls := range h.live {
+		ls.cancel()
+	}
+	return n
+}
+
 // release 只清理属于本代的条目：若已被接管，新条目不能被旧会话的收尾误删。
 func (h *h264Sessions) release(id string, gen uint64) {
 	h.mu.Lock()

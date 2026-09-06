@@ -61,9 +61,11 @@ const (
 	wsReadLimit = 64 << 10
 	// wsCloseReasonMax 是 RFC 6455 对 close 帧 reason 的长度上限。
 	wsCloseReasonMax = 123
-	// wsMaxDevices 同时允许多少台设备开着实时通道。每路都占节点一个软件编码器，
-	// 与 MJPEG 的 maxStreams 同理；同设备的接管不算新增。
-	wsMaxDevices = 4
+	// wsMaxDevices 同时允许多少台设备开着实时通道。每路都占节点一个软件编码器。
+	// 取值要 ≥ 节点的 max_devices，否则几个人各开几台就会把名额占满，后来的人
+	// 放大任何设备都被拒——真正的资源闸是节点内存与 max_devices，这里只拦住
+	// 「页面泄漏出一堆会话」这种异常，不该参与正常的资源分配。
+	wsMaxDevices = 16
 	// injectTextMax 是 INJECT_TEXT 的服务端上限，超过或含非 ASCII 的文本改走剪贴板粘贴。
 	injectTextMax = 300
 )
@@ -161,7 +163,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	sess, err := s.scrcpyStart(ctx, scrcpy.Options{
 		Serial: d.ADBAddr, ServerJar: s.Scrcpy.ServerJar, LocalPort: port,
-		MaxFPS: s.Scrcpy.MaxFPS, BitRate: s.Scrcpy.BitRate,
+		MaxFPS: s.Scrcpy.MaxFPS, BitRate: s.Scrcpy.BitRate, Log: s.Log,
 	})
 	if err != nil {
 		_ = c.Close(websocket.StatusInternalError, closeReason("scrcpy_failed: "+err.Error()))

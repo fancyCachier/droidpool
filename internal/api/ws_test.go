@@ -59,12 +59,18 @@ func wsReadText(t *testing.T, c *websocket.Conn) map[string]any {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	typ, data, err := c.Read(ctx)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if typ != websocket.MessageText {
-		t.Fatalf("期望文本消息，得到 %v", typ)
+	var typ websocket.MessageType
+	var data []byte
+	var err error
+	for {
+		typ, data, err = c.Read(ctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if typ == websocket.MessageText {
+			break
+		}
+		// 视频帧是二进制的，读文本事件时跳过
 	}
 	var m map[string]any
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -93,6 +99,22 @@ func readExact(t *testing.T, r net.Conn, n int) []byte {
 	return b
 }
 
+// pushFrame 让设备侧出一帧，用来终止「催首帧」的重试，免得后续读被 RESET_VIDEO 打断。
+func pushFrame(t *testing.T, video net.Conn, key bool) {
+	t.Helper()
+	hdr := make([]byte, 12)
+	var pf uint64 = 12345
+	if key {
+		pf |= 1 << 62
+	}
+	binary.BigEndian.PutUint64(hdr[0:8], pf)
+	binary.BigEndian.PutUint32(hdr[8:12], 3)
+	_ = video.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := video.Write(append(hdr, 'a', 'b', 'c')); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func wsHello(t *testing.T, c *websocket.Conn) {
 	t.Helper()
 	m := wsReadText(t, c)
@@ -109,13 +131,7 @@ func TestWSHelloFramesAndLiveInput(t *testing.T) {
 	<-fd.ready
 
 	// 设备侧出一帧关键帧（第 62 位是 scrcpy 的 key 标志）
-	hdr := make([]byte, 12)
-	binary.BigEndian.PutUint64(hdr[0:8], uint64(1)<<62|12345)
-	binary.BigEndian.PutUint32(hdr[8:12], 3)
-	_ = fd.video.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := fd.video.Write(append(hdr, 'a', 'b', 'c')); err != nil {
-		t.Fatal(err)
-	}
+	pushFrame(t, fd.video, true)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	typ, data, err := c.Read(ctx)
 	cancel()
@@ -470,7 +486,7 @@ func TestWSPingPongAndDeviceClipboard(t *testing.T) {
 
 // 同时放大的设备数有上限；同设备的接管不算新增，释放后名额回来。
 func TestWSSessionCapCountsDevicesNotConnections(t *testing.T) {
-	s, h := newServer(t, 6, nil)
+	s, h := newServer(t, wsMaxDevices+2, nil)
 	s.Scrcpy.ServerJar = "fake.jar"
 	s.StartScrcpy = func(context.Context, scrcpy.Options) (*scrcpy.Session, error) {
 		vc, vs := net.Pipe()
@@ -488,8 +504,8 @@ func TestWSSessionCapCountsDevicesNotConnections(t *testing.T) {
 		wsHello(t, c)
 		conns = append(conns, c)
 	}
-	// 第 5 台被拒，带原因
-	c5 := wsDial(t, base+"dev5/ws")
+	// 再多一台被拒，带原因
+	c5 := wsDial(t, fmt.Sprintf("%sdev%d/ws", base, wsMaxDevices+1))
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	_, _, err := c5.Read(ctx)
 	cancel()
@@ -511,6 +527,6 @@ func TestWSSessionCapCountsDevicesNotConnections(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	c6 := wsDial(t, base+"dev6/ws")
+	c6 := wsDial(t, fmt.Sprintf("%sdev%d/ws", base, wsMaxDevices+2))
 	wsHello(t, c6)
 }

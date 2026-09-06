@@ -47,6 +47,11 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
 .fps{font-size:11px;color:var(--dim);margin-left:6px}
 #loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
          background:#000;color:var(--dim);font-size:14px;line-height:1.5;pointer-events:none}
+/* 必须显式写：display:flex 是作者样式，会盖掉 [hidden] 自带的 UA display:none，
+   于是 el.hidden = true 在视觉上毫无作用，遮罩永远盖着画面。
+   之前「黑屏 + 等待首帧，但保存 PNG 是正常画面」就是这一条造成的，
+   排查时被它误导了很久：JS 里读 el.hidden 是 true，屏幕上却还盖着。 */
+#loading[hidden]{display:none}
 canvas:focus{outline:2px solid var(--acc);outline-offset:-2px}
 pre.clip{margin:0 0 8px;padding:8px 9px;background:#0d1117;border:1px solid var(--line);border-radius:6px;
          font:12px/1.4 ui-monospace,Menlo,monospace;color:var(--fg);max-height:80px;overflow:auto;
@@ -188,9 +193,12 @@ function setLive(on, txt){
   el.querySelector('.txt').textContent = txt || (on ? '实时' : '画面中断');
 }
 // 首帧到达前盖一层「连接中」，别让人对着黑框猜是没连上还是设备黑屏
-// 遮罩只用于「确实没有画面」的状态：连接中、重连、已暂停、被接管。
-// 画面静止不算——scrcpy 本来就只在变化时出帧，盖住一张好画面反而更糟（实测踩过）。
+// 遮罩只用于「确实没有画面」的状态：从没出过帧的连接中、重连、已暂停、被接管。
+// 一旦画布上有过画面就不再盖它——静止的旧画面仍然是设备当前的样子，
+// 而遮罩是不透明的，盖住可用画面比没有提示更糟（这两条都是实测踩出来的）。
 function loading(txt){ const l = $('#loading'); if(txt){ l.textContent = txt; l.hidden = false; } else l.hidden = true; }
+// hint 是「有画面就不打扰」的版本：没画面时盖遮罩，有画面时只写状态栏。
+function hint(txt){ if(lastFrameAt) setLive(false, txt); else loading(txt); }
 function resize(w, h){
   if(!w || !h || (w === cv.width && h === cv.height)) return;
   cv.width = base.width = w; cv.height = base.height = h;
@@ -198,10 +206,36 @@ function resize(w, h){
 }
 function paint(){ ctx.drawImage(base, 0, 0); drawRipples(); }
 
+// decoderUnusable：H.264 这条路在本浏览器上用不了，退回截图流并说明原因。
+// 直接摆在界面上，不要只写 console——操作人员不会去开控制台。
+let h264Broken = '';
+function decoderUnusable(why){
+  if(h264Broken) return;
+  h264Broken = why;
+  console.warn('H.264 不可用，退回截图流:', why);
+  flash(why + '，已退回截图流', true);
+  startStream();
+}
+
 // —— HUD：fps / 码率 / 往返 / 解码积压 ——
 let frames = 0, bytes = 0, lastFpsAt = performance.now(), rtt = null, lastFrameAt = 0;
 // mode: 'ws' = WebSocket 双向通道（H.264 + 实时指针）；'mjpeg' = 截图流 + 每手势一次 POST 的退化路径
-let decoder = null, mode = '', sock = null, streamAbort = null;
+let decoder = null, mode = '', sock = null, streamAbort = null, upgradeTimer = 0;
+// 每次 startStream 递增。断开回调先对一次代数：不是当前这一轮的连接就直接忽略，
+// 否则「服务端重启 → 旧连接断开排了一次重连 → 同时又有一次重连」会让两条连接
+// 同时存在，服务端按「同设备后来者接管」把先到的那条踢掉，页面于是显示
+// 「已被其他页面接管」并停止重连——其实根本没有别人，是自己接管了自己。
+let streamGen = 0, backlogResets = 0, reconnectTimer = 0;
+let sockOpenedAt = 0, totalBytes = 0, curCodec = '', stallReported = false;
+// 所有重连都走这里：同一时刻只允许有一个待触发的重连。
+// 不集中管的话，几次断开各自排一个定时器，到点一起开连接，服务端按「后来者接管」
+// 一个个踢掉前面的，页面就永远在 0.7 秒一次的连-断循环里，什么也显示不出来。
+function scheduleReconnect(ms){
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(startStream, ms);
+}
+// 与服务端 wsMaxDevices 对应，只用于提示文案
+const WS_MAX_DEVICES = 4;
 
 // —— H.264 解码：WebSocket 与 multipart 两条路都喂这里 ——
 // 直接看 NAL 类型判断这一包是什么，不依赖服务端标志位的语义。
@@ -219,9 +253,29 @@ const nalTypes = b => {
   }
   return t;
 };
+// 从 SPS 里取出 profile/constraints/level，拼成精确的 codec 串。
+// 写死 'avc1.42E01E'（Baseline 3.0）在 1366×768 上是错的：level 3.0 只够到 720×576，
+// 解码器会一路报 "Decoding error"。SPS 的 NAL 头之后依次是 profile_idc、
+// constraint_set 标志、level_idc 三个字节。
+function codecFromSPS(b){
+  for(let i = 0; i + 4 < b.length; i++){
+    if(b[i] === 0 && b[i+1] === 0){
+      let j = -1;
+      if(b[i+2] === 1) j = i + 3;
+      else if(b[i+2] === 0 && b[i+3] === 1) j = i + 4;
+      if(j >= 0 && j + 3 < b.length && (b[j] & 0x1f) === 7){
+        const hex = n => n.toString(16).padStart(2, '0');
+        return 'avc1.' + hex(b[j+1]) + hex(b[j+2]) + hex(b[j+3]);
+      }
+    }
+  }
+  return null;
+}
+
 // 建一个解码器，返回「喂一个访问单元」的函数
 function newDecoder(){
   if(decoder){ try{ decoder.close(); }catch(_){} }
+  let decErrors = 0;
   const dec = decoder = new VideoDecoder({
     output: frame => {
       resize(frame.displayWidth, frame.displayHeight);
@@ -231,25 +285,51 @@ function newDecoder(){
       loading(null);
       frames++; lastFrameAt = performance.now();
     },
-    error: e => { setLive(false, '解码出错'); console.warn('VideoDecoder', e); }
+    error: e => {
+      console.warn('VideoDecoder', e);
+      // 一两次解码错误可能只是丢了个参考帧，连续错说明这条路在本浏览器上走不通，
+      // 退回截图流而不是让人对着黑屏
+      if(++decErrors >= 3) decoderUnusable(`解码失败：${e.message || e.name}`);
+      else setLive(false, '解码出错，重试中');
+    }
   });
-  // annexb：起始码就在数据里，不需要单独的 description
-  dec.configure({codec: 'avc1.42E01E', optimizeForLatency: true, avc: {format: 'annexb'}});
-  let paramSets = null, started = false, ts = 0;
+  // annexb：起始码就在数据里，不需要单独的 description。
+  // codec 串等看到 SPS 再定（见 codecFromSPS），拿不到就退回一个宽松的默认值。
+  let paramSets = null, started = false, ts = 0, codec = '';
+  const setup = c => {
+    if(c === codec) return;
+    codec = c; curCodec = c;
+    try{ dec.configure({codec: c, optimizeForLatency: true, avc: {format: 'annexb'}}); }
+    catch(e){
+      console.warn('配置解码器失败', c, e);
+      decoderUnusable(`浏览器不支持 ${c}：${e.message || e.name}`);
+    }
+  };
   return bytes => {
-    if(dec.state !== 'configured') return;
     const t = nalTypes(bytes);
     const hasIDR = t.has(5), hasSlice = t.has(1) || t.has(5);
     // 只含参数集的包不能当帧喂（解码器会报 "A key frame is required"），
     // 存起来，等下一个 IDR 拼在它前面一起送
     if(!hasSlice){
-      if(t.has(7) || t.has(8)) paramSets = bytes;
+      if(t.has(7) || t.has(8)){
+        // 流中途又来一份参数集 = 服务端重启了编码器（我们催 RESET_VIDEO 时就会这样）。
+        // 旧解码器手里的参考帧全部失效，继续喂只会一路 "Decoding error"，必须重来。
+        if(started){
+          try{ dec.reset(); }catch(_){}
+          codec = ''; started = false;
+        }
+        paramSets = bytes;
+        setup(codecFromSPS(bytes) || 'avc1.4D4033');
+      }
       return;
     }
     if(!started){
       if(!hasIDR) return;            // 必须从 IDR 起步，之前的帧丢掉
+      // 关键帧自带 SPS 时（本机 redroid 就是这样）也从它取 codec 串
+      if(t.has(7)) setup(codecFromSPS(bytes) || codec || 'avc1.4D4033');
       started = true;
     }
+    if(dec.state !== 'configured') return;
     let data = bytes;
     if(hasIDR && paramSets && !t.has(7)){
       // IDR 自己不带 SPS/PPS 时补上，否则解码器不知道分辨率等参数
@@ -273,10 +353,11 @@ function wsURL(){
 }
 // 等到 hello 才算成功。hello 之前被关掉（未配 scrcpy、设备侧起不来）就 reject，
 // 调用方退回截图流。
-function startWS(){
+function startWS(gen){
   return new Promise((resolve, reject) => {
     const s = sock = new WebSocket(wsURL());
     s.binaryType = 'arraybuffer';
+    sockOpenedAt = performance.now(); totalBytes = 0; stallReported = false;
     const feed = newDecoder();
     let hello = false;
     s.onmessage = ev => {
@@ -288,6 +369,8 @@ function startWS(){
           setLive(true, '实时 H.264');
           // 重连时画布上通常还留着上一帧：静止的画面就是当前状态，盖住它反而看不见东西。
           // 只有从没出过帧（真的一片空白）才显示等待提示。
+          // 只有画布上还什么都没有时才提示等待；已经有画面就别改状态栏——
+          // 静止画面就是设备当前的样子，说「等待首帧」反而让人以为坏了
           if(!lastFrameAt) loading('等待首帧…');
           resolve(s);
         }else if(m.t === 'error'){
@@ -299,27 +382,29 @@ function startWS(){
         }
         return;
       }
-      bytes += ev.data.byteLength;
+      bytes += ev.data.byteLength; totalBytes += ev.data.byteLength;
       // 首字节是标志位；解码按 NAL 类型自行判断，不依赖它
       feed(new Uint8Array(ev.data, 1));
     };
     s.onclose = ev => {
+      if(gen !== streamGen){ if(!hello) reject(new Error('superseded')); return; }
       if(sock === s) sock = null;
       if(mode === 'ws') mode = '';   // 通道没了就回到 /input 的退化路径，别让按键静默失效
       pointers.clear(); slotMask = 0; rtt = null;
       if(s.superseded){ if(!hello) reject(new Error('superseded')); return; }  // 我们自己关的（暂停/换流）
-      if(ev.reason === 'too_many_sessions'){
-        // 名额满了：不退回截图流（那会再占一路 screencap），过会儿再试
-        setLive(false, '实时通道已满'); loading('同时放大的设备已达上限，10 秒后重试…');
-        if(!hello) reject(new Error('superseded'));
-        setTimeout(startStream, 10000);
+      // 名额满了不能把人挡在黑屏外面：退回截图流，慢但能看能点。
+      // （第一版做成「显示提示 + 10 秒后重试、不回退」，结果是别人开着几台
+      // 就让所有放大页都变成一块不能操作的黑屏，比慢得多的画面糟糕得多。）
+      if(ev.reason === 'too_many_sessions'){ if(!hello) reject(new Error(ev.reason)); return; }
+      if(!hello){ reject(new Error(ev.reason || 'closed before hello')); return; }
+      if(ev.reason === 'taken_over'){
+        // 真被别人接管了：不抢，隔一会儿再试，对方关掉页面后自己就回来了
+        hint('已被其他页面接管，30 秒后重试…');
+        scheduleReconnect(30000);
         return;
       }
-      if(!hello){ reject(new Error(ev.reason || 'closed before hello')); return; }
-      if(ev.reason === 'taken_over'){ setLive(false, '已被其他页面接管'); loading('已被其他页面接管'); return; }
-      setLive(false, '流中断，重连中');
-      if(!lastFrameAt) loading('流中断，重连中…');
-      setTimeout(startStream, 1500);
+      hint('流中断，重连中…');
+      scheduleReconnect(1500);
     };
   });
 }
@@ -374,40 +459,52 @@ async function startMJPEG(signal){
       bmp.close();
       paint();
       loading(null);
-      frames++;
-      setLive(true, window.isSecureContext ? '实时 截图流' : '截图流（http 非安全上下文，无 WebCodecs）');
+      frames++; lastFrameAt = performance.now();
+      setLive(true, h264Broken ? '截图流（H.264 不可用）'
+        : window.isSecureContext ? '实时 截图流' : '截图流（http 非安全上下文，无 WebCodecs）');
     }catch(_){}
   });
 }
 
 async function startStream(){
+  const gen = ++streamGen;
   stopStream();
-  loading('连接中…');
-  if(typeof VideoDecoder !== 'undefined'){
-    try{ await startWS(); return; }
+  hint('连接中…');
+  if(typeof VideoDecoder !== 'undefined' && !h264Broken){
+    try{ await startWS(gen); return; }
     catch(e){
       if(e.message === 'superseded') return;
       // 通道不可用（未配 scrcpy-server、设备侧起不来）就退回截图流，
       // 慢但一定能用，不能让放大视图直接黑掉
       console.warn('WebSocket 通道不可用，退回截图流:', e.message);
+      if(e.message === 'too_many_sessions')
+        flash('实时通道名额已满（同时最多 ' + WS_MAX_DEVICES + ' 台），已退回截图流：能看能点，但只有几 fps', true);
     }
   }
+  if(gen !== streamGen) return;
   mode = 'mjpeg';
   streamAbort = new AbortController();
+  // 退回截图流之后仍然定期探一次实时通道：别人关掉页面腾出名额时自动升回去，
+  // 不用操作人员盯着刷新
+  clearTimeout(upgradeTimer);
+  upgradeTimer = setTimeout(() => { if(mode === 'mjpeg') startStream(); }, 30000);
   // WebCodecs 只在安全上下文（HTTPS 或 localhost）里存在。用内网 IP 直接开 http://
   // 会静默落到截图流，操作人员不知道为什么只有 3 fps——把原因写在状态栏上。
   if(typeof VideoDecoder === 'undefined' && !window.isSecureContext)
     flash('当前是 http:// 非安全上下文，浏览器没有 WebCodecs，退回截图流；用 https 或 localhost 打开可得 H.264', true);
   try{
     await startMJPEG(streamAbort.signal);
+    if(gen !== streamGen) return;
     setLive(false, '流已结束');
   }catch(e){
-    if(e.name === 'AbortError') return;
-    setLive(false, '流中断，重连中');
-    setTimeout(startStream, 1500);
+    if(e.name === 'AbortError' || gen !== streamGen) return;
+    hint('流中断，重连中…');
+    scheduleReconnect(1500);
   }
 }
 function stopStream(){
+  clearTimeout(upgradeTimer); upgradeTimer = 0;
+  clearTimeout(reconnectTimer); reconnectTimer = 0;
   if(sock){ const s = sock; sock = null; s.superseded = true; s.close(); }
   if(streamAbort){ streamAbort.abort(); streamAbort = null; }
   if(decoder){ try{ decoder.close(); }catch(_){} decoder = null; }
@@ -430,7 +527,20 @@ function animate(){
     frames = 0; bytes = 0; lastFpsAt = now;
     // 解码排队超过 3 秒的量说明浏览器跟不上，画面会越来越滞后；
     // scrcpy 没有「按需关键帧」，只能断开重连拿一个新的 IDR 从头来
-    if(q > 30 && mode === 'ws'){ flash('解码积压，重连以追上实时画面', true); startStream(); }
+    // 积压过大说明浏览器追不上，scrcpy 没有「按需关键帧」，只能重开会话拿新 IDR。
+    // 但重开必须有节制：解码一直报错时，重开 → 又报错 → 再重开，会变成死循环，
+    // 页面永远停在黑屏（实测踩过，每 0.9 秒一个会话）。所以限次数。
+    if(q > 30 && mode === 'ws' && backlogResets < 3){
+      backlogResets++;
+      flash('解码积压，重连以追上实时画面', true);
+      startStream();
+    }
+    // 通道连着、字节也在收，却一帧都没解出来：把线索摆到界面上，
+    // 否则只剩一块黑屏和「等待首帧」，谁也不知道卡在哪
+    if(mode === 'ws' && !lastFrameAt && sock && performance.now() - sockOpenedAt > 8000 && !stallReported){
+      stallReported = true;
+      flash(`已收到 ${totalBytes} 字节但一帧未解出（codec ${curCodec || '未知'}），请把这条告诉维护者`, true);
+    }
     if(mode === 'ws') sendWS({t:'ping', ts: now});
   }
   requestAnimationFrame(animate);
@@ -747,7 +857,7 @@ const es = new EventSource('/api/events');
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){
     stopStream();
-    setLive(false, '已暂停'); loading('已暂停（切回标签页恢复）');
+    setLive(false, '已暂停'); hint('已暂停（切回标签页恢复）');
   } else if(!sock && !streamAbort){
     startStream();
   }

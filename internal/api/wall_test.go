@@ -276,3 +276,17 @@ func TestWallPagesRedirectToHTTPSWhenConfigured(t *testing.T) {
 		t.Errorf("未配 wall_url 时应直接出页面，得到 %d", rec.Code)
 	}
 }
+
+// 页面不能被浏览器缓存：没有缓存头时 Chrome 会按启发式规则缓存 HTML，
+// 部署后操作人员还在跑旧 JS，"修好了却还是老样子"。
+func TestPagesAreNotCached(t *testing.T) {
+	_, h := newServer(t, 1, nil)
+	for _, path := range []string{"/", "/device/dev1"} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("%s 的 Cache-Control = %q，期望 no-store", path, got)
+		}
+	}
+}
