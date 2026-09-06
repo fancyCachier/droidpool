@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/fancyCachier/droidpool/internal/adb"
 	"github.com/fancyCachier/droidpool/internal/api"
+	"github.com/fancyCachier/droidpool/internal/certfile"
 	"github.com/fancyCachier/droidpool/internal/config"
 	"github.com/fancyCachier/droidpool/internal/node"
 	"github.com/fancyCachier/droidpool/internal/pool"
@@ -146,21 +148,50 @@ func run() error {
 			BitRate:   4_000_000,
 		},
 	}
-	h := &http.Server{
+	srv.WallURL = cfg.TLS.WallURL
+	handler := srv.Routes()
+	servers := []*http.Server{{
 		Addr:              cfg.Listen,
-		Handler:           srv.Routes(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+	}}
+	if cfg.TLS.Enabled() {
+		// 证书由 acme.sh 在别处签好推过来，文件换新后 certfile 自动换用，不用重启
+		ld, err := certfile.New(cfg.TLS.Cert, cfg.TLS.Key)
+		if err != nil {
+			return fmt.Errorf("HTTPS 证书: %w", err)
+		}
+		ld.Log = log
+		servers = append(servers, &http.Server{
+			Addr:              cfg.TLS.Listen,
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+			TLSConfig:         &tls.Config{GetCertificate: ld.GetCertificate, MinVersion: tls.VersionTLS12},
+		})
 	}
 
 	go func() {
 		<-ctx.Done()
 		sc, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = h.Shutdown(sc)
+		for _, h := range servers {
+			_ = h.Shutdown(sc)
+		}
 	}()
 
-	log.Info("droidpoold 启动", "listen", cfg.Listen, "node", nc.Name)
-	if err := h.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	log.Info("droidpoold 启动", "listen", cfg.Listen, "listen_tls", cfg.TLS.Listen, "node", nc.Name)
+	// 任一监听退出就整体退出：端口被占这类错误要在启动时暴露，不能只剩一半在跑
+	errc := make(chan error, len(servers))
+	for _, h := range servers {
+		go func() {
+			if h.TLSConfig != nil {
+				errc <- h.ListenAndServeTLS("", "")
+			} else {
+				errc <- h.ListenAndServe()
+			}
+		}()
+	}
+	if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	log.Info("已停止")

@@ -54,6 +54,9 @@ type Server struct {
 	// Resetter 在 release 后把设备洗干净放回池子。为 nil 时设备会卡在 resetting——
 	// 首次部署时踩到的坑：release 走通了但没人去复位。
 	Resetter Resetter
+	// WallURL 非空时，走明文 http 打开的设备墙页面 302 到这里。WebCodecs 只在安全
+	// 上下文里存在，http://内网IP 上的放大视图只有 3 fps 截图流；API 不跳转，agent 照旧。
+	WallURL string
 }
 
 // Resetter 复位一台设备（由 pool.Manager 实现）。
@@ -102,7 +105,11 @@ func (s *Server) Routes() http.Handler {
 }
 
 func (s *Server) servePage(name string) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.WallURL != "" && r.TLS == nil {
+			http.Redirect(w, r, s.WallURL+r.URL.RequestURI(), http.StatusFound)
+			return
+		}
 		b, err := webFS.ReadFile(name)
 		if err != nil {
 			http.Error(w, "页面缺失", http.StatusInternalServerError)

@@ -166,3 +166,38 @@ func TestLoadRejectsUnsetEnvToken(t *testing.T) {
 		t.Fatal("环境变量未设置时 token 为空，应报错")
 	}
 }
+
+func TestTLSConfig(t *testing.T) {
+	c, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TLS.Enabled() {
+		t.Error("没配 [tls] 时不应开 HTTPS")
+	}
+
+	// listen 给了但没证书：启动时就该拦下，别等到第一次握手
+	if _, err := Load(write(t, minimal+"\n[tls]\nlisten = \"0.0.0.0:443\"\n")); err == nil {
+		t.Error("[tls] 只有 listen 没有 cert/key 应报错")
+	}
+	// wall_url 必须是 https，尾部斜杠要去掉，否则拼路径会出现 //device/x
+	if _, err := Load(write(t, minimal+"\n[tls]\nwall_url = \"http://x\"\n")); err == nil {
+		t.Error("wall_url 非 https 应报错")
+	}
+	c, err = Load(write(t, minimal+`
+[tls]
+listen   = "0.0.0.0:443"
+cert     = "/opt/droidpool/tls/fullchain.pem"
+key      = "/opt/droidpool/tls/privkey.pem"
+wall_url = "https://droidpool.example.com/"
+`))
+	if err != nil {
+		t.Fatalf("完整 [tls] 应能加载: %v", err)
+	}
+	if !c.TLS.Enabled() || c.TLS.Cert == "" || c.TLS.Key == "" {
+		t.Errorf("TLS = %+v", c.TLS)
+	}
+	if c.TLS.WallURL != "https://droidpool.example.com" {
+		t.Errorf("wall_url 应去掉尾部斜杠，得到 %q", c.TLS.WallURL)
+	}
+}

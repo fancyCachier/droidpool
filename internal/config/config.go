@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -39,8 +40,24 @@ type Config struct {
 	// 不用 swap 做闸——它是滞后且黏滞的症状，见 node.Health.UnderPressure。
 	MinAvailMiB int        `toml:"min_avail_mib"`
 	EdgeDefault EdgeTarget `toml:"edge_default"`
-	Nodes       []Node     `toml:"nodes"`
+	// TLS 设备墙的 HTTPS 入口。WebCodecs 只在安全上下文（HTTPS / localhost）里存在，
+	// 用 http://内网IP 打开设备墙只能拿到 3 fps 截图流。证书由别处（acme.sh）签好
+	// 推到 cert / key 路径，文件换新后自动生效，不用重启。
+	TLS   TLS    `toml:"tls"`
+	Nodes []Node `toml:"nodes"`
 }
+
+type TLS struct {
+	Listen string `toml:"listen"` // 如 "0.0.0.0:443"；空 = 不开 HTTPS
+	Cert   string `toml:"cert"`   // fullchain PEM
+	Key    string `toml:"key"`    // 私钥 PEM
+	// WallURL 设了之后，在 http 监听上打开设备墙页面会 302 到这里；API 不受影响，
+	// agent CLI 与 MCP 仍走 http。
+	WallURL string `toml:"wall_url"`
+}
+
+// Enabled 报告是否要开 HTTPS 监听。
+func (t TLS) Enabled() bool { return t.Listen != "" }
 
 type EdgeTarget struct {
 	Host string `toml:"host"`
@@ -162,6 +179,15 @@ func hostFromDockerHost(s string) string {
 func (c *Config) validate() error {
 	if c.Token == "" {
 		return fmt.Errorf("token 不能为空：agent 与设备墙共用它鉴权")
+	}
+	if c.TLS.Enabled() && (c.TLS.Cert == "" || c.TLS.Key == "") {
+		return fmt.Errorf("[tls] 开了 listen 就必须同时给 cert 与 key")
+	}
+	if u := c.TLS.WallURL; u != "" {
+		if !strings.HasPrefix(u, "https://") {
+			return fmt.Errorf("[tls] wall_url 必须以 https:// 开头，得到 %q", u)
+		}
+		c.TLS.WallURL = strings.TrimRight(u, "/")
 	}
 	if len(c.Nodes) == 0 {
 		return fmt.Errorf("至少要配一个 [[nodes]]")
