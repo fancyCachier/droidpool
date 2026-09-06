@@ -29,7 +29,37 @@ import (
 	"time"
 )
 
-const stateFile = ".droidpool"
+// stateFile 本地租约记录的路径。设了会话键就带后缀，多个会话共用一个目录时各记各的。
+func stateFile() string {
+	if s := sessionKey(); s != "" {
+		return ".droidpool." + s
+	}
+	return ".droidpool"
+}
+
+// sessionKey 返回 DROIDPOOL_SESSION（已做文件名安全化），未设置时为空。
+//
+// 幂等键原本只有 (host, worktree)，假设「同一主机同一目录再来一次 = 同一个 agent 在重试」。
+// dsh 这类多会话宿主在同一台机器、同一个检出里跑好几个 agent，这个假设不成立：
+// 后来者全都「复用既有租约」挤到同一台设备上（2026-09-04 线上 20 条租约 19 条在 1 号机）。
+// 会话键把每个会话分开，本地记录也随之分开；dsh 插件会自动注入，人手工用时可以不设。
+func sessionKey() string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			return r
+		}
+		return '-'
+	}, os.Getenv("DROIDPOOL_SESSION"))
+}
+
+// claimWorktree 组装发给控制面的幂等键后半段：worktree 名，带会话键时加 @会话。
+func claimWorktree(worktree, session string) string {
+	if session == "" {
+		return worktree
+	}
+	return worktree + "@" + session
+}
 
 type client struct {
 	base  string
@@ -72,8 +102,8 @@ func (c *client) do(method, path string, body any, out any) (int, error) {
 	return resp.StatusCode, nil
 }
 
-// gitInfo 从当前目录推导 worktree 名、分支与 HEAD。
-func gitInfo() (worktree, branch, head string) {
+// gitInfo 从当前目录推导仓库顶层目录、worktree 名、分支与 HEAD。
+func gitInfo() (top, worktree, branch, head string) {
 	run := func(args ...string) string {
 		out, err := exec.Command("git", args...).Output()
 		if err != nil {
@@ -81,11 +111,11 @@ func gitInfo() (worktree, branch, head string) {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	top := run("rev-parse", "--show-toplevel")
+	top = run("rev-parse", "--show-toplevel")
 	if top != "" {
 		worktree = filepath.Base(top)
 	}
-	return worktree, run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "--short", "HEAD")
+	return top, worktree, run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "--short", "HEAD")
 }
 
 type leaseState struct {
@@ -96,12 +126,16 @@ type leaseState struct {
 
 func saveState(s leaseState) error {
 	b, _ := json.MarshalIndent(s, "", "  ")
-	return os.WriteFile(stateFile, b, 0o600)
+	return os.WriteFile(stateFile(), b, 0o600)
 }
 
 func loadState() (leaseState, error) {
+	return loadStateFrom(stateFile())
+}
+
+func loadStateFrom(path string) (leaseState, error) {
 	var s leaseState
-	b, err := os.ReadFile(stateFile)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return s, fmt.Errorf("没有本地租约记录（先跑 droidpool claim）")
 	}
@@ -166,14 +200,14 @@ func main() {
 }
 
 func cmdClaim(c *client) {
-	wt, branch, head := gitInfo()
+	top, wt, branch, head := gitInfo()
 	if wt == "" {
 		fatal("当前目录不是 git 仓库，无法推导 worktree 名")
 	}
 	host, _ := os.Hostname()
 	req := map[string]any{
 		"owner": os.Getenv("USER") + "@" + host, "host": host,
-		"worktree": wt, "branch": branch, "head_sha": head,
+		"worktree": claimWorktree(wt, sessionKey()), "branch": branch, "head_sha": head,
 	}
 	var resp struct {
 		leaseState
@@ -191,8 +225,11 @@ func cmdClaim(c *client) {
 		}
 		fatal("claim 失败: %v", err)
 	}
+	if resp.Reused && !heldHere(resp.LeaseID, top) {
+		fmt.Fprint(os.Stderr, reuseWarning)
+	}
 	if err := saveState(resp.leaseState); err != nil {
-		fatal("写 %s 失败: %v", stateFile, err)
+		fatal("写 %s 失败: %v", stateFile(), err)
 	}
 	verb := "已分配"
 	if resp.Reused {
@@ -204,6 +241,23 @@ func cmdClaim(c *client) {
 	if out, err := exec.Command("adb", "connect", resp.ADBAddr).CombinedOutput(); err == nil {
 		fmt.Printf("  %s", out)
 	}
+}
+
+const reuseWarning = `⚠️  复用了既有租约，但本地没有它的记录：这台设备多半正被同一主机上的另一个会话持有，
+   两边装包会互相覆盖。多个会话共用一个检出时，给每个会话设不同的 DROIDPOOL_SESSION
+  （dsh 插件会自动注入），或者到各自的 worktree 里 claim。
+`
+
+// heldHere 报告复用到的租约是不是本目录（或本 worktree 顶层）自己 claim 出来的。
+// 都不是，就是幂等键撞了：同一主机上另一个会话正拿着这台设备。
+// 两处都查是因为 agent 常在 worktree 顶层 claim、再进子目录干活。
+func heldHere(leaseID, top string) bool {
+	for _, dir := range []string{".", top} {
+		if s, err := loadStateFrom(filepath.Join(dir, stateFile())); err == nil && s.LeaseID == leaseID {
+			return true
+		}
+	}
+	return false
 }
 
 // heartbeat 告诉 watchdog「这个 agent 还活着」。失败只提示不中断——
@@ -446,7 +500,7 @@ func cmdRelease(c *client) {
 	if _, err := c.do("DELETE", "/api/leases/"+s.LeaseID, nil, nil); err != nil {
 		fmt.Fprintf(os.Stderr, "归还接口报错（仍清理本地记录）: %v\n", err)
 	}
-	_ = os.Remove(stateFile)
+	_ = os.Remove(stateFile())
 	fmt.Printf("已归还设备 %s\n", s.DeviceID)
 }
 
@@ -472,7 +526,7 @@ func fatal(format string, a ...any) {
 func usage() {
 	fmt.Print(`droidpool —— 从设备池取一台独占 Android 设备
 
-  claim     取一台设备（幂等：同一 worktree 重复调用复用同一台）
+  claim     取一台设备（幂等：同一主机 + worktree [+ 会话键] 重复调用复用同一台）
   addr      打印 adb 地址，供 flutter run -d $(droidpool addr)
   status    查看租约；人工接管中时以退出码 10 结束
   release   归还设备
@@ -489,6 +543,8 @@ func usage() {
   DROIDPOOL_TOKEN     鉴权 token（必填）
   DROIDPOOL_EDGE_HOST seed-edge / run 写入的后端主机（或用 --host）
   DROIDPOOL_HEARTBEAT_SEC  watch 的心跳间隔秒数（默认 60）
+  DROIDPOOL_SESSION   会话键（可选）。几个 agent 共用一台机器、一个检出时给每个会话设不同的值，
+                      否则它们会复用同一条租约挤在一台设备上；dsh 插件会自动注入
 
 watchdog：控制面会回收「久未活动」的租约（默认空闲 30 分钟），防止 agent
 僵死后一直占着机器。每条 droidpool 命令都会顺手发心跳；跑长任务时用

@@ -41,7 +41,7 @@ adb 会报 `more than one device`，或者更糟——命令打到别人的设�
 
 | 命令 | 作用 |
 |---|---|
-| `droidpool claim [--ttl 4h]` | 取一台设备。**幂等**：同一 worktree 重复调用返回同一台，不会占第二台 |
+| `droidpool claim [--ttl 4h]` | 取一台设备。**幂等**：同一主机同一 worktree 重复调用返回同一台，不会占第二台；设了 `DROIDPOOL_SESSION` 再按会话区分。复用了不是本目录 claim 出来的租约时会在 stderr 提示 |
 | `droidpool addr` | 打印 adb 地址，供 `-s` 使用 |
 | `droidpool status` | 查租约。**人工接管中时以退出码 10 结束**（见 §4） |
 | `droidpool heartbeat` | 发一次心跳，告诉 watchdog 自己还活着 |
@@ -166,6 +166,7 @@ CLI 会把这两种拒绝翻译成中文提示，不要当成错误往上抛。
 | app 装上但停在引导页 | `seed-edge` 没跑，或 Edge 证书换了导致 pin 不匹配 |
 | 画面一直不变 | 设备墙上确认一下是不是 app 崩了 |
 | 操作没反应 | 看设备墙是否有人接管中 |
+| `claim` 提示「复用了既有租约，但本地没有它的记录」 | 同一主机上另一个会话正拿着这台设备（几个会话共用一个检出）。给每个会话设不同的 `DROIDPOOL_SESSION`，或到自己的 worktree 里 claim |
 
 ## 10. 三种接入方式
 
@@ -195,3 +196,4 @@ agent 连上就知道该怎么用。三种方式背后是同一个控制面与�
 | `DROIDPOOL_URL` | `http://192.168.14.32:8600` | 控制面地址 |
 | `DROIDPOOL_TOKEN` | 无，**必填** | 租约接口鉴权 |
 | `DROIDPOOL_HEARTBEAT_SEC` | 60 | `watch` 的心跳间隔 |
+| `DROIDPOOL_SESSION` | 无 | 会话键。几个 agent 共用一台机器、一个检出时给每个会话设不同的值，否则它们会复用同一条租约挤在一台设备上；进幂等键与状态文件名（`.droidpool.<会话>`）。dsh 插件自动注入 |
