@@ -10,6 +10,15 @@ warm_pool      = 2
 # （N=12 起失败率 5.6%、p95 冲到 2.66×），CPU 与温度都没有预警价值。
 swap_guard_mib = 256
 
+# 设备墙的 HTTPS 入口（可选）。WebCodecs 只在安全上下文（HTTPS / localhost）里存在，
+# 用 http://内网IP 打开只有 3 fps 截图流。证书文件换新后自动生效，不用重启；
+# wall_url 设了之后 http 上打开的设备墙页面会 302 过去，API 不受影响。
+# [tls]
+# listen   = "0.0.0.0:443"
+# cert     = "/opt/droidpool/tls/fullchain.pem"
+# key      = "/opt/droidpool/tls/privkey.pem"
+# wall_url = "https://droidpool.example.com"
+
 [edge_default]
 host = "192.168.14.53"
 port = 8090

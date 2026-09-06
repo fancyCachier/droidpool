@@ -16,11 +16,20 @@ scp -q "$HERE/dist/droidpool-linux-amd64"  "$HOST:/opt/droidpool/droidpool"
 scp -q "$HERE/deploy/config.toml"           "$HOST:/opt/droidpool/config.toml"
 scp -q "$JAR"                                "$HOST:/opt/droidpool/scrcpy-server"
 scp -q "$HERE/deploy/droidpoold.service"    "$HOST:/tmp/droidpoold.service"
+scp -q "$HERE/deploy/cert/recv-cert.sh"     "$HOST:/tmp/recv-cert.sh"
 
 ssh "$HOST" bash -s <<'REMOTE'
 set -e
 cd /opt/droidpool
 chmod +x droidpoold.new droidpool
+# 证书接收端（office-gateway 的 acme.sh 续签后经 ssh forced command 推过来，见 docs/2026-09-06-https-cert.md）
+mkdir -p bin tls && chmod 700 tls && install -m 755 /tmp/recv-cert.sh bin/recv-cert.sh && rm -f /tmp/recv-cert.sh
+# 配置开了 [tls] 但证书还没推到：新二进制会拒绝启动，别把正在跑的旧进程换掉
+if grep -q '^\[tls\]' config.toml && [ ! -s tls/fullchain.pem ]; then
+  echo "config.toml 开了 [tls] 但 /opt/droidpool/tls/fullchain.pem 不存在；先在 office-gateway 跑 ~/bin/droidpool-deploy-cert.sh 推证书" >&2
+  rm -f droidpoold.new
+  exit 1
+fi
 mv -f droidpoold.new droidpoold
 # token 只在首次生成，之后保留
 if [ ! -f env ]; then
@@ -52,4 +61,4 @@ for i in $(seq 1 60); do
 done
 # 只看本次启动之后的日志，否则旧启动的错误会混进来误导人
 ssh "$HOST" 'sudo -n journalctl -u droidpoold _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value droidpoold) --no-pager 2>/dev/null | grep -E "golden|清理|补齐|设备就绪|失败" | tail -12 | cut -c60-220'
-echo "✅ 部署完成: http://192.168.14.32:8600"
+echo "✅ 部署完成: https://droidpool.daboshi.cn （设备墙） · http://192.168.14.32:8600 （API / CLI）"

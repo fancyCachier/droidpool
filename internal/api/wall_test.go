@@ -2,11 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -236,5 +239,40 @@ func TestH264SessionsIsolatedPerDevice(t *testing.T) {
 	h.acquire("dev2", 27200, func() {})
 	if c1 {
 		t.Error("另一台设备的会话不应影响本设备")
+	}
+}
+
+// 配了 wall_url 时，明文 http 上打开的页面要跳到 https；API 与 https 上的页面不受影响。
+func TestWallPagesRedirectToHTTPSWhenConfigured(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	s.WallURL = "https://droidpool.example.com"
+	for _, path := range []string{"/", "/device/dev1"} {
+		req := httptest.NewRequest("GET", path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusFound || rec.Header().Get("Location") != s.WallURL+path {
+			t.Errorf("%s: 应 302 到 %s%s，得到 %d %q", path, s.WallURL, path, rec.Code, rec.Header().Get("Location"))
+		}
+	}
+	// https 上（r.TLS 非空）直接出页面
+	req := httptest.NewRequest("GET", "/device/dev1", nil)
+	req.TLS = &tls.ConnectionState{}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<canvas") {
+		t.Errorf("https 上应直接出页面，得到 %d", rec.Code)
+	}
+	// API 不跳转
+	rec = do(t, h, "GET", "/api/wall", nil, false)
+	if rec.Code != http.StatusOK {
+		t.Errorf("API 不应被跳转，得到 %d", rec.Code)
+	}
+	// 没配 wall_url 时 http 也直接出页面
+	s.WallURL = ""
+	req = httptest.NewRequest("GET", "/", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("未配 wall_url 时应直接出页面，得到 %d", rec.Code)
 	}
 }

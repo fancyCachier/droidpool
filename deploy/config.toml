@@ -12,6 +12,16 @@ reap_interval = "1m"
 # 节点可用内存低于此值即拒绝新 claim（实测每台常驻约 1 GB）
 min_avail_mib = 2048
 
+# 设备墙 HTTPS 入口。WebCodecs 只在安全上下文（HTTPS / localhost）里存在，
+# 用 http://192.168.14.32:8600 打开只有 3 fps 截图流，wall_url 让 http 上的页面自动跳过去。
+# 证书由 office-gateway 的 acme.sh 签发（DNS-01）后推到 tls/，换新不用重启，
+# 见 docs/2026-09-06-https-cert.md。agent CLI / MCP 仍走 http 8600。
+[tls]
+listen   = "0.0.0.0:443"
+cert     = "/opt/droidpool/tls/fullchain.pem"
+key      = "/opt/droidpool/tls/privkey.pem"
+wall_url = "https://droidpool.daboshi.cn"
+
 [edge_default]
 host = "192.168.14.53"
 port = 8090

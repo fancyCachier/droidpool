@@ -31,9 +31,16 @@ once, zoom into one, and take over when an agent needs help.
   displayed but not used as a gate: it is a lagging, sticky symptom that stays
   high long after pressure is gone.
 - **Device wall.** One page shows every device as a live thumbnail with its
-  lease, branch and remaining time. Click a tile to zoom: H.264 video via the
-  scrcpy protocol decoded with WebCodecs, tap / swipe / keys / text injected
-  through scrcpy's control socket, screenshot to PNG or clipboard.
+  lease, branch and remaining time. Click a tile to zoom: one WebSocket carries
+  H.264 video (scrcpy protocol, decoded with WebCodecs) down and live input up.
+  Pointer down / move / up are forwarded as they happen through scrcpy's
+  control socket, so drag, long-press and multi-touch (Alt/Ctrl + drag pinches)
+  behave like a finger on the device; the wheel becomes a native scroll event.
+  Keys, text, screenshot to PNG or clipboard. **WebCodecs only exists in a
+  secure context**: open the wall via HTTPS or `localhost` (an SSH port
+  forward works); on a plain `http://<lan-ip>` URL the browser has no
+  `VideoDecoder` and the page falls back to the 3 fps screenshot stream and
+  says so. See "HTTPS for the device wall" below.
 - **Human takeover protocol.** An operator can flag a lease as "human takeover";
   `droidpool status` exits 10 so the agent knows to stop and wait.
 
@@ -192,6 +199,26 @@ bench/                reproducible smoke, login-flow, concurrency sweep scripts
 deploy/               systemd unit, config template, deploy script
 docs/                 roadmap, baselines, design comparisons (Chinese)
 ```
+
+## HTTPS for the device wall
+
+WebCodecs only exists in a secure context, so the zoomed view needs HTTPS (or
+`localhost`). `droidpoold` can terminate TLS itself:
+
+```toml
+[tls]
+listen   = "0.0.0.0:443"
+cert     = "/opt/droidpool/tls/fullchain.pem"
+key      = "/opt/droidpool/tls/privkey.pem"
+wall_url = "https://droidpool.example.com"   # http:// wall pages 302 here; the API stays on http
+```
+
+The certificate files are watched: replace them and the next handshake uses
+the new pair, no restart. Any ACME client can produce them; `deploy/cert/`
+holds the pipeline we use (acme.sh with DNS-01 on one host, pushed over ssh to
+a forced-command receiver next to `droidpoold`). Binding port 443 as a
+non-root user needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the systemd
+unit, which `deploy/droidpoold.service` sets.
 
 ## Development
 
