@@ -49,6 +49,8 @@ type Server struct {
 	// Scrcpy 为空时 H.264 端点返回 503，前端自动退回 screencap 流。
 	Scrcpy ScrcpyConfig
 	h264   h264Sessions
+	// StartScrcpy 供测试与演示程序替换（真实实现要推 jar、起 adb）；为 nil 时用 scrcpy.Start。
+	StartScrcpy ScrcpyStarter
 	// Resetter 在 release 后把设备洗干净放回池子。为 nil 时设备会卡在 resetting——
 	// 首次部署时踩到的坑：release 走通了但没人去复位。
 	Resetter Resetter
@@ -92,6 +94,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/devices/{id}/screenshot.jpg", s.handleScreenshot)
 	mux.HandleFunc("GET /api/devices/{id}/stream.mjpg", s.handleStream)
 	mux.HandleFunc("GET /api/devices/{id}/stream.h264", s.handleH264Stream)
+	mux.HandleFunc("GET /api/devices/{id}/ws", s.handleWS)
 	mux.HandleFunc("POST /api/devices/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))

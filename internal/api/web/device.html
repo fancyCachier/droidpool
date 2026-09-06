@@ -139,7 +139,7 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
     <div class="panel">
       <h2>文本输入</h2>
       <input type="text" id="text" placeholder="输入后回车发送">
-      <div class="hint">点击画面 = 点按，按住拖动 = 滑动，滚轮 = 上下滑。<br>
+      <div class="hint">点击 = 点按，按住 = 长按，拖动 = 跟手拖动/滑动，Alt(Option)/Ctrl + 拖动 = 双指缩放，滚轮 = 滚动。<br>
         文本不支持中文（需设备端 IME）。</div>
     </div>
   </div>
@@ -151,7 +151,13 @@ const $ = s => document.querySelector(s);
 const id = decodeURIComponent(location.pathname.split('/').pop());
 $('#title').textContent = id;
 
-const cv = $('#cv'), ctx = cv.getContext('2d', {alpha:false, willReadFrequently:true});
+const cv = $('#cv'), ctx = cv.getContext('2d', {alpha:false});
+// base 存最近一帧的原始画面，可见 canvas = base + 涟漪叠加层。
+// 分两层是因为涟漪要在画面静止时也能动（长按时设备根本不出帧），
+// 导出截图时也能拿到不带涟漪的干净帧。
+const base = document.createElement('canvas');
+base.width = cv.width; base.height = cv.height;
+const bctx = base.getContext('2d', {alpha:false});
 let devW = 1366, devH = 768, lease = null;
 
 function flash(msg, isErr){
@@ -163,21 +169,127 @@ function setLive(on, txt){
   el.className = 'live' + (on ? ' on' : '');
   el.querySelector('.txt').textContent = txt || (on ? '实时' : '画面中断');
 }
+function resize(w, h){
+  if(!w || !h || (w === cv.width && h === cv.height)) return;
+  cv.width = base.width = w; cv.height = base.height = h;
+  devW = w; devH = h; loadInfo();
+}
+function paint(){ ctx.drawImage(base, 0, 0); drawRipples(); }
 
-// 画面走 MJPEG 连续流：每帧一次 HTTP 拉取的往返开销在人工操作时很明显，
-// 连续流把它降到零，帧率直接由设备侧 screencap 决定（实测约 3 fps）。
-// 流喂给一个隐藏 <img>，再逐帧画到 canvas —— 用 canvas 承接输入是因为
-// <img> 会触发浏览器原生图片拖拽，按住拖动的手势直接被吞掉，做不了滑动。
-// 画面走 MJPEG 连续流，但**不用 <img> 承接**：Chrome 对 <img> 里的 multipart
-// 流不会逐帧触发 load 事件，拿不到帧边界，canvas 只能画到首帧就停住。
-// 改为自己读流、按 Content-Length 切帧、逐帧转 ImageBitmap。
-// 这样帧事件精确（fps 是真数字），canvas 也能正常承接拖动手势——
-// <img> 会触发浏览器原生图片拖拽，按住拖动的手势直接被吞掉。
-let frames = 0, lastFpsAt = performance.now(), streamAbort = null, curBitmap = null;
-let decoder = null, mode = '';
+let frames = 0, lastFpsAt = performance.now();
+// mode: 'ws' = WebSocket 双向通道（H.264 + 实时指针）；'mjpeg' = 截图流 + 每手势一次 POST 的退化路径
+let decoder = null, mode = '', sock = null, streamAbort = null;
 
+// —— H.264 解码：WebSocket 与 multipart 两条路都喂这里 ——
+// 直接看 NAL 类型判断这一包是什么，不依赖服务端标志位的语义。
+// Annex-B 起始码是 00 00 01 或 00 00 00 01，其后一字节的低 5 位是 NAL 类型：
+//   7=SPS 8=PPS（只有参数集，不能当帧喂）  5=IDR（关键帧）  1=非 IDR 片
+const nalTypes = b => {
+  const t = new Set();
+  for(let i = 0; i + 3 < b.length; i++){
+    if(b[i] === 0 && b[i+1] === 0){
+      let j = -1;
+      if(b[i+2] === 1) j = i + 3;
+      else if(b[i+2] === 0 && b[i+3] === 1) j = i + 4;
+      if(j >= 0 && j < b.length){ t.add(b[j] & 0x1f); i = j; }
+    }
+  }
+  return t;
+};
+// 建一个解码器，返回「喂一个访问单元」的函数
+function newDecoder(){
+  if(decoder){ try{ decoder.close(); }catch(_){} }
+  const dec = decoder = new VideoDecoder({
+    output: frame => {
+      resize(frame.displayWidth, frame.displayHeight);
+      bctx.drawImage(frame, 0, 0);
+      frame.close();
+      paint();
+      frames++;
+    },
+    error: e => { setLive(false, '解码出错'); console.warn('VideoDecoder', e); }
+  });
+  // annexb：起始码就在数据里，不需要单独的 description
+  dec.configure({codec: 'avc1.42E01E', optimizeForLatency: true, avc: {format: 'annexb'}});
+  let paramSets = null, started = false, ts = 0;
+  return bytes => {
+    if(dec.state !== 'configured') return;
+    const t = nalTypes(bytes);
+    const hasIDR = t.has(5), hasSlice = t.has(1) || t.has(5);
+    // 只含参数集的包不能当帧喂（解码器会报 "A key frame is required"），
+    // 存起来，等下一个 IDR 拼在它前面一起送
+    if(!hasSlice){
+      if(t.has(7) || t.has(8)) paramSets = bytes;
+      return;
+    }
+    if(!started){
+      if(!hasIDR) return;            // 必须从 IDR 起步，之前的帧丢掉
+      started = true;
+    }
+    let data = bytes;
+    if(hasIDR && paramSets && !t.has(7)){
+      // IDR 自己不带 SPS/PPS 时补上，否则解码器不知道分辨率等参数
+      data = new Uint8Array(paramSets.length + bytes.length);
+      data.set(paramSets); data.set(bytes, paramSets.length);
+    }
+    dec.decode(new EncodedVideoChunk({
+      type: hasIDR ? 'key' : 'delta',
+      timestamp: (ts += 33333),   // 设备 PTS 高位混着标志位，自己生成更可靠
+      data
+    }));
+  };
+}
+
+// —— WebSocket 双向通道（首选）——
+// 下行：二进制 = [标志位 1 字节][H.264 访问单元]，文本 = JSON 事件（hello / error）
+// 上行：JSON 输入，指针 down/move/up 按发生顺序实时发，设备侧看到的就是一根真实的手指
+function wsURL(){
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host +
+    `/api/devices/${encodeURIComponent(id)}/ws`;
+}
+// 等到 hello 才算成功。hello 之前被关掉（未配 scrcpy、设备侧起不来）就 reject，
+// 调用方退回截图流。
+function startWS(){
+  return new Promise((resolve, reject) => {
+    const s = sock = new WebSocket(wsURL());
+    s.binaryType = 'arraybuffer';
+    const feed = newDecoder();
+    let hello = false;
+    s.onmessage = ev => {
+      if(typeof ev.data === 'string'){
+        let m; try{ m = JSON.parse(ev.data); }catch(_){ return; }
+        if(m.t === 'hello'){
+          hello = true; mode = 'ws';
+          resize(m.w, m.h);
+          setLive(true, '实时 H.264');
+          resolve(s);
+        }else if(m.t === 'error'){
+          flash('操作被拒: ' + m.msg, true);
+        }
+        return;
+      }
+      // 首字节是标志位；解码按 NAL 类型自行判断，不依赖它
+      feed(new Uint8Array(ev.data, 1));
+    };
+    s.onclose = ev => {
+      if(sock === s) sock = null;
+      if(mode === 'ws') mode = '';   // 通道没了就回到 /input 的退化路径，别让按键静默失效
+      pointers.clear(); slotMask = 0;
+      if(s.superseded){ if(!hello) reject(new Error('superseded')); return; }  // 我们自己关的（暂停/换流）
+      if(!hello){ reject(new Error(ev.reason || 'closed before hello')); return; }
+      if(ev.reason === 'taken_over'){ setLive(false, '已被其他页面接管'); return; }
+      setLive(false, '流中断，重连中');
+      setTimeout(startStream, 1500);
+    };
+  });
+}
+function sendWS(o){
+  if(mode === 'ws' && sock && sock.readyState === WebSocket.OPEN){ sock.send(JSON.stringify(o)); return true; }
+  return false;
+}
+
+// —— screencap 路（退回）——
 // 通用 multipart 流读取：把每个 part 的头与负载交给 onPart 处理。
-// 视频与 H.264 两条路共用这一段解析，避免两处各写一遍慢慢走偏。
 async function readMultipart(url, signal, onPart){
   const res = await fetch(url, {signal});
   if(!res.ok) throw new Error(res.status);
@@ -210,76 +322,6 @@ async function readMultipart(url, signal, onPart){
     }
   }
 }
-
-// —— H.264 路（首选）——
-// 设备侧 MediaCodec 直接把画面编码成 H.264，CPU 不碰像素；
-// screencap 那条每帧要 350ms 的回读，这条实测 13.8 fps。
-async function startH264(signal){
-  let paramSets = null, started = false, ts = 0;
-
-  // 直接看 NAL 类型判断这一包是什么，不依赖服务端标志位的语义。
-  // Annex-B 起始码是 00 00 01 或 00 00 00 01，其后一字节的低 5 位是 NAL 类型：
-  //   7=SPS 8=PPS（只有参数集，不能当帧喂）  5=IDR（关键帧）  1=非 IDR 片
-  const nalTypes = b => {
-    const t = new Set();
-    for(let i = 0; i + 3 < b.length; i++){
-      if(b[i] === 0 && b[i+1] === 0){
-        let j = -1;
-        if(b[i+2] === 1) j = i + 3;
-        else if(b[i+2] === 0 && b[i+3] === 1) j = i + 4;
-        if(j >= 0 && j < b.length){ t.add(b[j] & 0x1f); i = j; }
-      }
-    }
-    return t;
-  };
-
-  decoder = new VideoDecoder({
-    output: frame => {
-      if(frame.displayWidth && (frame.displayWidth !== cv.width || frame.displayHeight !== cv.height)){
-        cv.width = frame.displayWidth; cv.height = frame.displayHeight;
-        devW = cv.width; devH = cv.height; loadInfo();
-      }
-      ctx.drawImage(frame, 0, 0);
-      frame.close();
-      drawRipples();
-      frames++;
-      setLive(true, '实时 H.264');
-    },
-    error: e => { setLive(false, '解码出错'); console.warn('VideoDecoder', e); }
-  });
-  // annexb：起始码就在数据里，不需要单独的 description
-  decoder.configure({codec: 'avc1.42E01E', optimizeForLatency: true, avc: {format: 'annexb'}});
-
-  await readMultipart(`/api/devices/${encodeURIComponent(id)}/stream.h264`, signal, async (_h, bytes) => {
-    const t = nalTypes(bytes);
-    const hasIDR = t.has(5), hasSlice = t.has(1) || t.has(5);
-
-    // 只含参数集的包不能当帧喂（解码器会报 "A key frame is required"），
-    // 存起来，等下一个 IDR 拼在它前面一起送
-    if(!hasSlice){
-      if(t.has(7) || t.has(8)) paramSets = bytes;
-      return;
-    }
-    if(!started){
-      if(!hasIDR) return;            // 必须从 IDR 起步，之前的帧丢掉
-      started = true;
-    }
-    let data = bytes;
-    if(hasIDR && paramSets && !t.has(7)){
-      // IDR 自己不带 SPS/PPS 时补上，否则解码器不知道分辨率等参数
-      data = new Uint8Array(paramSets.length + bytes.length);
-      data.set(paramSets); data.set(bytes, paramSets.length);
-    }
-    if(decoder.state !== 'configured') return;
-    decoder.decode(new EncodedVideoChunk({
-      type: hasIDR ? 'key' : 'delta',
-      timestamp: (ts += 33333),   // 设备 PTS 高位混着标志位，自己生成更可靠
-      data
-    }));
-  });
-}
-
-// —— screencap 路（退回）——
 async function startMJPEG(signal){
   await readMultipart(`/api/devices/${encodeURIComponent(id)}/stream.mjpg`, signal, async (header, bytes) => {
     const w = +(/X-Device-Width:\s*(\d+)/i.exec(header)?.[1] || 0);
@@ -287,54 +329,52 @@ async function startMJPEG(signal){
     const type = /Content-Type:\s*(\S+)/i.exec(header)?.[1] || 'image/jpeg';
     try{
       const bmp = await createImageBitmap(new Blob([bytes], {type}));
-      if(curBitmap) curBitmap.close();
-      curBitmap = bmp;
-      if(w && h && (w !== cv.width || h !== cv.height)){
-        cv.width = w; cv.height = h; devW = w; devH = h; loadInfo();
-      }
-      drawFrame();
+      resize(w, h);
+      bctx.drawImage(bmp, 0, 0);
+      bmp.close();
+      paint();
       frames++;
-      setLive(true, '实时 截图流');
+      setLive(true, window.isSecureContext ? '实时 截图流' : '截图流（http 非安全上下文，无 WebCodecs）');
     }catch(_){}
   });
 }
 
 async function startStream(){
-  if(streamAbort) streamAbort.abort();
-  streamAbort = new AbortController();
-  const signal = streamAbort.signal;
-  const canH264 = typeof VideoDecoder !== 'undefined';
-  try{
-    if(canH264){
-      mode = 'h264';
-      await startH264(signal);
-    } else {
-      mode = 'mjpeg';
-      await startMJPEG(signal);
+  stopStream();
+  if(typeof VideoDecoder !== 'undefined'){
+    try{ await startWS(); return; }
+    catch(e){
+      if(e.message === 'superseded') return;
+      // 通道不可用（未配 scrcpy-server、设备侧起不来）就退回截图流，
+      // 慢但一定能用，不能让放大视图直接黑掉
+      console.warn('WebSocket 通道不可用，退回截图流:', e.message);
     }
+  }
+  mode = 'mjpeg';
+  streamAbort = new AbortController();
+  // WebCodecs 只在安全上下文（HTTPS 或 localhost）里存在。用内网 IP 直接开 http://
+  // 会静默落到截图流，操作人员不知道为什么只有 3 fps——把原因写在状态栏上。
+  if(typeof VideoDecoder === 'undefined' && !window.isSecureContext)
+    flash('当前是 http:// 非安全上下文，浏览器没有 WebCodecs，退回截图流；用 https 或 localhost 打开可得 H.264', true);
+  try{
+    await startMJPEG(streamAbort.signal);
     setLive(false, '流已结束');
   }catch(e){
     if(e.name === 'AbortError') return;
-    if(mode === 'h264'){
-      // H.264 不可用（未配 scrcpy-server、会话被占、浏览器不支持）就退回截图流，
-      // 慢但一定能用，不能让放大视图直接黑掉
-      console.warn('H.264 流不可用，退回截图流:', e);
-      mode = 'mjpeg';
-      try{ await startMJPEG(signal); return; }catch(_){}
-    }
     setLive(false, '流中断，重连中');
     setTimeout(startStream, 1500);
   }
 }
-
-function drawFrame(){
-  if(!curBitmap) return;
-  ctx.drawImage(curBitmap, 0, 0);
-  drawRipples();
+function stopStream(){
+  if(sock){ const s = sock; sock = null; s.superseded = true; s.close(); }
+  if(streamAbort){ streamAbort.abort(); streamAbort = null; }
+  if(decoder){ try{ decoder.close(); }catch(_){} decoder = null; }
+  mode = '';
 }
 
 function animate(){
-  if(ripples.length && mode !== 'h264') drawFrame();
+  flushMoves();
+  if(ripples.length) paint();
   const now = performance.now();
   if(now - lastFpsAt >= 1000){
     $('#fpsnow').textContent = frames ? `${frames} fps` : '';
@@ -371,6 +411,12 @@ function toDevice(ev){
     y: Math.round((ev.clientY - r.top) / r.height * cv.height)
   };
 }
+// 捕获了指针之后拖出画面事件照样来，钳到边缘；服务端也会钳，这里钳是为了涟漪画在画面里
+function clampDev(p){
+  return {x: Math.max(0, Math.min(cv.width - 1, p.x)), y: Math.max(0, Math.min(cv.height - 1, p.y))};
+}
+// 双指缩放：以画面中心为对称点镜像出第二根手指（scrcpy 的 Ctrl+拖动就是这么做的）
+function mirror(p){ return {x: cv.width - 1 - p.x, y: cv.height - 1 - p.y}; }
 
 async function send(body){
   const r = await fetch(`/api/devices/${encodeURIComponent(id)}/input`, {
@@ -380,17 +426,85 @@ async function send(body){
   if(!r.ok){ flash('操作失败: ' + r.status, true); return false; }
   return true;
 }
+// 有通道走通道，没有走 HTTP
+async function input(wsMsg, httpBody){
+  if(sendWS(wsMsg)) return true;
+  return send(httpBody);
+}
 
+// —— 实时指针（ws 模式）——
+// 每根浏览器指针占一个 0~9 的槽位作为设备侧 pointer id；Alt/Ctrl 按下时再占一个槽位
+// 当镜像手指。move 先攒着，在每个动画帧统一发一次：高刷屏一秒几百条 pointermove，
+// 设备那边 60 Hz 足够，多发只是排队。
+const pointers = new Map();   // e.pointerId → {slot, virt, last, pending, trail}
+let slotMask = 0;
+function allocSlot(){ for(let i = 0; i < 10; i++) if(!(slotMask & (1 << i))){ slotMask |= 1 << i; return i; } return -1; }
+function freeSlot(i){ if(i >= 0) slotMask &= ~(1 << i); }
+function touch(a, slot, p){ sendWS({t:'touch', a, id:slot, x:p.x, y:p.y}); }
+function flushMoves(){
+  for(const rec of pointers.values()){
+    const p = rec.pending;
+    if(!p) continue;
+    rec.pending = null;
+    if(p.x === rec.last.x && p.y === rec.last.y) continue;
+    rec.last = p;
+    touch('move', rec.slot, p);
+    if(rec.virt >= 0) touch('move', rec.virt, mirror(p));
+    if(Math.hypot(p.x - rec.trail.x, p.y - rec.trail.y) > 24){ rec.trail = p; addRipple(p.x, p.y, 'pending'); }
+  }
+}
+function endPointer(e, cancelled){
+  const rec = pointers.get(e.pointerId);
+  if(!rec) return;
+  pointers.delete(e.pointerId);
+  // pointercancel 没有可信坐标，用最后一个位置；否则先把攒着的 move 发掉再抬起
+  let p = cancelled ? rec.last : clampDev(toDevice(e));
+  if(!cancelled && rec.pending && (rec.pending.x !== rec.last.x || rec.pending.y !== rec.last.y)){
+    touch('move', rec.slot, rec.pending);
+    if(rec.virt >= 0) touch('move', rec.virt, mirror(rec.pending));
+  }
+  touch('up', rec.slot, p);
+  if(rec.virt >= 0){ touch('up', rec.virt, mirror(p)); freeSlot(rec.virt); }
+  freeSlot(rec.slot);
+  addRipple(p.x, p.y, 'done');
+}
+
+// —— 退化路径（mjpeg 模式）：松手后才判断是点还是滑，交给 /input 回放 ——
 let down = null;
+
 cv.addEventListener('pointerdown', e => {
   // setPointerCapture 在某些情况下会抛（合成事件、指针已释放），
   // 抛出来会中断整个处理函数，点击静默失效。捕获只是锦上添花，失败不该阻断操作。
   try { cv.setPointerCapture(e.pointerId); } catch(_){}
-  down = {...toDevice(e), t: Date.now()};
-  addRipple(down.x, down.y, 'pending');   // 按下立刻给反馈
   e.preventDefault();
+  const p = clampDev(toDevice(e));
+  if(mode !== 'ws'){
+    down = {...p, t: Date.now()};
+    addRipple(p.x, p.y, 'pending');
+    return;
+  }
+  const pinch = e.altKey || e.ctrlKey;
+  if(e.button !== 0 && !pinch) return;   // 右键/中键暂无语义；Mac 上 Ctrl+点击是 button 2，按缩放处理
+  const slot = allocSlot();
+  if(slot < 0) return;
+  const rec = {slot, virt: pinch ? allocSlot() : -1, last: p, pending: null, trail: p};
+  pointers.set(e.pointerId, rec);
+  touch('down', slot, p);
+  addRipple(p.x, p.y, 'pending');
+  if(rec.virt >= 0){ const m = mirror(p); touch('down', rec.virt, m); addRipple(m.x, m.y, 'pending'); }
+});
+cv.addEventListener('pointermove', e => {
+  if(mode === 'ws'){
+    const rec = pointers.get(e.pointerId);
+    if(rec) rec.pending = clampDev(toDevice(e));
+    return;
+  }
+  if(!down) return;
+  const p = toDevice(e);
+  if(Math.hypot(p.x - down.x, p.y - down.y) > 12) addRipple(p.x, p.y, 'pending');
 });
 cv.addEventListener('pointerup', async e => {
+  if(mode === 'ws'){ endPointer(e, false); return; }
   if(!down) return;
   const up = toDevice(e), from = down;
   down = null;
@@ -407,20 +521,23 @@ cv.addEventListener('pointerup', async e => {
     }
   }
 });
-cv.addEventListener('pointercancel', () => { down = null; });
-// 拖动中实时画出轨迹起点，让人看清将要发出的是滑动
-cv.addEventListener('pointermove', e => {
-  if(!down) return;
-  const p = toDevice(e);
-  if(Math.hypot(p.x - down.x, p.y - down.y) > 12) addRipple(p.x, p.y, 'pending');
-});
+cv.addEventListener('pointercancel', e => { if(mode === 'ws') endPointer(e, true); else down = null; });
+cv.addEventListener('contextmenu', e => e.preventDefault());   // Ctrl+点击 / 右键不要弹菜单
 
 let wheelLock = false;
 cv.addEventListener('wheel', async e => {
   e.preventDefault();
+  const p = clampDev(toDevice(e));
+  if(mode === 'ws'){
+    // 转成 Android AXIS_*SCROLL 的 [-1,1]：像素模式一格约 100px，行模式一格 3 行，页模式 1 页。
+    // 浏览器 deltaY 向下为正，Android vscroll 向上为正，所以取反；横向同向。
+    const k = e.deltaMode === 1 ? 1 / 3 : e.deltaMode === 2 ? 1 : 1 / 100;
+    const dx = Math.max(-1, Math.min(1, e.deltaX * k)), dy = Math.max(-1, Math.min(1, -e.deltaY * k));
+    if(dx || dy) sendWS({t:'scroll', x:p.x, y:p.y, dx, dy});
+    return;
+  }
   if(wheelLock) return;
   wheelLock = true;
-  const p = toDevice(e);
   const dy = e.deltaY > 0 ? -300 : 300;   // 滚轮向下 = 内容上移
   addRipple(p.x, p.y, 'pending');
   await send({type:'swipe', x:p.x, y:p.y, x2:p.x, y2:Math.max(0, Math.min(cv.height, p.y + dy)), ms:200});
@@ -428,32 +545,25 @@ cv.addEventListener('wheel', async e => {
 }, {passive:false});
 
 document.querySelectorAll('[data-key]').forEach(b => {
-  b.onclick = async () => { if(await send({type:'key', key:b.dataset.key})) flash('按键 ' + (b.title||b.dataset.key)); };
+  b.onclick = async () => {
+    const key = b.dataset.key;
+    if(await input({t:'key', key}, {type:'key', key})) flash('按键 ' + (b.title || key));
+  };
 });
 $('#text').addEventListener('keydown', async e => {
   if(e.key !== 'Enter') return;
   const v = e.target.value;
   if(!v) return;
-  if(await send({type:'text', text:v})){ flash('已输入'); e.target.value = ''; }
+  if(await input({t:'text', text:v}, {type:'text', text:v})){ flash('已输入'); e.target.value = ''; }
 });
 
-// 截图：canvas 里就是原始分辨率的那一帧。涟漪是叠加层，导出时要去掉，
-// 否则存下来的图上会多几个圈。
+// 截图：base 里就是原始分辨率、不带涟漪的那一帧
 function stamp(){
   const d = new Date(), p = n => String(n).padStart(2,'0');
   return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
-// 导出时不要带上涟漪叠加层
-function cleanFrame(){
-  const c = document.createElement('canvas');
-  c.width = cv.width; c.height = cv.height;
-  // H.264 路没有 bitmap，直接从主 canvas 取（会带上涟漪，可接受）
-  if(curBitmap) c.getContext('2d').drawImage(curBitmap, 0, 0);
-  else c.getContext('2d').drawImage(cv, 0, 0);
-  return c;
-}
 $('#snap').onclick = () => {
-  cleanFrame().toBlob(b => {
+  base.toBlob(b => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(b);
     a.download = `${id}-${stamp()}.png`;
@@ -463,7 +573,7 @@ $('#snap').onclick = () => {
   }, 'image/png');
 };
 $('#copy').onclick = () => {
-  cleanFrame().toBlob(async b => {
+  base.toBlob(async b => {
     try{
       await navigator.clipboard.write([new ClipboardItem({'image/png': b})]);
       flash('已复制到剪贴板');
@@ -513,14 +623,12 @@ $('#release').onclick = async () => {
 const es = new EventSource('/api/events');
 ['snapshot','tick','claim','release','human','reap'].forEach(k => es.addEventListener(k, loadInfo));
 
-// 页面隐藏时断流，别让后台标签页一直占着节点 CPU 和流配额
+// 页面隐藏时断流，别让后台标签页一直占着节点 CPU 和设备的编码器
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){
-    if(streamAbort) streamAbort.abort();
-    streamAbort = null;
-    if(decoder && decoder.state === 'configured'){ try{ decoder.close(); }catch(_){} decoder = null; }
+    stopStream();
     setLive(false, '已暂停');
-  } else if(!streamAbort){
+  } else if(!sock && !streamAbort){
     startStream();
   }
 });

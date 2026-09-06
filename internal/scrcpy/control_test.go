@@ -49,7 +49,7 @@ func TestFloatToU16FP(t *testing.T) {
 // 错一个偏移服务端就会解出荒谬坐标或直接断开。
 func TestTouchMsgLayout(t *testing.T) {
 	c, _ := ctrlSession(t, 1366, 768)
-	b := c.touchMsg(motionActionDown, 100, 200, 1.0, buttonPrimary)
+	b := c.touchMsg(pointerIDFinger, motionActionDown, 100, 200, 1.0, buttonPrimary)
 	if len(b) != 32 {
 		t.Fatalf("触摸消息应为 32 字节，得到 %d", len(b))
 	}
@@ -248,5 +248,114 @@ func TestControllerRefusesAfterClose(t *testing.T) {
 	c.s.closed.Store(true)
 	if err := c.Key(KeycodeBack); err == nil {
 		t.Error("会话关闭后写入应报错，而不是写到已关的 socket 上 panic")
+	}
+}
+
+// 实时指针：一条 Touch 就是一条消息，pointerID 原样带过去，服务端靠它区分手指。
+func TestTouchCarriesPointerIDAndAction(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.Touch(TouchMove, 3, 100, 200, 0.5) }()
+	b := readN(t, srv, 32)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b[0] != msgInjectTouchEvent || b[1] != motionActionMove {
+		t.Errorf("type/action = %d/%d，期望 %d/%d", b[0], b[1], msgInjectTouchEvent, motionActionMove)
+	}
+	if id := binary.BigEndian.Uint64(b[2:10]); id != 3 {
+		t.Errorf("pointer id = %d，期望 3", id)
+	}
+	if x, y := binary.BigEndian.Uint32(b[10:14]), binary.BigEndian.Uint32(b[14:18]); x != 100 || y != 200 {
+		t.Errorf("坐标 = %d,%d，期望 100,200", x, y)
+	}
+	if p := binary.BigEndian.Uint16(b[22:24]); p != 0x8000 {
+		t.Errorf("pressure 0.5 应编成 0x8000，得到 %#x", p)
+	}
+	if bt := binary.BigEndian.Uint32(b[28:32]); bt != buttonPrimary {
+		t.Errorf("MOVE 的 buttons 应为 primary，得到 %d", bt)
+	}
+}
+
+// 指针拖出画面是常态；UP 若因越界被拒，设备上那根手指就永远抬不起来。
+// 所以 Touch 钳坐标而不是报错，抬起时压力与按钮归零。
+func TestTouchClampsInsteadOfRejecting(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.Touch(TouchUp, 0, -50, 9999, 1) }()
+	b := readN(t, srv, 32)
+	if err := <-done; err != nil {
+		t.Fatalf("越界的 UP 不应报错: %v", err)
+	}
+	if x, y := binary.BigEndian.Uint32(b[10:14]), binary.BigEndian.Uint32(b[14:18]); x != 0 || y != 767 {
+		t.Errorf("越界坐标应钳到 0,767，得到 %d,%d", x, y)
+	}
+	if p := binary.BigEndian.Uint16(b[22:24]); p != 0 {
+		t.Errorf("UP 的 pressure 应为 0，得到 %#x", p)
+	}
+	if bt := binary.BigEndian.Uint32(b[28:32]); bt != 0 {
+		t.Errorf("UP 的 buttons 应为 0，得到 %d", bt)
+	}
+}
+
+func TestTouchRejectsUnknownAction(t *testing.T) {
+	c, _ := ctrlSession(t, 1366, 768)
+	if err := c.Touch(TouchAction(9), 0, 1, 1, 1); err == nil {
+		t.Error("未知动作应报错")
+	}
+}
+
+func TestFloatToI16FP(t *testing.T) {
+	for _, tc := range []struct {
+		in   float64
+		want int16
+	}{
+		{0, 0}, {0.5, 0x4000}, {1, 0x7fff}, {-1, -0x8000}, {2, 0x7fff}, {-3, -0x8000}, {-0.25, -0x2000},
+	} {
+		if got := floatToI16FP(tc.in); got != tc.want {
+			t.Errorf("floatToI16FP(%v) = %#x，期望 %#x", tc.in, got, tc.want)
+		}
+	}
+}
+
+// 滚轮走 INJECT_SCROLL_EVENT：固定 21 字节，位置 + 两个 16 位定点滚动量 + buttons。
+func TestScrollMsgLayout(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.Scroll(683, 384, 0.25, -1) }()
+	b := readN(t, srv, 21)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b[0] != msgInjectScroll {
+		t.Errorf("type = %d，期望 %d", b[0], msgInjectScroll)
+	}
+	if x, y := binary.BigEndian.Uint32(b[1:5]), binary.BigEndian.Uint32(b[5:9]); x != 683 || y != 384 {
+		t.Errorf("坐标 = %d,%d", x, y)
+	}
+	if w, h := binary.BigEndian.Uint16(b[9:11]), binary.BigEndian.Uint16(b[11:13]); w != 1366 || h != 768 {
+		t.Errorf("屏幕尺寸 = %dx%d", w, h)
+	}
+	if hs := int16(binary.BigEndian.Uint16(b[13:15])); hs != 0x2000 {
+		t.Errorf("hscroll 0.25 应为 0x2000，得到 %#x", hs)
+	}
+	if vs := int16(binary.BigEndian.Uint16(b[15:17])); vs != -0x8000 {
+		t.Errorf("vscroll -1 应为 -0x8000，得到 %#x", vs)
+	}
+	if bt := binary.BigEndian.Uint32(b[17:21]); bt != 0 {
+		t.Errorf("buttons 应为 0，得到 %d", bt)
+	}
+}
+
+func TestScrollClampsPosition(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.Scroll(5000, -5, 0, 0) }()
+	b := readN(t, srv, 21)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if x, y := binary.BigEndian.Uint32(b[1:5]), binary.BigEndian.Uint32(b[5:9]); x != 1365 || y != 0 {
+		t.Errorf("越界坐标应钳到 1365,0，得到 %d,%d", x, y)
 	}
 }

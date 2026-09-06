@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/coder/websocket v1.8.15
 	github.com/modelcontextprotocol/go-sdk v1.3.0
 	golang.org/x/image v0.45.0
 	modernc.org/sqlite v1.58.0
