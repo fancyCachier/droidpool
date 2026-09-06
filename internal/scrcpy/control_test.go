@@ -359,3 +359,94 @@ func TestScrollClampsPosition(t *testing.T) {
 		t.Errorf("越界坐标应钳到 1365,0，得到 %d,%d", x, y)
 	}
 }
+
+func TestKeyEventCarriesMetaState(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.KeyEvent(KeyDown, 29, 0x3000) }() // Ctrl+A
+	b := readN(t, srv, 14)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b[0] != msgInjectKeycode || b[1] != keyActionDown {
+		t.Errorf("type/action = %d/%d", b[0], b[1])
+	}
+	if kc := binary.BigEndian.Uint32(b[2:6]); kc != 29 {
+		t.Errorf("keycode = %d", kc)
+	}
+	if rep := binary.BigEndian.Uint32(b[6:10]); rep != 0 {
+		t.Errorf("repeat 应为 0，得到 %d", rep)
+	}
+	if meta := binary.BigEndian.Uint32(b[10:14]); meta != 0x3000 {
+		t.Errorf("metaState = %#x，期望 0x3000", meta)
+	}
+	if err := c.KeyEvent(KeyAction(7), 1, 0); err == nil {
+		t.Error("未知按键动作应报错")
+	}
+}
+
+// 不带修饰键的 Key 走的是同一条布局，metaState 必须是 0，否则设备会当成按着 Shift。
+func TestKeyWithoutMetaKeepsZero(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.Key(KeycodeBack) }()
+	b := readN(t, srv, 28)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if meta := binary.BigEndian.Uint32(b[10:14]); meta != 0 {
+		t.Errorf("Key 的 metaState 应为 0，得到 %#x", meta)
+	}
+}
+
+// SET_CLIPBOARD：type 9 + sequence 8 + paste 1 + len 4 + UTF-8；中文按字节数算长度。
+func TestSetClipboardLayout(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	text := "你好 hi"
+	done := make(chan error, 1)
+	go func() { done <- c.SetClipboard(text, true) }()
+	b := readN(t, srv, 14+len(text))
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b[0] != msgSetClipboard {
+		t.Errorf("type = %d，期望 %d", b[0], msgSetClipboard)
+	}
+	if seq := binary.BigEndian.Uint64(b[1:9]); seq != 0 {
+		t.Errorf("sequence 应为 0（不要 ACK），得到 %d", seq)
+	}
+	if b[9] != 1 {
+		t.Errorf("paste 标志应为 1，得到 %d", b[9])
+	}
+	if n := binary.BigEndian.Uint32(b[10:14]); int(n) != len(text) {
+		t.Errorf("长度 = %d，期望 %d（字节数）", n, len(text))
+	}
+	if got := string(b[14:]); got != text {
+		t.Errorf("文本 = %q", got)
+	}
+	// 不粘贴时标志为 0
+	go func() { done <- c.SetClipboard("x", false) }()
+	b = readN(t, srv, 15)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b[9] != 0 {
+		t.Errorf("不粘贴时 paste 标志应为 0，得到 %d", b[9])
+	}
+	if err := c.SetClipboard(string(make([]byte, clipboardTextMax+1)), false); err == nil {
+		t.Error("超过剪贴板上限应报错")
+	}
+}
+
+func TestGetClipboardLayout(t *testing.T) {
+	c, srv := ctrlSession(t, 1366, 768)
+	done := make(chan error, 1)
+	go func() { done <- c.GetClipboard(CopyKeyCopy) }()
+	b := readN(t, srv, 2)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if b[0] != msgGetClipboard || b[1] != byte(CopyKeyCopy) {
+		t.Errorf("GET_CLIPBOARD = % x，期望 08 01", b)
+	}
+}

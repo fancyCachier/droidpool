@@ -338,7 +338,10 @@ func TestMakeGoldenStripsOverlayFlagAndAppliesSettings(t *testing.T) {
 		t.Errorf("其它启动参数应保留: %s", run)
 	}
 	// 系统设置必须落下：关动画是截图与驱动稳定的前提
-	for _, want := range []string{"window_animation_scale 0", "stayon true", "persist.sys.locale zh-CN", "package_verifier_enable 0"} {
+	// screen_off_timeout 是真正管用的那条常亮设置：容器没有充电器，svc power stayon
+	// 只在已插电时生效，光靠它设备还是会息屏变成黑屏
+	for _, want := range []string{"window_animation_scale 0", "screen_off_timeout 2147483647",
+		"stayon true", "persist.sys.locale zh-CN", "package_verifier_enable 0"} {
 		if f.lastMatching(want) == nil {
 			t.Errorf("golden 应执行设置 %q", want)
 		}

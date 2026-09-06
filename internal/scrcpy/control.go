@@ -16,7 +16,12 @@ const (
 	msgInjectTouchEvent = 2
 	msgInjectScroll     = 3
 	msgBackOrScreenOn   = 4
+	msgGetClipboard     = 8
+	msgSetClipboard     = 9
 )
+
+// clipboardTextMax 是服务端 CLIPBOARD_TEXT_MAX_LENGTH（256 KiB - 14）。
+const clipboardTextMax = 1<<18 - 14
 
 // Android 输入常量（android/input.h）。
 const (
@@ -154,13 +159,17 @@ func (c *Controller) Swipe(x1, y1, x2, y2 int, dur time.Duration) error {
 	return c.write(c.touchMsg(pointerIDFinger, motionActionUp, x2, y2, 0, 0))
 }
 
-// keyMsg 组一条 INJECT_KEYCODE（固定 14 字节）。
-func keyMsg(action byte, keycode uint32) []byte {
+// keyMsg 组一条 INJECT_KEYCODE（固定 14 字节），不带修饰键。
+func keyMsg(action byte, keycode uint32) []byte { return keyMsgMeta(action, keycode, 0) }
+
+// keyMsgMeta 同上，metaState 是 Android 的 META_*_ON 位组合（Shift/Ctrl/Alt/Meta）。
+func keyMsgMeta(action byte, keycode, metaState uint32) []byte {
 	b := make([]byte, 14)
 	b[0] = msgInjectKeycode
 	b[1] = action
 	binary.BigEndian.PutUint32(b[2:6], keycode)
-	// repeat=0, metastate=0
+	// b[6:10] repeat = 0
+	binary.BigEndian.PutUint32(b[10:14], metaState)
 	return b
 }
 
@@ -261,4 +270,56 @@ func (c *Controller) clamp(x, y int) (int, int) {
 func floatToI16FP(f float64) int16 {
 	f = max(-1, min(1, f))
 	return int16(min(int32(math.Floor(f*32768)), 0x7fff))
+}
+
+// KeyAction 按键动作，与 android/input.h 的 AKEY_EVENT_ACTION_* 一致。
+type KeyAction byte
+
+const (
+	KeyDown KeyAction = keyActionDown
+	KeyUp   KeyAction = keyActionUp
+)
+
+// KeyEvent 注入单个按键动作：浏览器的 keydown / keyup 各对应一条，修饰键由 metaState 带过去，
+// 这样 Ctrl+A、Shift+方向键这类组合在设备上才成立。
+func (c *Controller) KeyEvent(action KeyAction, keycode, metaState uint32) error {
+	switch action {
+	case KeyDown, KeyUp:
+	default:
+		return fmt.Errorf("未知按键动作 %d", action)
+	}
+	return c.write(keyMsgMeta(byte(action), keycode, metaState))
+}
+
+// SetClipboard 把文本写进设备剪贴板；paste 为真时服务端随即按一下 KEYCODE_PASTE，
+// 等于在当前输入框里粘贴。中文等非 ASCII 文本只能走这条：INJECT_TEXT 只认虚拟键盘上有的字符，
+// 遇到 CJK 会静默丢字。
+func (c *Controller) SetClipboard(text string, paste bool) error {
+	if len(text) > clipboardTextMax {
+		return fmt.Errorf("文本 %d 字节超过剪贴板上限 %d", len(text), clipboardTextMax)
+	}
+	b := make([]byte, 1+8+1+4+len(text))
+	b[0] = msgSetClipboard
+	// b[1:9] sequence = 0（SEQUENCE_INVALID）：不要求服务端回 ACK
+	if paste {
+		b[9] = 1
+	}
+	binary.BigEndian.PutUint32(b[10:14], uint32(len(text)))
+	copy(b[14:], text)
+	return c.write(b)
+}
+
+// CopyKey 让 GetClipboard 先按哪个键再取剪贴板（COPY 能把当前选中的文字先复制进去）。
+type CopyKey byte
+
+const (
+	CopyKeyNone CopyKey = 0
+	CopyKeyCopy CopyKey = 1
+	CopyKeyCut  CopyKey = 2
+)
+
+// GetClipboard 请求设备剪贴板。结果不在这里返回：服务端异步经控制 socket 推一条
+// DeviceMsgClipboard，由 Session.ReadDeviceMessage 收。
+func (c *Controller) GetClipboard(key CopyKey) error {
+	return c.write([]byte{msgGetClipboard, byte(key)})
 }

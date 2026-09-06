@@ -45,6 +45,12 @@ dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:1
 dt{color:var(--dim)} dd{margin:0;word-break:break-all}
 .hint{color:var(--dim);font-size:12px;margin-top:7px;line-height:1.45}
 .fps{font-size:11px;color:var(--dim);margin-left:6px}
+#loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+         background:#000;color:var(--dim);font-size:14px;line-height:1.5;pointer-events:none}
+canvas:focus{outline:2px solid var(--acc);outline-offset:-2px}
+pre.clip{margin:0 0 8px;padding:8px 9px;background:#0d1117;border:1px solid var(--line);border-radius:6px;
+         font:12px/1.4 ui-monospace,Menlo,monospace;color:var(--fg);max-height:80px;overflow:auto;
+         white-space:pre-wrap;word-break:break-all}
 #flash{position:fixed;right:16px;bottom:16px;background:var(--card);border:1px solid var(--acc);
        border-radius:6px;padding:8px 12px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none}
 #flash.show{opacity:1}
@@ -60,7 +66,7 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
 </header>
 
 <div class="wrap">
-  <div class="screen"><canvas id="cv" width="1366" height="768"></canvas></div>
+  <div class="screen"><canvas id="cv" width="1366" height="768" tabindex="0"></canvas><div id="loading">连接中…</div></div>
   <div class="side">
     <div class="panel">
       <h2>租约</h2>
@@ -140,7 +146,19 @@ dt{color:var(--dim)} dd{margin:0;word-break:break-all}
       <h2>文本输入</h2>
       <input type="text" id="text" placeholder="输入后回车发送">
       <div class="hint">点击 = 点按，按住 = 长按，拖动 = 跟手拖动/滑动，Alt(Option)/Ctrl + 拖动 = 双指缩放，滚轮 = 滚动。<br>
-        文本不支持中文（需设备端 IME）。</div>
+        点一下画面后可直接打字：字母数字与回车、退格、方向键直通设备，Esc = 返回，Ctrl/⌘+字母 = 组合键；
+        中文请用上面的输入框（经设备剪贴板粘贴）。</div>
+    </div>
+
+    <div class="panel">
+      <h2>设备剪贴板</h2>
+      <pre class="clip" id="devclip">（空）</pre>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button id="clipget">读取</button>
+        <button id="clipcopy" disabled>复制到本机</button>
+        <button id="clippaste">本机剪贴板 → 设备</button>
+      </div>
+      <div class="hint">画面聚焦时 Ctrl/⌘+C 取设备剪贴板，Ctrl/⌘+V 把本机剪贴板粘贴进设备；设备上复制文字会自动同步到这里。</div>
     </div>
   </div>
 </div>
@@ -169,6 +187,10 @@ function setLive(on, txt){
   el.className = 'live' + (on ? ' on' : '');
   el.querySelector('.txt').textContent = txt || (on ? '实时' : '画面中断');
 }
+// 首帧到达前盖一层「连接中」，别让人对着黑框猜是没连上还是设备黑屏
+// 遮罩只用于「确实没有画面」的状态：连接中、重连、已暂停、被接管。
+// 画面静止不算——scrcpy 本来就只在变化时出帧，盖住一张好画面反而更糟（实测踩过）。
+function loading(txt){ const l = $('#loading'); if(txt){ l.textContent = txt; l.hidden = false; } else l.hidden = true; }
 function resize(w, h){
   if(!w || !h || (w === cv.width && h === cv.height)) return;
   cv.width = base.width = w; cv.height = base.height = h;
@@ -176,7 +198,8 @@ function resize(w, h){
 }
 function paint(){ ctx.drawImage(base, 0, 0); drawRipples(); }
 
-let frames = 0, lastFpsAt = performance.now();
+// —— HUD：fps / 码率 / 往返 / 解码积压 ——
+let frames = 0, bytes = 0, lastFpsAt = performance.now(), rtt = null, lastFrameAt = 0;
 // mode: 'ws' = WebSocket 双向通道（H.264 + 实时指针）；'mjpeg' = 截图流 + 每手势一次 POST 的退化路径
 let decoder = null, mode = '', sock = null, streamAbort = null;
 
@@ -205,7 +228,8 @@ function newDecoder(){
       bctx.drawImage(frame, 0, 0);
       frame.close();
       paint();
-      frames++;
+      loading(null);
+      frames++; lastFrameAt = performance.now();
     },
     error: e => { setLive(false, '解码出错'); console.warn('VideoDecoder', e); }
   });
@@ -241,7 +265,7 @@ function newDecoder(){
 }
 
 // —— WebSocket 双向通道（首选）——
-// 下行：二进制 = [标志位 1 字节][H.264 访问单元]，文本 = JSON 事件（hello / error）
+// 下行：二进制 = [标志位 1 字节][H.264 访问单元]，文本 = JSON 事件（hello / error / clip / pong）
 // 上行：JSON 输入，指针 down/move/up 按发生顺序实时发，设备侧看到的就是一根真实的手指
 function wsURL(){
   return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host +
@@ -262,23 +286,39 @@ function startWS(){
           hello = true; mode = 'ws';
           resize(m.w, m.h);
           setLive(true, '实时 H.264');
+          // 重连时画布上通常还留着上一帧：静止的画面就是当前状态，盖住它反而看不见东西。
+          // 只有从没出过帧（真的一片空白）才显示等待提示。
+          if(!lastFrameAt) loading('等待首帧…');
           resolve(s);
         }else if(m.t === 'error'){
           flash('操作被拒: ' + m.msg, true);
+        }else if(m.t === 'clip'){
+          onDeviceClip(m.text);
+        }else if(m.t === 'pong'){
+          rtt = Math.round(performance.now() - m.ts);
         }
         return;
       }
+      bytes += ev.data.byteLength;
       // 首字节是标志位；解码按 NAL 类型自行判断，不依赖它
       feed(new Uint8Array(ev.data, 1));
     };
     s.onclose = ev => {
       if(sock === s) sock = null;
       if(mode === 'ws') mode = '';   // 通道没了就回到 /input 的退化路径，别让按键静默失效
-      pointers.clear(); slotMask = 0;
+      pointers.clear(); slotMask = 0; rtt = null;
       if(s.superseded){ if(!hello) reject(new Error('superseded')); return; }  // 我们自己关的（暂停/换流）
+      if(ev.reason === 'too_many_sessions'){
+        // 名额满了：不退回截图流（那会再占一路 screencap），过会儿再试
+        setLive(false, '实时通道已满'); loading('同时放大的设备已达上限，10 秒后重试…');
+        if(!hello) reject(new Error('superseded'));
+        setTimeout(startStream, 10000);
+        return;
+      }
       if(!hello){ reject(new Error(ev.reason || 'closed before hello')); return; }
-      if(ev.reason === 'taken_over'){ setLive(false, '已被其他页面接管'); return; }
+      if(ev.reason === 'taken_over'){ setLive(false, '已被其他页面接管'); loading('已被其他页面接管'); return; }
       setLive(false, '流中断，重连中');
+      if(!lastFrameAt) loading('流中断，重连中…');
       setTimeout(startStream, 1500);
     };
   });
@@ -333,6 +373,7 @@ async function startMJPEG(signal){
       bctx.drawImage(bmp, 0, 0);
       bmp.close();
       paint();
+      loading(null);
       frames++;
       setLive(true, window.isSecureContext ? '实时 截图流' : '截图流（http 非安全上下文，无 WebCodecs）');
     }catch(_){}
@@ -341,6 +382,7 @@ async function startMJPEG(signal){
 
 async function startStream(){
   stopStream();
+  loading('连接中…');
   if(typeof VideoDecoder !== 'undefined'){
     try{ await startWS(); return; }
     catch(e){
@@ -377,8 +419,19 @@ function animate(){
   if(ripples.length) paint();
   const now = performance.now();
   if(now - lastFpsAt >= 1000){
-    $('#fpsnow').textContent = frames ? `${frames} fps` : '';
-    frames = 0; lastFpsAt = now;
+    const parts = [];
+    if(frames) parts.push(`${frames} fps`);
+    else if(lastFrameAt) parts.push(`静止 ${Math.round((now - lastFrameAt) / 1000)} s`);
+    if(bytes) parts.push(`${Math.round(bytes * 8 / 1000)} kbps`);
+    if(rtt !== null) parts.push(`往返 ${rtt} ms`);
+    const q = decoder && decoder.state === 'configured' ? decoder.decodeQueueSize : 0;
+    if(q > 2) parts.push(`积压 ${q}`);
+    $('#fpsnow').textContent = parts.join(' · ');
+    frames = 0; bytes = 0; lastFpsAt = now;
+    // 解码排队超过 3 秒的量说明浏览器跟不上，画面会越来越滞后；
+    // scrcpy 没有「按需关键帧」，只能断开重连拿一个新的 IDR 从头来
+    if(q > 30 && mode === 'ws'){ flash('解码积压，重连以追上实时画面', true); startStream(); }
+    if(mode === 'ws') sendWS({t:'ping', ts: now});
   }
   requestAnimationFrame(animate);
 }
@@ -477,6 +530,7 @@ cv.addEventListener('pointerdown', e => {
   // 抛出来会中断整个处理函数，点击静默失效。捕获只是锦上添花，失败不该阻断操作。
   try { cv.setPointerCapture(e.pointerId); } catch(_){}
   e.preventDefault();
+  cv.focus({preventScroll:true});   // 点过画面后键盘就直通设备
   const p = clampDev(toDevice(e));
   if(mode !== 'ws'){
     down = {...p, t: Date.now()};
@@ -544,6 +598,72 @@ cv.addEventListener('wheel', async e => {
   setTimeout(() => wheelLock = false, 240);
 }, {passive:false});
 
+// —— 物理键盘直通（画面聚焦时）——
+// 特殊键按 Android keycode 直接注入（带修饰键），可打印字符走 text（服务端按 ASCII 与否选路）。
+// IME 组合中的按键（key === 'Process' / isComposing）不管：中文走输入框。
+const KEYCODES = {Enter:66, Backspace:67, Delete:112, Tab:61, Escape:4, ArrowUp:19, ArrowDown:20,
+  ArrowLeft:21, ArrowRight:22, Home:122, End:123, PageUp:92, PageDown:93, ' ':62};
+// Android META_* 位：SHIFT 0x1|0x40，ALT 0x2|0x10，CTRL 0x1000|0x2000，META 0x10000|0x20000
+function metaOf(e){
+  let m = 0;
+  if(e.shiftKey) m |= 0x41;
+  if(e.altKey) m |= 0x12;
+  if(e.ctrlKey || e.metaKey) m |= 0x3000;   // Mac 的 ⌘ 当 Ctrl 用，Ctrl+A/C/V/X/Z 才有意义
+  return m;
+}
+// 字母/数字在 Android 的 keycode：A=29…Z=54，0=7…9=16
+function letterCode(k){
+  if(/^[a-z]$/i.test(k)) return 29 + (k.toLowerCase().charCodeAt(0) - 97);
+  if(/^[0-9]$/.test(k)) return 7 + (k.charCodeAt(0) - 48);
+  return null;
+}
+function keyevPair(code, meta){
+  sendWS({t:'keyev', a:'down', code, meta});
+  sendWS({t:'keyev', a:'up', code, meta});
+}
+cv.addEventListener('keydown', async e => {
+  if(mode !== 'ws' || e.isComposing || e.key === 'Process') return;
+  const combo = e.ctrlKey || e.metaKey;
+  if(combo && /^[cv]$/i.test(e.key)){
+    // 剪贴板双向：⌘/Ctrl+C 取设备剪贴板，⌘/Ctrl+V 把本机剪贴板粘进设备
+    e.preventDefault();
+    if(e.key.toLowerCase() === 'c') sendWS({t:'getclip', copy:true});
+    else pasteToDevice();
+    return;
+  }
+  if(e.key in KEYCODES){
+    e.preventDefault();
+    keyevPair(KEYCODES[e.key], metaOf(e));
+    return;
+  }
+  const lc = letterCode(e.key);
+  if(combo && lc !== null){ e.preventDefault(); keyevPair(lc, metaOf(e)); return; }
+  if(e.key.length === 1 && !combo){
+    e.preventDefault();
+    sendWS({t:'text', text:e.key});   // 逐字符打字，和真键盘一样
+  }
+});
+
+// —— 设备剪贴板 ——
+let devClip = '';
+function onDeviceClip(text){
+  devClip = text || '';
+  $('#devclip').textContent = devClip || '（空）';
+  $('#clipcopy').disabled = !devClip;
+  // 由 ⌘/Ctrl+C 触发时用户手势还在有效期内，顺手写进本机剪贴板；失败就留在面板里
+  if(devClip && navigator.clipboard) navigator.clipboard.writeText(devClip).then(() => flash('设备剪贴板已复制到本机')).catch(() => {});
+}
+async function pasteToDevice(){
+  try{
+    const text = await navigator.clipboard.readText();
+    if(!text){ flash('本机剪贴板是空的', true); return; }
+    if(sendWS({t:'clip', text, paste:true})) flash(`已粘贴 ${text.length} 字`);
+  }catch(_){ flash('读不到本机剪贴板（需 HTTPS 且授权）', true); }
+}
+$('#clipget').onclick = () => { if(!sendWS({t:'getclip', copy:false})) flash('实时通道未连接', true); };
+$('#clipcopy').onclick = () => navigator.clipboard.writeText(devClip).then(() => flash('已复制到本机')).catch(() => flash('复制失败（需 HTTPS）', true));
+$('#clippaste').onclick = pasteToDevice;
+
 document.querySelectorAll('[data-key]').forEach(b => {
   b.onclick = async () => {
     const key = b.dataset.key;
@@ -551,7 +671,7 @@ document.querySelectorAll('[data-key]').forEach(b => {
   };
 });
 $('#text').addEventListener('keydown', async e => {
-  if(e.key !== 'Enter') return;
+  if(e.key !== 'Enter' || e.isComposing) return;
   const v = e.target.value;
   if(!v) return;
   if(await input({t:'text', text:v}, {type:'text', text:v})){ flash('已输入'); e.target.value = ''; }
@@ -627,7 +747,7 @@ const es = new EventSource('/api/events');
 document.addEventListener('visibilitychange', () => {
   if(document.hidden){
     stopStream();
-    setLive(false, '已暂停');
+    setLive(false, '已暂停'); loading('已暂停（切回标签页恢复）');
   } else if(!sock && !streamAbort){
     startStream();
   }
