@@ -86,6 +86,12 @@ func newSCID() string {
 	return fmt.Sprintf("%08x", time.Now().UnixNano()&0x7fffffff)
 }
 
+// NewSession 用已建立的视频与控制连接构造会话，跳过推 jar、forward 与握手。
+// 给测试和「连接由别处建立」的场景用；没有设备侧进程可探测，Alive 只看是否已 Close。
+func NewSession(video, control net.Conn, width, height int) *Session {
+	return &Session{video: video, control: control, Width: width, Height: height}
+}
+
 // Start 推服务端、建隧道、完成握手。返回后即可 ReadFrame。
 func Start(ctx context.Context, opt Options) (*Session, error) {
 	if opt.Serial == "" || opt.ServerJar == "" || opt.LocalPort == 0 {
@@ -233,8 +239,13 @@ func (s *Session) ReadFrame() (*Frame, error) {
 // Alive 报告设备侧 scrcpy 进程是否还在。
 // 进程退出后 socket 未必立刻报错（adb 隧道会吞掉一段时间），靠它来兜底。
 func (s *Session) Alive() bool {
-	if s.closed.Load() || s.cmd == nil || s.cmd.Process == nil {
+	if s.closed.Load() {
 		return false
+	}
+	if s.cmd == nil || s.cmd.Process == nil {
+		// 不是 Start 拉起的进程（NewSession 传入的现成连接），没有进程可探，
+		// 只要没 Close 就当活着
+		return true
 	}
 	// ProcessState 只在 Wait 过之后才有；这里用信号 0 探测
 	return s.cmd.Process.Signal(syscall.Signal(0)) == nil
@@ -266,8 +277,10 @@ func (s *Session) Close() error {
 
 	// 杀本机的 adb shell 只是断了管道，设备上的 app_process 不一定跟着退。
 	// 用 scid 精确定位设备侧进程再杀，不误伤别的会话或别人手动跑的 scrcpy。
-	_ = exec.CommandContext(ctx, s.opt.adb(), "-s", s.opt.Serial, "shell",
-		"pkill", "-f", "scid="+s.scid).Run()
+	if s.cmd != nil {
+		_ = exec.CommandContext(ctx, s.opt.adb(), "-s", s.opt.Serial, "shell",
+			"pkill", "-f", "scid="+s.scid).Run()
+	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 		_ = s.cmd.Wait()

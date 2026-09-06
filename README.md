@@ -162,9 +162,10 @@ POST   /api/leases/{id}/human          {takeover: bool, note?}
 DELETE /api/leases/{id}                release → async reset
 GET    /api/devices · /api/leases · /api/health
 GET    /api/events                     SSE, full snapshot on every change
-GET    /api/devices/{id}/stream.h264   multipart H.264 (scrcpy)
+GET    /api/devices/{id}/ws            WebSocket: H.264 access units down, live touch / scroll / key / text up
+GET    /api/devices/{id}/stream.h264   multipart H.264 (scrcpy), kept for curl-based measurements
 GET    /api/devices/{id}/stream.mjpg   multipart JPEG/PNG (screencap fallback)
-POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …}
+POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …} (fallback when no WebSocket session)
 ```
 
 ## What it deliberately does not do
@@ -210,3 +211,5 @@ committed to this public repository.
 - [scrcpy](https://github.com/Genymobile/scrcpy) — whose server jar and wire
   protocol make low-latency streaming possible; the protocol details here were
   confirmed by packet capture against v4.1
+- [coder/websocket](https://github.com/coder/websocket) — the WebSocket
+  transport behind the device wall's zoomed view

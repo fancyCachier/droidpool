@@ -223,3 +223,36 @@ func TestReadFrameMasksUnknownHighFlag(t *testing.T) {
 		t.Errorf("PTS = %d，未知标志位应被掩掉，期望 %d", f.PTS, realPTS)
 	}
 }
+
+// NewSession 造出来的会话没有设备侧进程：Alive 只看有没有 Close，
+// Close 也不能去跑 adb（测试机上根本没有设备）。
+func TestNewSessionAliveUntilClosed(t *testing.T) {
+	vc, vs := net.Pipe()
+	cc, cs := net.Pipe()
+	t.Cleanup(func() { vs.Close(); cs.Close() })
+	s := NewSession(vc, cc, 1366, 768)
+	if s.Width != 1366 || s.Height != 768 {
+		t.Fatalf("尺寸 = %dx%d", s.Width, s.Height)
+	}
+	if !s.Alive() {
+		t.Error("刚构造的会话应视为存活")
+	}
+	if _, err := s.Control(); err != nil {
+		t.Errorf("带控制连接的会话应能取控制器: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s.Alive() {
+		t.Error("Close 之后不应再存活")
+	}
+	// 两条连接都应被关掉：对端写入要报错
+	_ = vs.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := vs.Write([]byte{0}); err == nil {
+		t.Error("Close 后视频连接应已断开")
+	}
+	_ = cs.SetWriteDeadline(time.Now().Add(time.Second))
+	if _, err := cs.Write([]byte{0}); err == nil {
+		t.Error("Close 后控制连接应已断开")
+	}
+}

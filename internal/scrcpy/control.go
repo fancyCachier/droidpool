@@ -84,12 +84,12 @@ func floatToU16FP(f float64) uint16 {
 	return uint16(math.Floor(f * 65536))
 }
 
-// touchMsg 组一条 INJECT_TOUCH_EVENT（固定 32 字节）。
-func (c *Controller) touchMsg(action byte, x, y int, pressure float64, buttons uint32) []byte {
+// touchMsg 组一条 INJECT_TOUCH_EVENT（固定 32 字节）。pointerID 区分多点触控里的不同手指。
+func (c *Controller) touchMsg(pointerID uint64, action byte, x, y int, pressure float64, buttons uint32) []byte {
 	b := make([]byte, 32)
 	b[0] = msgInjectTouchEvent
 	b[1] = action
-	binary.BigEndian.PutUint64(b[2:10], pointerIDFinger)
+	binary.BigEndian.PutUint64(b[2:10], pointerID)
 	binary.BigEndian.PutUint32(b[10:14], uint32(int32(x)))
 	binary.BigEndian.PutUint32(b[14:18], uint32(int32(y)))
 	binary.BigEndian.PutUint16(b[18:20], uint16(c.w))
@@ -112,11 +112,11 @@ func (c *Controller) Tap(x, y int) error {
 	if err := c.checkXY(x, y); err != nil {
 		return err
 	}
-	if err := c.write(c.touchMsg(motionActionDown, x, y, 1, buttonPrimary)); err != nil {
+	if err := c.write(c.touchMsg(pointerIDFinger, motionActionDown, x, y, 1, buttonPrimary)); err != nil {
 		return err
 	}
 	time.Sleep(40 * time.Millisecond)
-	return c.write(c.touchMsg(motionActionUp, x, y, 0, 0))
+	return c.write(c.touchMsg(pointerIDFinger, motionActionUp, x, y, 0, 0))
 }
 
 // Swipe 滑动。用 MOVE 事件插值，让 Flutter 的滚动物理能识别出速度；
@@ -138,7 +138,7 @@ func (c *Controller) Swipe(x1, y1, x2, y2 int, dur time.Duration) error {
 	if steps > 60 {
 		steps = 60
 	}
-	if err := c.write(c.touchMsg(motionActionDown, x1, y1, 1, buttonPrimary)); err != nil {
+	if err := c.write(c.touchMsg(pointerIDFinger, motionActionDown, x1, y1, 1, buttonPrimary)); err != nil {
 		return err
 	}
 	tick := dur / time.Duration(steps)
@@ -146,12 +146,12 @@ func (c *Controller) Swipe(x1, y1, x2, y2 int, dur time.Duration) error {
 		t := float64(i) / float64(steps)
 		x := x1 + int(float64(x2-x1)*t)
 		y := y1 + int(float64(y2-y1)*t)
-		if err := c.write(c.touchMsg(motionActionMove, x, y, 1, buttonPrimary)); err != nil {
+		if err := c.write(c.touchMsg(pointerIDFinger, motionActionMove, x, y, 1, buttonPrimary)); err != nil {
 			return err
 		}
 		time.Sleep(tick)
 	}
-	return c.write(c.touchMsg(motionActionUp, x2, y2, 0, 0))
+	return c.write(c.touchMsg(pointerIDFinger, motionActionUp, x2, y2, 0, 0))
 }
 
 // keyMsg 组一条 INJECT_KEYCODE（固定 14 字节）。
@@ -203,3 +203,62 @@ const (
 	KeycodeVolumeUp   = 24
 	KeycodeVolumeDown = 25
 )
+
+// TouchAction 是 Touch 的动作，取值与 android/input.h 的 AMOTION_EVENT_ACTION_* 一致。
+type TouchAction byte
+
+const (
+	TouchDown TouchAction = motionActionDown
+	TouchUp   TouchAction = motionActionUp
+	TouchMove TouchAction = motionActionMove
+)
+
+// MaxPointers 是同时存在的指针数上限，等于 scrcpy 服务端 PointersState 的容量。
+const MaxPointers = 10
+
+// Touch 注入一个指针的一条触摸事件。多点触控由调用方用不同 pointerID 组合，
+// 服务端会按当前按下的指针数自己生成 ACTION_POINTER_DOWN/UP，这里不用管。
+//
+// 坐标越界时**钳到屏幕边缘而不是拒绝**：浏览器捕获指针后拖出画面事件照样来，
+// 要是 UP 因为越界被拒，设备上那根手指就永远抬不起来了。
+func (c *Controller) Touch(action TouchAction, pointerID uint64, x, y int, pressure float64) error {
+	switch action {
+	case TouchDown, TouchUp, TouchMove:
+	default:
+		return fmt.Errorf("未知触摸动作 %d", action)
+	}
+	x, y = c.clamp(x, y)
+	buttons := uint32(buttonPrimary)
+	if action == TouchUp {
+		buttons, pressure = 0, 0 // 抬起时压力与按钮都要归零，否则某些 View 当成仍按着
+	}
+	return c.write(c.touchMsg(pointerID, byte(action), x, y, pressure, buttons))
+}
+
+// Scroll 注入一条滚轮事件（INJECT_SCROLL_EVENT，固定 21 字节）。
+// hscroll / vscroll 取 [-1, 1]，与 Android AXIS_HSCROLL / AXIS_VSCROLL 同向：
+// vscroll 为正表示向上滚（内容往下走）。越界值钳住，坐标同 Touch 钳到屏幕内。
+func (c *Controller) Scroll(x, y int, hscroll, vscroll float64) error {
+	x, y = c.clamp(x, y)
+	b := make([]byte, 21)
+	b[0] = msgInjectScroll
+	binary.BigEndian.PutUint32(b[1:5], uint32(int32(x)))
+	binary.BigEndian.PutUint32(b[5:9], uint32(int32(y)))
+	binary.BigEndian.PutUint16(b[9:11], uint16(c.w))
+	binary.BigEndian.PutUint16(b[11:13], uint16(c.h))
+	binary.BigEndian.PutUint16(b[13:15], uint16(floatToI16FP(hscroll)))
+	binary.BigEndian.PutUint16(b[15:17], uint16(floatToI16FP(vscroll)))
+	// b[17:21] buttons = 0
+	return c.write(b)
+}
+
+func (c *Controller) clamp(x, y int) (int, int) {
+	return max(0, min(x, c.w-1)), max(0, min(y, c.h-1))
+}
+
+// floatToI16FP 把 [-1,1] 的浮点压成 16 位有符号定点，与 scrcpy 的 sc_float_to_i16fp 一致：
+// 乘 2^15 后钳到 0x7fff（f=1.0 时恰好溢出到 0x8000）。
+func floatToI16FP(f float64) int16 {
+	f = max(-1, min(1, f))
+	return int16(min(int32(math.Floor(f*32768)), 0x7fff))
+}
