@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -27,6 +28,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fancyCachier/droidpool/internal/uiagent"
 )
 
 // stateFile 本地租约记录的路径。设了会话键就带后缀，多个会话共用一个目录时各记各的。
@@ -185,6 +188,9 @@ func main() {
 	case "battery":
 		touchIfLeased(c)
 		cmdBattery(os.Args[2:])
+	case "ui-dump":
+		touchIfLeased(c)
+		cmdUIDump(os.Args[2:])
 	case "run":
 		touchIfLeased(c)
 		cmdRun(os.Args[2:])
@@ -327,6 +333,47 @@ const cashierPkg = "cn.daboshi.cashier_app.dev"
 //
 // 写的是 shared_prefs/FlutterSharedPreferences.xml 的两个 key，格式与 app 一致；
 // run-as 里相对路径的 cwd 不可靠，一律 push 到 /data/local/tmp 再用绝对路径 cp。
+// cmdUIDump 取一次界面层级 XML。
+//
+// 走常驻 agent 而不是 `uiautomator dump`：后者每次都要新起 ART 进程再加载框架 jar，
+// 热设备上一次约 380 ms，而树本身只有几十个节点（2026-09-07 实测）。常驻之后约 25 ms。
+// 代价是每次调用要拉起一次 agent（约 1~2 s），所以单次调用反而更慢——
+// 值当的是 --watch 这种连着取多次的用法，以及后续把会话挂在租约上复用。
+func cmdUIDump(args []string) {
+	fs := flag.NewFlagSet("ui-dump", flag.ExitOnError)
+	dex := fs.String("dex", os.Getenv("DROIDPOOL_UIAGENT_DEX"), "uiagent.dex 路径（或设 DROIDPOOL_UIAGENT_DEX）")
+	port := fs.Int("port", 27400, "adb forward 用的本机端口")
+	n := fs.Int("n", 1, "连取几次（>1 时每次之间不重启 agent，用来看真实开销）")
+	fs.Parse(args)
+	if *dex == "" {
+		fatal("未指定 uiagent.dex：--dex 或 DROIDPOOL_UIAGENT_DEX（用 device/uiagent/build.sh 编）")
+	}
+	st, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	s, err := uiagent.Start(ctx, uiagent.Options{
+		Serial: st.ADBAddr, DexPath: *dex, LocalPort: *port,
+	})
+	if err != nil {
+		fatal("启动 uiagent: %v", err)
+	}
+	defer s.Close()
+	for i := 0; i < *n; i++ {
+		start := time.Now()
+		xml, err := s.Dump()
+		if err != nil {
+			fatal("dump: %v", err)
+		}
+		if *n > 1 {
+			fmt.Fprintf(os.Stderr, "第 %d 次 %d ms，%d 字节\n", i+1, time.Since(start).Milliseconds(), len(xml))
+		}
+		fmt.Println(xml)
+	}
+}
+
 // cmdBattery 给设备伪造一块电池。redroid 默认 present=false、level=0，
 // 也就是「没有电池」——需要看电量的应用在这上面拿到的是 0。
 //
@@ -593,6 +640,8 @@ func usage() {
             [--host <edge-host>] [--port 8090]，或设 DROIDPOOL_EDGE_HOST
   battery   伪造一块电池（redroid 默认没有电池，应用读到的电量是 0）
             [--level 1~100] [--status charging|discharging|full] [--temp 31.5] | --reset
+  ui-dump   取界面层级 XML。走常驻 agent，单次约 25 ms（uiautomator dump 约 380 ms）
+            [--dex uiagent.dex] [--n 1]，或设 DROIDPOOL_UIAGENT_DEX
   run       一步到位：装包 → seed-edge → 启动 → 自动过引导页到登录页
             [--apk build/app/outputs/flutter-apk/app-debug.apk] [--no-seed] [--no-onboard]
   heartbeat 发一次心跳（告诉 watchdog 自己还活着）
@@ -602,6 +651,7 @@ func usage() {
   DROIDPOOL_URL       控制面地址（必填，如 http://droidpool.example:8600）
   DROIDPOOL_TOKEN     鉴权 token（必填）
   DROIDPOOL_EDGE_HOST seed-edge / run 写入的后端主机（或用 --host）
+  DROIDPOOL_UIAGENT_DEX  ui-dump 用的 uiagent.dex 路径（device/uiagent/build.sh 编出来）
   DROIDPOOL_HEARTBEAT_SEC  watch 的心跳间隔秒数（默认 60）
   DROIDPOOL_SESSION   会话键（可选）。几个 agent 共用一台机器、一个检出时给每个会话设不同的值，
                       否则它们会复用同一条租约挤在一台设备上；dsh 插件会自动注入
