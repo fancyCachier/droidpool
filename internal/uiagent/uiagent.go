@@ -32,6 +32,9 @@ const mainClass = "com.daboshi.droidpool.UiAgent"
 // devicePort agent 在设备上监听的端口，绑 loopback，靠 adb forward 进去。
 const devicePort = 27400
 
+// deviceLog agent 脱离启动后的输出落在这里，排查「起来了但连不上」时看它。
+const deviceLog = "/data/local/tmp/droidpool-uiagent.log"
+
 // maxDumpBytes 一次 dump 的上限。协议是一行一条响应，没有长度前缀，
 // 加个上限免得设备侧出问题时把控制面的内存吃光。
 const maxDumpBytes = 8 << 20
@@ -45,10 +48,12 @@ type Options struct {
 
 // Session 一个已就绪的 agent 连接通道。
 type Session struct {
-	opt      Options
-	cmd      *exec.Cmd
-	forwards bool
+	opt    Options
+	reused bool // 连上的是设备上已在跑的 agent，本次没有启动它
 }
+
+// Reused 报告本次是否复用了已在跑的 agent（没有付启动代价）。
+func (s *Session) Reused() bool { return s.reused }
 
 func (o *Options) adb() string {
 	if o.ADBPath != "" {
@@ -61,41 +66,59 @@ func (s *Session) adbCmd(ctx context.Context, args ...string) *exec.Cmd {
 	return exec.CommandContext(ctx, s.opt.adb(), append([]string{"-s", s.opt.Serial}, args...)...)
 }
 
-// Start 推 dex、拉起 agent、建 forward，返回后即可 Dump。
+// Start 让设备上的 agent 就绪并建好通道，返回后即可 Dump。
+//
+// 先建 forward 再 PING：agent 会脱离 adb shell 常驻在设备上（实测 nohup
+// 启动后 adb shell 退出，agent 仍在监听并正常应答），所以能复用就不重启。
+// 复用时整个 Start 只有一次 forward 加一次 PING，几十毫秒；冷启动要推 dex、
+// 拉起 ART 进程、等 UiAutomation 连上，约 1~2 s。login_flow 那种连着取十几次
+// 的用法，差别全在这里。
 func Start(ctx context.Context, opt Options) (*Session, error) {
 	if opt.Serial == "" || opt.DexPath == "" || opt.LocalPort == 0 {
 		return nil, errors.New("Serial / DexPath / LocalPort 都必填")
 	}
 	s := &Session{opt: opt}
+	if err := s.forward(ctx); err != nil {
+		return nil, err
+	}
+	if s.pingOK() {
+		s.reused = true
+		return s, nil
+	}
 
-	// 先清残留：一台设备上同时只该有一个 agent，前一个还占着端口的话
-	// 新的会绑定失败，症状是「起来了但连不上」。退出码不可信——pkill 的模式
-	// 会匹配到 pkill 自己，所以只管发不管结果。
+	// 没人应答：可能是没起过，也可能是上一个卡死了还占着端口——后者会让新的
+	// 绑定失败，症状是「起来了但连不上」，所以无论如何先清一遍。pkill 的退出码
+	// 不可信（它的模式会匹配到自己），只管发不管结果。
 	_ = s.adbCmd(ctx, "shell", "pkill", "-f", mainClass).Run()
 
 	if out, err := s.adbCmd(ctx, "push", "--sync", opt.DexPath, devicePath).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("推送 uiagent.dex: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	port := strconv.Itoa(opt.LocalPort)
-	_ = s.adbCmd(ctx, "forward", "--remove", "tcp:"+port).Run()
-	if out, err := s.adbCmd(ctx, "forward", "tcp:"+port, "tcp:"+strconv.Itoa(devicePort)).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("建立 adb forward: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-	s.forwards = true
-
-	// adb shell 进程由这边挂住。设备侧 `nohup ... &` 不留存——实测这么起会
-	// 静默退出，表现为「push 成功、forward 成功、就是连不上」。
-	s.cmd = s.adbCmd(ctx, "shell", "CLASSPATH="+devicePath, "app_process", "/", mainClass,
-		"port="+strconv.Itoa(devicePort))
-	if err := s.cmd.Start(); err != nil {
-		s.Close()
-		return nil, fmt.Errorf("启动 uiagent: %w", err)
+	// nohup 脱离：agent 要活过这条 adb shell，下次调用才能复用。
+	start := fmt.Sprintf("CLASSPATH=%s nohup app_process / %s port=%d > %s 2>&1 &",
+		devicePath, mainClass, devicePort, deviceLog)
+	if out, err := s.adbCmd(ctx, "shell", start).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("启动 uiagent: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	if err := s.waitReady(ctx); err != nil {
-		s.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// forward 建 adb forward，幂等。
+func (s *Session) forward(ctx context.Context) error {
+	port := strconv.Itoa(s.opt.LocalPort)
+	_ = s.adbCmd(ctx, "forward", "--remove", "tcp:"+port).Run()
+	if out, err := s.adbCmd(ctx, "forward", "tcp:"+port, "tcp:"+strconv.Itoa(devicePort)).CombinedOutput(); err != nil {
+		return fmt.Errorf("建立 adb forward: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (s *Session) pingOK() bool {
+	out, err := s.request("PING")
+	return err == nil && strings.TrimSpace(out) == "PONG"
 }
 
 // waitReady 轮询到 PING 有应答。设备侧要建 UiAutomation 连接，不是瞬时的。
@@ -115,7 +138,7 @@ func (s *Session) waitReady(ctx context.Context) error {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("uiagent 15 s 内未就绪: %w", last)
+	return fmt.Errorf("uiagent 15 s 内未就绪（设备上看 %s）: %w", deviceLog, last)
 }
 
 // Dump 取一次界面层级 XML。
@@ -163,19 +186,17 @@ func readLimitedLine(r *bufio.Reader, limit int) (string, error) {
 	}
 }
 
-// Close 收掉设备侧进程与 forward。
+// Close 只释放本机这端的 forward，**不动设备上的 agent**——留着它，
+// 下次 Start 直接复用，省掉 1~2 s 冷启动。设备复位会重建容器，自然清干净。
 func (s *Session) Close() error {
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-		_ = s.cmd.Wait()
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// adb shell 被杀掉不代表设备侧进程也没了——它是另一端的独立进程。
-	_ = s.adbCmd(ctx, "shell", "pkill", "-f", mainClass).Run()
-	if s.forwards {
-		_ = s.adbCmd(ctx, "forward", "--remove", "tcp:"+strconv.Itoa(s.opt.LocalPort)).Run()
-		s.forwards = false
-	}
+	_ = s.adbCmd(ctx, "forward", "--remove", "tcp:"+strconv.Itoa(s.opt.LocalPort)).Run()
 	return nil
+}
+
+// Stop 连设备上的 agent 一起收掉。给「确实要腾干净」的场合用。
+func (s *Session) Stop(ctx context.Context) error {
+	_ = s.adbCmd(ctx, "shell", "pkill", "-f", mainClass).Run()
+	return s.Close()
 }
