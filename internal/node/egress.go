@@ -32,6 +32,21 @@ const (
 func RelayName(deviceID string) string { return "droidpool-egress-" + deviceID }
 func TunName(deviceID string) string   { return "droidpool-tun-" + deviceID }
 
+// SidecarDeviceID 把出口链路上的辅助容器名映射回它服务的设备 id。
+//
+// 这两个容器名同样以 droidpool- 开头，而对账逻辑（Running / Reconcile）是按
+// 这个前缀认设备的。不把它们摘出来的话，对账会认定它们「不在设备表里」而
+// `docker rm -f` 掉——tun 边车持有 netns，删掉等于把每台设备的网络连根拔掉，
+// 而且它还占着 adb 端口，会同时命中「抢占端口」那条判定。
+func SidecarDeviceID(container string) (deviceID string, ok bool) {
+	for _, p := range []string{"droidpool-tun-", "droidpool-egress-"} {
+		if id, found := strings.CutPrefix(container, p); found && id != "" {
+			return id, true
+		}
+	}
+	return "", false
+}
+
 // lanRoutes 走真实网卡而不进隧道的网段。
 //
 // 不分流 adb 就会断：docker 的 DNAT 保留源 IP，adbd 的回包目标是局域网地址，

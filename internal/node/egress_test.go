@@ -141,3 +141,76 @@ func TestRemoveCleansEgressChain(t *testing.T) {
 		}
 	}
 }
+
+func TestSidecarDeviceID(t *testing.T) {
+	cases := map[string]string{
+		"droidpool-tun-3588-a-1":    "3588-a-1",
+		"droidpool-egress-3588-a-1": "3588-a-1",
+		"droidpool-3588-a-1":        "", // 设备本身不是边车
+		"droidpool-golden":          "",
+		"droidpool-tun-":            "", // 空 id 不算
+		"unrelated":                 "",
+	}
+	for in, want := range cases {
+		got, ok := SidecarDeviceID(in)
+		if want == "" {
+			if ok {
+				t.Errorf("SidecarDeviceID(%q) 不该判定为边车，得到 %q", in, got)
+			}
+			continue
+		}
+		if !ok || got != want {
+			t.Errorf("SidecarDeviceID(%q) = %q,%v，期望 %q,true", in, got, ok, want)
+		}
+	}
+}
+
+// 对账绝不能删掉在用设备的边车：tun 边车持有 netns，删了那台设备网络就断了，
+// 而且它占着 adb 端口会同时命中「抢占端口」那条判定。
+func TestReconcileKeepsSidecarsOfLiveDevices(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{
+		match: "ps -a",
+		out: "droidpool-3588-a-1\t\n" +
+			"droidpool-tun-3588-a-1\t0.0.0.0:5561->5555/tcp\n" +
+			"droidpool-egress-3588-a-1\t\n",
+	}}}
+	keep := map[string]bool{"droidpool-3588-a-1": true}
+	removed, err := egressNode(f).Reconcile(context.Background(), keep, []int{5561})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("在用设备的边车被删了：%v", removed)
+	}
+}
+
+// 设备已经不在了，它的边车要跟着清掉，否则残留会占着 adb 端口让下次 Create 失败。
+func TestReconcileRemovesOrphanedSidecars(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{
+		match: "ps -a",
+		out: "droidpool-tun-3588-a-9\t0.0.0.0:5569->5555/tcp\n" +
+			"droidpool-egress-3588-a-9\t\n",
+	}}}
+	removed, err := egressNode(f).Reconcile(context.Background(), map[string]bool{}, []int{5569})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 {
+		t.Errorf("孤儿边车应当被清掉，实际删了 %v", removed)
+	}
+}
+
+// 边车不是设备，不该混进 Running 的设备清单——那会让 ReconcileStore 误判。
+func TestRunningExcludesSidecars(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{
+		match: "ps --format",
+		out:   "droidpool-3588-a-1\ndroidpool-tun-3588-a-1\ndroidpool-egress-3588-a-1\n",
+	}}}
+	names, err := egressNode(f).Running(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "droidpool-3588-a-1" {
+		t.Errorf("Running 应当只返回设备，实际 %v", names)
+	}
+}
