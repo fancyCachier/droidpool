@@ -205,6 +205,10 @@ func (m *Manager) Reset(ctx context.Context, deviceID string) error {
 		_ = m.Store.UpsertDevice(d)
 		return err
 	}
+	if err := m.applyEgress(ctx, deviceID); err != nil {
+		// 同 createOne：出口没接上时设备是直连，可用但不是预期状态，必须留痕
+		m.log().Error("出口配置失败，该设备当前为直连", "device", deviceID, "err", err)
+	}
 	d.State = StateReady
 	d.LastHealthy = time.Now()
 	d.HealthFails = 0

@@ -466,3 +466,21 @@ func TestSetEgressPersistsAndApplies(t *testing.T) {
 		t.Errorf("设备不存在却动了节点：%v", drv.egress)
 	}
 }
+
+// 复位走的是 Reset 而不是 createOne，出口同样要重新落上去。
+// 漏了这条的后果很隐蔽：设备照常可用，只是悄悄变成直连——
+// 2026-09-07 生产上开 egress 后第一台重建的设备就是这样，边车起来了但规则没加。
+func TestResetReappliesEgress(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	_ = st.UpsertDevice(&Device{ID: "3588-a-1", State: StateReady, EgressProxy: "socks5://up:1080"})
+	m := newManager(drv, st, 1)
+	if err := m.Reset(context.Background(), "3588-a-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(drv.finished) == 0 {
+		t.Error("Reset 后未调用 FinishEgress，流量不会进隧道")
+	}
+	if got := drv.egress["3588-a-1"]; got != "socks5://up:1080" {
+		t.Errorf("Reset 后未重放出口设置，实际 %q", got)
+	}
+}
