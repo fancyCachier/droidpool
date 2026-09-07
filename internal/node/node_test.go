@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -165,7 +167,7 @@ func TestRunningFiltersOwnContainers(t *testing.T) {
 }
 
 func TestParseHealth(t *testing.T) {
-	// free -m 第2行「总量 可用」、第3行 swap 已用、温度毫度、1 分钟负载
+	// 第1行「总量 可用」（自算，见 Health 的注释）、第2行 swap 已用、温度毫度、1 分钟负载
 	out := "15843 4623\n1015\n60100\n21.51\n"
 	h, err := parseHealth(out)
 	if err != nil {
@@ -373,5 +375,70 @@ func TestRunningSet(t *testing.T) {
 	}
 	if !set["droidpool-a"] || !set["droidpool-b"] || set["other"] {
 		t.Errorf("集合内容不对: %v", set)
+	}
+}
+
+// 采集内存用的 awk 表达式，直接喂真实形状的 /proc/meminfo 验算。
+// 内核的 MemAvailable 在这台节点上会报出比 MemFree 还小的值，所以我们自己算；
+// 算错的话池子要么误拒 claim，要么在真没内存时还往上塞。
+func TestMemAvailFormula(t *testing.T) {
+	if _, err := exec.LookPath("awk"); err != nil {
+		t.Skip("没有 awk")
+	}
+	const meminfo = `MemTotal:       16334848 kB
+MemFree:         6038528 kB
+MemAvailable:    2494464 kB
+Buffers:          204800 kB
+Cached:          3317760 kB
+SReclaimable:     288768 kB
+Shmem:            348160 kB
+Mapped:           967680 kB
+`
+	// 用 node.go 里那一份，读 stdin 而不是 /proc/meminfo
+	script := strings.Replace(memAvailAwk, " /proc/meminfo", "", 1)
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Stdin = strings.NewReader(meminfo)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("跑 awk 失败: %v", err)
+	}
+	var total, avail int
+	if _, err := fmt.Sscanf(string(out), "%d %d", &total, &avail); err != nil {
+		t.Fatalf("输出不符: %q", out)
+	}
+	if total != 15952 {
+		t.Errorf("总量 = %d，期望 15952", total)
+	}
+	// 6038528+3317760+288768-348160-967680 = 8329216 kB = 8134 MiB
+	if avail != 8134 {
+		t.Errorf("可用 = %d，期望 8134", avail)
+	}
+	// 关键：必须远高于内核那个 2436，否则等于没改
+	if avail <= 2436 {
+		t.Errorf("自算结果 %d 不该低于内核的 MemAvailable(2436)——那说明公式又退回保守了", avail)
+	}
+}
+
+// 页缓存被压光时（cache 全没了），结果不能低于 MemFree——空闲内存一定是可用的。
+func TestMemAvailNeverBelowFree(t *testing.T) {
+	if _, err := exec.LookPath("awk"); err != nil {
+		t.Skip("没有 awk")
+	}
+	const meminfo = `MemTotal:       16334848 kB
+MemFree:         6038528 kB
+Cached:            10240 kB
+SReclaimable:       1024 kB
+Shmem:            348160 kB
+Mapped:           967680 kB
+`
+	// 用 node.go 里那一份，读 stdin 而不是 /proc/meminfo
+	script := strings.Replace(memAvailAwk, " /proc/meminfo", "", 1)
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Stdin = strings.NewReader(meminfo)
+	out, _ := cmd.Output()
+	var total, avail int
+	fmt.Sscanf(string(out), "%d %d", &total, &avail)
+	if avail != 5897 {
+		t.Errorf("可用 = %d，期望回落到 MemFree 的 5897", avail)
 	}
 }

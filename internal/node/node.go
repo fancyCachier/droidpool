@@ -203,9 +203,19 @@ func (n *Node) Running(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// memAvailAwk 从 /proc/meminfo 算「总量 可用」，单位 MiB。
+// 提成常量是为了让测试拿这一份去跑，而不是各留一份拷贝——不然改了这里，
+// 测试里的副本还是旧的，等于没测。
+const memAvailAwk = `awk '/^MemTotal:/{t=$2} /^MemFree:/{f=$2} /^Cached:/{c=$2} ` +
+	`/^SReclaimable:/{s=$2} /^Shmem:/{sh=$2} /^Mapped:/{m=$2} ` +
+	`END{a=f+c+s-sh-m; if(a<f)a=f; printf "%d %d\n", int(t/1024), int(a/1024)}' /proc/meminfo`
+
 // Health 节点资源快照。
 type Health struct {
 	MemTotalMiB int
+	// MemAvailMiB 自己算的可用内存：空闲 + 页缓存 + 可回收 slab − shmem − mapped，
+	// 且不低于 MemFree（空闲内存本身一定是可用的）。不取内核的 MemAvailable，
+	// 它在这个内核上会报出比 MemFree 还小的值。
 	MemAvailMiB int
 	SwapUsedMiB int
 	TempC       float64
@@ -222,8 +232,17 @@ func (n *Node) Health(ctx context.Context) (*Health, error) {
 		r = ExecRunner{}
 	}
 	sshTarget := strings.TrimPrefix(n.DockerHost, "ssh://")
+	// 不用内核的 MemAvailable：在这台节点上它坏得很明显——某次 MemFree
+	// 是 5897 MiB 而 MemAvailable 只报 2436 MiB，**比空闲内存本身还小一半**。
+	// 后果是池子在节点还有好几 GB 余量时就拒绝新 claim。
+	//
+	// 自己算：空闲 + 页缓存 + 可回收 slab，再减掉两块确实拿不回来的——
+	// Shmem（tmpfs，redroid 用得不少）和 Mapped（进程正映射着的文件页）。
+	// 校准依据是实测：某次 drop_caches 把 MemFree 从 3773 抬到 9238 MiB，
+	// 即当时约 5.5 GB 页缓存是真能回收的，这个算式与之量级相符。
 	out, err := r.Run(ctx, "ssh", "-o", "BatchMode=yes", sshTarget,
-		`free -m | awk 'NR==2{print $2, $7} NR==3{print $3}'; `+
+		memAvailAwk+`; `+
+			`awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{printf "%d\n", int((t-f)/1024)}' /proc/meminfo; `+
 			`cat /sys/class/thermal/thermal_zone0/temp; cut -d" " -f1 /proc/loadavg`)
 	if err != nil {
 		return nil, err
