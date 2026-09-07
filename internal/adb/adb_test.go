@@ -388,3 +388,41 @@ func TestInputNotBlockedByCapture(t *testing.T) {
 	}
 	close(release)
 }
+
+// 连接陈旧时必须先重连再判死。不这么做的话，设备一被复位重建，探活就永远
+// 失败：判死 → 复位 → 新容器 → 连接又陈旧 → 再判死，循环自我维持，
+// 只有人工 adb connect 能打断（2026-09-07 在 3588-a-8 上真的转了四轮）。
+func TestAliveReconnectsBeforeGivingUp(t *testing.T) {
+	f := &fakeRunner{
+		out: map[string][]byte{},
+		err: map[string]error{"shell getprop": errors.New("device offline")},
+	}
+	c := &Client{Runner: f}
+
+	// 第一次探活失败 → 应当发出 connect
+	if c.Alive(context.Background(), "host:5561") {
+		t.Error("设备真的探不通时不该返回 true")
+	}
+	if f.last("connect host:5561") == nil {
+		t.Error("判死之前必须先尝试重连")
+	}
+
+	// 重连之后能探通 → 判活
+	f.err = map[string]error{}
+	f.out = map[string][]byte{"shell getprop": []byte("1\n")}
+	if !c.Alive(context.Background(), "host:5561") {
+		t.Error("能探通时应当判活")
+	}
+}
+
+// 一次就探通的常态路径不该多发 connect —— 每 30 秒一轮乘 8 台，白白多一倍调用。
+func TestAliveSkipsReconnectWhenHealthy(t *testing.T) {
+	f := &fakeRunner{out: map[string][]byte{"shell getprop": []byte("1\n")}}
+	c := &Client{Runner: f}
+	if !c.Alive(context.Background(), "host:5561") {
+		t.Fatal("应当判活")
+	}
+	if f.last("connect") != nil {
+		t.Error("已经探通了就不该再 connect")
+	}
+}

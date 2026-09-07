@@ -229,8 +229,25 @@ func (c *Client) Text(ctx context.Context, serial, s string) error {
 
 // Alive 报告设备是否还应答，供健康检查用。
 func (c *Client) Alive(ctx context.Context, serial string) bool {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if c.probe(ctx, serial) {
+		return true
+	}
+	// 判死之前先重连一次，把「连接陈旧」和「设备真死」分开。
+	//
+	// 网络 adb 的连接在容器重建后会变成 offline 且不会自己回来，而 connect
+	// 只在守护进程启动时调过一次。结果是设备一旦被复位重建，探活就永远失败：
+	// 判死 → 复位 → 新容器 → 连接又是陈旧的 → 再判死，自我维持的循环，
+	// 只有人工 adb connect 才能打断（2026-09-07 在 3588-a-8 上实际发生过，
+	// 连转了四轮）。complexity 只多一次 connect，值得。
+	if err := c.Connect(ctx, serial); err != nil {
+		return false
+	}
+	return c.probe(ctx, serial)
+}
+
+func (c *Client) probe(ctx context.Context, serial string) bool {
 	out, err := c.run(ctx, serial, "shell", "getprop", "sys.boot_completed")
 	return err == nil && strings.TrimSpace(string(out)) == "1"
 }
