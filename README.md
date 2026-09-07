@@ -60,9 +60,15 @@ once, zoom into one, and take over when an agent needs help.
   a 27-node hierarchy. A resident agent keeps the process and the UiAutomation
   connection alive, which brings a dump down to ~20 ms. Available as
   `droidpool ui-dump` and as `GET /api/devices/{id}/ui`.
-- **A camera, if you want one.** Redroid ships no camera at all. Feed an RTSP
-  stream into a v4l2loopback node on the host and the device gets a working
-  Camera2 device (`device/redroid-patches/`, needs a self-built image).
+- **A camera, if you want one.** Redroid ships no camera at all. Point a device
+  at an RTSP URL — from the wall, the CLI or the API — and it gets a working
+  Camera2 device; the host transcodes the stream into a per-device v4l2loopback
+  node that the container sees as an ordinary UVC webcam. Changing the URL
+  rebuilds only the feed container, so the device keeps running. Off per device
+  by default, deliberately: one 720p15 feed costs about 70 % of a core (MJPEG
+  encoding dominates, and this ffmpeg build has no hardware JPEG encoder even
+  though the SoC has one), so eight of them would eat most of the node. Needs a
+  self-built image, see `device/redroid-patches/`.
 
 ## Measured on an 8-core RK3588S with 16 GB RAM
 
@@ -164,6 +170,7 @@ playbook, including the UI-driving pitfalls we hit.
 | `devices` | List the pool |
 | `battery [--level 1..100]` | Fake a battery. Redroid has none, so apps read 0 % — `--status charging\|discharging\|full`, `--temp`, or `--reset` |
 | `ui-dump [--n 5]` | Dump the view hierarchy as XML through a resident agent (~25 ms vs ~380 ms for `uiautomator dump`) |
+| `camera --rtsp … \| --off` | Feed an RTSP stream to the device's camera, or stop it |
 
 ## Integrations
 
@@ -198,6 +205,7 @@ GET    /api/devices/{id}/stream.mjpg   multipart JPEG/PNG (screencap fallback)
 POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …} (fallback when no WebSocket session)
 GET    /api/devices/{id}/ui            view hierarchy XML via the resident agent
 PUT    /api/devices/{id}/egress        {proxy: "socks5://host:port"} — empty string means direct
+PUT    /api/devices/{id}/camera        {rtsp: "rtsp://host/live"} — empty string stops the feed
 ```
 
 ## What it deliberately does not do

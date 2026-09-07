@@ -253,3 +253,66 @@ func TestCreateOmitsCameraWhenDisabled(t *testing.T) {
 		t.Errorf("未启用时不该透传任何 video 节点：%s", j)
 	}
 }
+
+func TestSetCameraBuildsFeedContainer(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	if err := n.SetCamera(context.Background(), "3588-a-3", "rtsp://cam/live"); err != nil {
+		t.Fatal(err)
+	}
+	j := strings.Join(f.lastMatching("--name droidpool-cam-3588-a-3"), " ")
+	for _, want := range []string{
+		"--device /dev/video23",    // 一台设备一个节点
+		"-c:v mjpeg",               // HAL 只认 MJPEG，喂别的会被整个丢掉
+		"-rtsp_transport tcp",      // UDP 丢包在容器里表现为花屏
+		"--restart unless-stopped", // 源抖动后要自己接回来，否则画面永久黑
+		"rtsp://cam/live",
+	} {
+		if !strings.Contains(j, want) {
+			t.Errorf("推流容器缺少 %q\n实际: %s", want, j)
+		}
+	}
+}
+
+// 停流只删容器，不该再起一个。
+func TestSetCameraEmptyStopsFeed(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	if err := n.SetCamera(context.Background(), "3588-a-3", ""); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastMatching("rm -f droidpool-cam-3588-a-3") == nil {
+		t.Error("停流应当删掉推流容器")
+	}
+	for _, c := range f.calls {
+		if strings.Contains(strings.Join(c, " "), "run -d --name droidpool-cam-") {
+			t.Errorf("停流不该再起容器：%v", c)
+		}
+	}
+}
+
+// 节点没开摄像头时要明确报错，而不是起一个对着空路径灌的容器。
+func TestSetCameraFailsWhenNodeDisabled(t *testing.T) {
+	n := testNode(&fakeRunner{}) // CameraVideoBase 为 0
+	if err := n.SetCamera(context.Background(), "3588-a-3", "rtsp://cam/live"); err == nil {
+		t.Error("节点未启用摄像头时应当报错")
+	}
+}
+
+// 推流容器同样以 droidpool- 开头，对账不认识它就会当成残留删掉。
+func TestReconcileKeepsCamFeedOfLiveDevice(t *testing.T) {
+	f := &fakeRunner{replies: []reply{{
+		match: "ps -a",
+		out:   "droidpool-3588-a-1\t\ndroidpool-cam-3588-a-1\t\n",
+	}}}
+	removed, err := testNode(f).Reconcile(context.Background(),
+		map[string]bool{"droidpool-3588-a-1": true}, []int{5561})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("在用设备的推流容器被删了：%v", removed)
+	}
+}

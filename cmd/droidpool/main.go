@@ -191,6 +191,9 @@ func main() {
 	case "ui-dump":
 		touchIfLeased(c)
 		cmdUIDump(os.Args[2:])
+	case "camera":
+		touchIfLeased(c)
+		cmdCamera(c, os.Args[2:])
 	case "run":
 		touchIfLeased(c)
 		cmdRun(os.Args[2:])
@@ -333,6 +336,41 @@ const cashierPkg = "cn.daboshi.cashier_app.dev"
 //
 // 写的是 shared_prefs/FlutterSharedPreferences.xml 的两个 key，格式与 app 一致；
 // run-as 里相对路径的 cwd 不可靠，一律 push 到 /data/local/tmp 再用绝对路径 cp。
+// cmdCamera 设置这台设备的摄像头画面源。
+//
+// 走控制面而不是自己去节点上起 ffmpeg：推流容器要跟着设备的生命周期走，
+// 设备复位重建后控制面会按库里的记录把它重放回来，agent 自己起的野进程做不到
+// ——设备换了而流还对着旧的 /dev/videoN 灌，画面就永远黑着。
+func cmdCamera(c *client, args []string) {
+	fs := flag.NewFlagSet("camera", flag.ExitOnError)
+	rtsp := fs.String("rtsp", "", "画面源，如 rtsp://host/live；留空配合 --off 表示停流")
+	off := fs.Bool("off", false, "停流")
+	fs.Parse(args)
+	if !*off && *rtsp == "" {
+		fatal("要么 --rtsp <地址>，要么 --off")
+	}
+	src := *rtsp
+	if *off {
+		src = ""
+	}
+	st, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	var resp struct {
+		CameraRTSP string `json:"camera_rtsp"`
+	}
+	if _, err := c.do("PUT", "/api/devices/"+st.DeviceID+"/camera",
+		map[string]string{"rtsp": src}, &resp); err != nil {
+		fatal("设置摄像头失败: %v", err)
+	}
+	if resp.CameraRTSP == "" {
+		fmt.Println("已停流（相机随之报 0 个设备）")
+	} else {
+		fmt.Printf("摄像头画面源: %s\n", resp.CameraRTSP)
+	}
+}
+
 // cmdUIDump 取一次界面层级 XML。
 //
 // 走常驻 agent 而不是 `uiautomator dump`：后者每次都要新起 ART 进程再加载框架 jar，
@@ -642,6 +680,8 @@ func usage() {
             [--level 1~100] [--status charging|discharging|full] [--temp 31.5] | --reset
   ui-dump   取界面层级 XML。走常驻 agent，单次约 25 ms（uiautomator dump 约 380 ms）
             [--dex uiagent.dex] [--n 1]，或设 DROIDPOOL_UIAGENT_DEX
+  camera    给设备接一路 RTSP 当摄像头（redroid 自身没有摄像头）
+            --rtsp rtsp://host/live | --off
   run       一步到位：装包 → seed-edge → 启动 → 自动过引导页到登录页
             [--apk build/app/outputs/flutter-apk/app-debug.apk] [--no-seed] [--no-onboard]
   heartbeat 发一次心跳（告诉 watchdog 自己还活着）

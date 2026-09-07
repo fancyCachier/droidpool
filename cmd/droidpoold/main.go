@@ -143,6 +143,7 @@ func run() error {
 		Events:      hub,
 		Resetter:    mgr,
 		Egress:      mgr,
+		Camera:      mgr,
 		UI: api.UIConfig{
 			// 未设置时界面层级接口返回 503；deploy.sh 会把 dex 推过来
 			DexPath:  os.Getenv("DROIDPOOL_UIAGENT_DEX"),

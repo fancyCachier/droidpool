@@ -20,6 +20,7 @@ type fakeDriver struct {
 	createErr   map[string]error
 	bootErr     map[string]error
 	egress      map[string]string
+	camera      map[string]string
 	finished    []string
 }
 
@@ -39,6 +40,16 @@ func (f *fakeDriver) FinishEgress(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.finished = append(f.finished, id)
+	return nil
+}
+
+func (f *fakeDriver) SetCamera(_ context.Context, id, rtsp string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.camera == nil {
+		f.camera = map[string]string{}
+	}
+	f.camera[id] = rtsp
 	return nil
 }
 
@@ -93,10 +104,26 @@ func (s *memStore) UpsertDevice(d *Device) error {
 	// 与真库保持一致：SQL 的 ON CONFLICT 分支不更新 egress_proxy，
 	// 否则每次健康检查回写都会把用户设的出口冲掉。假实现也必须这样，
 	// 不然它会掩盖真实行为。
-	if old, ok := s.m[d.ID]; ok && c.EgressProxy == "" {
-		c.EgressProxy = old.EgressProxy
+	if old, ok := s.m[d.ID]; ok {
+		if c.EgressProxy == "" {
+			c.EgressProxy = old.EgressProxy
+		}
+		if c.CameraRTSP == "" {
+			c.CameraRTSP = old.CameraRTSP
+		}
 	}
 	s.m[d.ID] = &c
+	return nil
+}
+
+func (s *memStore) SetDeviceCamera(id, rtsp string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.m[id]
+	if !ok {
+		return errors.New("不存在")
+	}
+	d.CameraRTSP = rtsp
 	return nil
 }
 
@@ -482,5 +509,46 @@ func TestResetReappliesEgress(t *testing.T) {
 	}
 	if got := drv.egress["3588-a-1"]; got != "socks5://up:1080" {
 		t.Errorf("Reset 后未重放出口设置，实际 %q", got)
+	}
+}
+
+// 复位后摄像头也要重放：推流容器是对着某个 /dev/videoN 灌的，设备重建了
+// 而流没跟上，画面就对着一个没人读的节点空转。
+func TestResetReappliesCamera(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	_ = st.UpsertDevice(&Device{ID: "3588-a-1", State: StateReady, CameraRTSP: "rtsp://cam/live"})
+	m := newManager(drv, st, 1)
+	if err := m.Reset(context.Background(), "3588-a-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := drv.camera["3588-a-1"]; got != "rtsp://cam/live" {
+		t.Errorf("Reset 后未重放画面源，实际 %q", got)
+	}
+}
+
+func TestSetCameraPersistsAndApplies(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	_ = st.UpsertDevice(&Device{ID: "d1"})
+	m := newManager(drv, st, 1)
+	if err := m.SetCamera(context.Background(), "d1", "rtsp://x/live"); err != nil {
+		t.Fatal(err)
+	}
+	if drv.camera["d1"] != "rtsp://x/live" {
+		t.Errorf("未下发到节点：%q", drv.camera["d1"])
+	}
+	if d, _ := st.GetDevice("d1"); d.CameraRTSP != "rtsp://x/live" {
+		t.Errorf("未落库：%q", d.CameraRTSP)
+	}
+}
+
+// 没设过摄像头的设备不该被起推流容器——转码一路吃掉一个核的七成。
+func TestCreateSkipsCameraWhenUnset(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	m := newManager(drv, st, 1)
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := drv.camera["3588-a-1"]; ok {
+		t.Error("没设过画面源就不该起推流容器")
 	}
 }

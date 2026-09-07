@@ -123,6 +123,7 @@ func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBas
 func (n *Node) Remove(ctx context.Context, deviceID string) error {
 	_, err := n.docker(ctx, "rm", "-f", ContainerName(deviceID))
 	n.removeEgress(ctx, deviceID)
+	n.removeCamFeed(ctx, deviceID)
 	return err
 }
 

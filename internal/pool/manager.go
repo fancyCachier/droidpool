@@ -20,6 +20,8 @@ type NodeDriver interface {
 	FinishEgress(ctx context.Context, deviceID string) error
 	// SetEgress 换这台设备的上游出口。只重建中继容器，设备不重启。
 	SetEgress(ctx context.Context, deviceID, proxy string) error
+	// SetCamera 换这台设备的摄像头画面源。只重建推流容器，设备不重启。
+	SetCamera(ctx context.Context, deviceID, rtsp string) error
 }
 
 // DeviceStore 是 Manager 需要的存储能力子集。
@@ -29,6 +31,7 @@ type DeviceStore interface {
 	ListDevices() ([]*Device, error)
 	SetDeviceState(id string, to DeviceState) error
 	SetDeviceEgress(id, proxy string) error
+	SetDeviceCamera(id, rtsp string) error
 }
 
 // Manager 负责把设备拉起来、复位、以及节点上的容器与库内记录对账。
@@ -104,10 +107,10 @@ func (m *Manager) createOne(ctx context.Context, i int) error {
 		_ = m.Store.UpsertDevice(d)
 		return err
 	}
-	if err := m.applyEgress(ctx, id); err != nil {
+	if err := m.applyDeviceSettings(ctx, id); err != nil {
 		// 出口没接上不至于让设备不可用（此时是直连），但要留下痕迹，
 		// 否则「以为走了代理其实没走」比直接失败更危险。
-		m.log().Error("出口配置失败，该设备当前为直连", "device", id, "err", err)
+		m.log().Error("每设备设置未落上，该设备为直连且无摄像头", "device", id, "err", err)
 	}
 	d.State = StateReady
 	d.LastHealthy = time.Now()
@@ -118,17 +121,46 @@ func (m *Manager) createOne(ctx context.Context, i int) error {
 	return nil
 }
 
-// applyEgress 把库里记着的出口设置落到刚起来的设备上。
-// 设备重建（复位、节点重启）后容器是全新的，出口不会自己回来，必须重放一次。
-func (m *Manager) applyEgress(ctx context.Context, deviceID string) error {
+// applyDeviceSettings 把库里记着的每设备设置落到刚起来的设备上。
+//
+// 设备重建（复位、节点重启）后容器是全新的，出口与摄像头都不会自己回来，
+// 必须重放。摄像头尤其要紧：推流容器是对着某个 /dev/videoN 灌的，设备换了
+// 而流没换，画面就对着一个没人读的节点空转。
+func (m *Manager) applyDeviceSettings(ctx context.Context, deviceID string) error {
 	if err := m.Driver.FinishEgress(ctx, deviceID); err != nil {
 		return err
 	}
 	d, err := m.Store.GetDevice(deviceID)
-	if err != nil || d.EgressProxy == "" {
+	if err != nil {
 		return err
 	}
-	return m.Driver.SetEgress(ctx, deviceID, d.EgressProxy)
+	if d.EgressProxy != "" {
+		if err := m.Driver.SetEgress(ctx, deviceID, d.EgressProxy); err != nil {
+			return err
+		}
+	}
+	if d.CameraRTSP != "" {
+		if err := m.Driver.SetCamera(ctx, deviceID, d.CameraRTSP); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetCamera 改一台设备的摄像头画面源并落库。推流容器重建不影响设备与租约。
+//
+// 按需：默认空串（不推流）。一路 720p@15 的转码在这台节点上实测约占一个核的
+// 71%（其中 MJPEG 编码约 59%，是大头，而这个 ffmpeg 构建没有 mjpeg_rkmpp
+// 硬件编码器——硬件与 MPP 库都支持，只是没编进去）。8 台全开会吃掉近 6 个核，
+// 所以只给真正需要摄像头的设备开。
+func (m *Manager) SetCamera(ctx context.Context, deviceID, rtsp string) error {
+	if _, err := m.Store.GetDevice(deviceID); err != nil {
+		return err
+	}
+	if err := m.Driver.SetCamera(ctx, deviceID, rtsp); err != nil {
+		return err
+	}
+	return m.Store.SetDeviceCamera(deviceID, rtsp)
 }
 
 // SetEgress 改一台设备的上游出口并落库。中继重建不影响设备与租约。
@@ -205,9 +237,9 @@ func (m *Manager) Reset(ctx context.Context, deviceID string) error {
 		_ = m.Store.UpsertDevice(d)
 		return err
 	}
-	if err := m.applyEgress(ctx, deviceID); err != nil {
+	if err := m.applyDeviceSettings(ctx, deviceID); err != nil {
 		// 同 createOne：出口没接上时设备是直连，可用但不是预期状态，必须留痕
-		m.log().Error("出口配置失败，该设备当前为直连", "device", deviceID, "err", err)
+		m.log().Error("每设备设置未落上，该设备为直连且无摄像头", "device", deviceID, "err", err)
 	}
 	d.State = StateReady
 	d.LastHealthy = time.Now()
