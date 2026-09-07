@@ -93,6 +93,16 @@ pre.clip{margin:0 0 8px;padding:8px 9px;background:#0d1117;border:1px solid var(
     </div>
 
     <div class="panel">
+      <h2>摄像头</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="camera" placeholder="rtsp://主机/live，留空＝停流"
+               style="flex:1;min-width:180px">
+        <button id="camsave">应用</button>
+      </div>
+      <div class="hint" id="camhint">redroid 自身没有摄像头，画面由这路 RTSP 提供。</div>
+    </div>
+
+    <div class="panel">
       <h2>控制</h2>
       <div class="nav3">
         <button data-key="back" title="返回">
@@ -837,6 +847,10 @@ async function loadInfo(){
       ${d.human ? `<dt>接管</dt><dd style="color:var(--busy)">进行中 ${d.note||''}</dd>` : ''}`;
     // 只在没聚焦时回显，否则会把用户正在敲的内容冲掉
     if(document.activeElement !== $('#egress')) $('#egress').value = d.egress_proxy || '';
+    if(document.activeElement !== $('#camera')) $('#camera').value = d.camera_rtsp || '';
+    $('#camhint').textContent = d.camera_rtsp
+      ? '画面源 ' + d.camera_rtsp + '；转码约占节点一个核的 7 成，用完记得停。'
+      : 'redroid 自身没有摄像头，填一路 RTSP 才有画面。';
     $('#egresshint').textContent = d.egress_proxy
       ? '公网经 ' + d.egress_proxy + ' 落地；内网直连。'
       : '公网直连（未设代理）；内网始终直连。';
@@ -846,6 +860,23 @@ async function loadInfo(){
     $('#takeover').dataset.on = d.human ? '1' : '';
   }catch(_){}
 }
+
+$('#camsave').onclick = async () => {
+  const rtsp = $('#camera').value.trim();
+  const r = await fetch(`/api/devices/${encodeURIComponent(id)}/camera`, {
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({rtsp})
+  });
+  if(r.ok){
+    // 只重建推流容器，设备不重启；相机要几秒才被 HAL 重新识别
+    flash(rtsp ? '画面源已切到 ' + rtsp + '（相机几秒后生效）' : '已停流');
+  }else{
+    let msg = r.status;
+    try{ msg = (await r.json()).message || msg; }catch(_){}
+    flash('摄像头设置失败: ' + msg, true);
+  }
+  loadInfo();
+};
 
 $('#egressave').onclick = async () => {
   const proxy = $('#egress').value.trim();
@@ -883,7 +914,7 @@ $('#release').onclick = async () => {
 
 // 租约变更走 SSE，不必轮询
 const es = new EventSource('/api/events');
-['snapshot','tick','claim','release','human','reap','egress'].forEach(k => es.addEventListener(k, loadInfo));
+['snapshot','tick','claim','release','human','reap','egress','camera'].forEach(k => es.addEventListener(k, loadInfo));
 
 // 页面隐藏时断流，别让后台标签页一直占着节点 CPU 和设备的编码器
 document.addEventListener('visibilitychange', () => {

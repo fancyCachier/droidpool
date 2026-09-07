@@ -32,14 +32,15 @@ const (
 func RelayName(deviceID string) string { return "droidpool-egress-" + deviceID }
 func TunName(deviceID string) string   { return "droidpool-tun-" + deviceID }
 
-// SidecarDeviceID 把出口链路上的辅助容器名映射回它服务的设备 id。
+// SidecarDeviceID 把设备的辅助容器名映射回它服务的设备 id。
+// 出口链路两个 + 摄像头推流一个，都跟着设备走。
 //
 // 这两个容器名同样以 droidpool- 开头，而对账逻辑（Running / Reconcile）是按
 // 这个前缀认设备的。不把它们摘出来的话，对账会认定它们「不在设备表里」而
 // `docker rm -f` 掉——tun 边车持有 netns，删掉等于把每台设备的网络连根拔掉，
 // 而且它还占着 adb 端口，会同时命中「抢占端口」那条判定。
 func SidecarDeviceID(container string) (deviceID string, ok bool) {
-	for _, p := range []string{"droidpool-tun-", "droidpool-egress-"} {
+	for _, p := range []string{"droidpool-tun-", "droidpool-egress-", "droidpool-cam-"} {
 		if id, found := strings.CutPrefix(container, p); found && id != "" {
 			return id, true
 		}

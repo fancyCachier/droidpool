@@ -500,3 +500,58 @@ func TestSetEgressUnknownDevice(t *testing.T) {
 		t.Errorf("设备不存在应当 404，实际 %d", rec.Code)
 	}
 }
+
+type fakeCamera struct {
+	mu  sync.Mutex
+	set map[string]string
+	err error
+}
+
+func (f *fakeCamera) SetCamera(_ context.Context, id, rtsp string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.set == nil {
+		f.set = map[string]string{}
+	}
+	f.set[id] = rtsp
+	return nil
+}
+
+func TestSetCameraAppliesAndValidates(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	fc := &fakeCamera{}
+	s.Camera = fc
+
+	if rec := do(t, h, "PUT", "/api/devices/dev1/camera",
+		map[string]any{"rtsp": "rtsp://cam.lan/live"}, false); rec.Code != http.StatusOK {
+		t.Fatalf("状态 %d：%s", rec.Code, rec.Body)
+	}
+	if fc.set["dev1"] != "rtsp://cam.lan/live" {
+		t.Errorf("未下发：%v", fc.set)
+	}
+	// 空串 = 停流，是合法输入
+	if rec := do(t, h, "PUT", "/api/devices/dev1/camera",
+		map[string]any{"rtsp": ""}, false); rec.Code != http.StatusOK {
+		t.Errorf("留空应当表示停流，实际 %d", rec.Code)
+	}
+	// 非 rtsp 的地址 ffmpeg 也会试着打开，失败后容器反复重启，
+	// 而设备侧只表现为「相机 0 个」，必须在这里挡住
+	for _, bad := range []string{"http://cam/live", "cam.lan/live", "rtsp://a b/live"} {
+		if rec := do(t, h, "PUT", "/api/devices/dev1/camera",
+			map[string]any{"rtsp": bad}, false); rec.Code != http.StatusBadRequest {
+			t.Errorf("%q 应当被拒，实际 %d", bad, rec.Code)
+		}
+	}
+}
+
+func TestSetCameraNeedsBackend(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	s.Camera = nil
+	if rec := do(t, h, "PUT", "/api/devices/dev1/camera",
+		map[string]any{"rtsp": ""}, false); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("未接后端应当 503，实际 %d", rec.Code)
+	}
+}

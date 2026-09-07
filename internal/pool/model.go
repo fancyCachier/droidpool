@@ -65,6 +65,9 @@ type Device struct {
 	// EgressProxy 这台设备公网出口用的上游 socks5（如 socks5://host:1080），
 	// 空 = 直连。每台设备一份，运行中可改，见 node/egress.go。
 	EgressProxy string `json:"egress_proxy"`
+	// CameraRTSP 这台设备摄像头画面的来源，空 = 不推流（相机报 0 个设备）。
+	// 每台设备一份，运行中可改，见 node/camera.go。
+	CameraRTSP string `json:"camera_rtsp"`
 }
 
 // HealthFailThreshold 连续失败多少次判定设备损坏。

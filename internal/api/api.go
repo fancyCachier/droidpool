@@ -57,6 +57,8 @@ type Server struct {
 	Resetter Resetter
 	// Egress 为 nil 时出口设置接口返回 503，其余不受影响。
 	Egress EgressSetter
+	// Camera 为 nil 时摄像头设置接口返回 503，其余不受影响。
+	Camera CameraSetter
 	// UI 配置界面层级接口；DexPath 为空时该接口返回 503。
 	UI UIConfig
 	ui uiSessions
@@ -73,6 +75,11 @@ type Resetter interface {
 // EgressSetter 改一台设备的公网出口（由 pool.Manager 实现）。
 type EgressSetter interface {
 	SetEgress(ctx context.Context, deviceID, proxy string) error
+}
+
+// CameraSetter 改一台设备的摄像头画面源（由 pool.Manager 实现）。
+type CameraSetter interface {
+	SetCamera(ctx context.Context, deviceID, rtsp string) error
 }
 
 // CloseSessions 收尾所有设备墙实时会话与 uiagent 会话，返回被取消的数量。关停前调用。
@@ -117,6 +124,7 @@ func (s *Server) Routes() http.Handler {
 	// 同组的 /input 已经等于完全控制设备，出口设置不比它更宽。
 	mux.HandleFunc("PUT /api/devices/{id}/egress", s.handleSetEgress)
 	mux.HandleFunc("GET /api/devices/{id}/ui", s.handleUIDump)
+	mux.HandleFunc("PUT /api/devices/{id}/camera", s.handleSetCamera)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
 	return mux
@@ -414,6 +422,55 @@ func (s *Server) handleSetEgress(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Events.Publish("egress", map[string]any{"device": id, "proxy": req.Proxy})
 	writeJSON(w, http.StatusOK, map[string]any{"device": id, "egress_proxy": req.Proxy})
+}
+
+// handleSetCamera 改一台设备的摄像头画面源。只重建推流容器，设备与租约都不中断。
+func (s *Server) handleSetCamera(w http.ResponseWriter, r *http.Request) {
+	if s.Camera == nil {
+		writeErr(w, http.StatusServiceUnavailable, "unavailable", "本实例未接摄像头管理")
+		return
+	}
+	id := r.PathValue("id")
+	var req struct {
+		RTSP string `json:"rtsp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
+		return
+	}
+	req.RTSP = strings.TrimSpace(req.RTSP)
+	if err := validateRTSP(req.RTSP); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if err := s.Camera.SetCamera(r.Context(), id, req.RTSP); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "设备不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.Events.Publish("camera", map[string]any{"device": id, "rtsp": req.RTSP})
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "camera_rtsp": req.RTSP})
+}
+
+// validateRTSP 拦掉明显写错的画面源。空串表示停流。
+//
+// 只认 rtsp/rtsps：推流容器把这个串直接交给 ffmpeg 的 -i，写成 http 之类的
+// ffmpeg 也会试着打开，失败后容器反复重启，而设备侧只表现为「相机 0 个」，
+// 要翻推流容器的日志才看得出来。
+func validateRTSP(u string) error {
+	if u == "" {
+		return nil
+	}
+	if !strings.HasPrefix(u, "rtsp://") && !strings.HasPrefix(u, "rtsps://") {
+		return errors.New("画面源要以 rtsp:// 开头，留空表示停流")
+	}
+	if strings.ContainsAny(u, " \t\n") {
+		return errors.New("画面源里不能有空白字符")
+	}
+	return nil
 }
 
 // validateProxy 拦掉明显写错的出口地址。空串表示直连。
