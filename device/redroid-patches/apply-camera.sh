@@ -23,12 +23,15 @@ else
 
 # 外接摄像头：画面来自宿主的 v4l2loopback（RTSP → ffmpeg → /dev/videoN），
 # 容器以 --device 拿到该节点。用 AOSP 现成的 external provider，不写 HAL 代码。
+#
+# 只拷 camera.external.xml：它本身就声明了 android.hardware.camera.any，
+# 而 camera.any.xml 这个文件在 AOSP 14 里并不存在（写上去 ninja 直接报
+# missing and no known rule to make it）。
 PRODUCT_PACKAGES += \
     android.hardware.camera.provider@2.7-external-service
 
 PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.camera.external.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.external.xml \
-    frameworks/native/data/etc/android.hardware.camera.any.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.any.xml \
     $(LOCAL_PATH)/external_camera_config.xml:$(TARGET_COPY_OUT_VENDOR)/etc/external_camera_config.xml
 MK
   echo "  redroid.mk 已追加"
