@@ -5,6 +5,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -80,6 +81,16 @@ func (n *Node) docker(ctx context.Context, args ...string) (string, error) {
 		r = er
 	}
 	return r.Run(ctx, "docker", args...)
+}
+
+// shellQuote 把字符串包成 sh 的单引号形式，镜像名里的特殊字符不会被解释。
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// logf 记一条节点级日志。Node 没有 logger，退回标准库。
+func (n *Node) logf(format string, a ...any) {
+	slog.Info(fmt.Sprintf(format, a...), "node", n.Name)
 }
 
 // ContainerName 设备 id 对应的容器名。
@@ -293,9 +304,24 @@ func (h *Health) UnderPressure(minAvailMiB int) bool {
 // **base 不预装 app**：多宿主机 debug keystore 不同，预装会让 `install -r` 报签名冲突。
 // 幂等：base 已有内容时直接返回，想重做先手动清空目录。
 func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
-	// 已有内容就不重做：boot 过一次的 /data 里必然有 system/ 目录
-	if out, err := n.sshRun(ctx, "test -d "+baseDir+"/system && echo yes || echo no"); err == nil && strings.TrimSpace(out) == "yes" {
+	// 已有内容且是同一个镜像造的就不重做。
+	//
+	// 只看 system/ 目录是不够的：换了镜像之后基底还是旧镜像的 /data，
+	// 8 台设备会拿着它去跑新镜像。同版本 Android 大概率能跑，但 fingerprint
+	// 变了，Android 可能触发首启逻辑，而且这种「跑起来了但不对」最难查。
+	// 靠人记得手工删目录同样不可靠，所以把镜像名记在基底里，对不上就重造。
+	stamp := baseDir + "/.droidpool-image"
+	out, err := n.sshRun(ctx, "test -d "+baseDir+"/system && cat "+stamp+" 2>/dev/null || true")
+	if err == nil && strings.TrimSpace(out) == n.Image {
 		return nil
+	}
+	if strings.TrimSpace(out) != "" {
+		n.logf("golden 基底由 %q 造的，当前镜像是 %q，重造", strings.TrimSpace(out), n.Image)
+	}
+	// 换镜像时必须清干净：残留的旧 /data 会和新镜像混在一起
+	if _, err := n.docker(ctx, "run", "--rm", "-v", baseDir+":/wipe",
+		"busybox:stable", "sh", "-c", "rm -rf /wipe/* /wipe/.[!.]* 2>/dev/null; true"); err != nil {
+		return fmt.Errorf("清空 golden 基底: %w", err)
 	}
 	const name = "droidpool-golden"
 	_, _ = n.docker(ctx, "rm", "-f", name)
@@ -338,6 +364,11 @@ func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
 	}
 	// 让设置落盘再停
 	_, _ = n.docker(ctx, "exec", name, "sync")
+	// 写下是哪个镜像造的，下次好判断要不要重造
+	if _, err := n.docker(ctx, "exec", name, "sh", "-c",
+		"printf '%s' "+shellQuote(n.Image)+" > /data/.droidpool-image"); err != nil {
+		return fmt.Errorf("写 golden 镜像标记: %w", err)
+	}
 	if _, err := n.docker(ctx, "stop", "-t", "10", name); err != nil {
 		return fmt.Errorf("停 golden 容器: %w", err)
 	}

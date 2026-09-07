@@ -307,8 +307,11 @@ func TestReconcileRemovesPortHogsAndOrphans(t *testing.T) {
 }
 
 func TestMakeGoldenSkipsWhenBaseExists(t *testing.T) {
-	f := &fakeRunner{replies: []reply{{match: "test -d", out: "yes\n"}}}
-	n := testNode(f)
+	// 判据是「基底存在**且**是当前镜像造的」——只看目录在不在不够，
+	// 换镜像后旧基底会被拿去跑新镜像，见 TestMakeGoldenRebuildsWhenImageChanged。
+	n := testNode(nil)
+	f := &fakeRunner{replies: []reply{{match: ".droidpool-image", out: n.Image + "\n"}}}
+	n.Runner = f
 	if err := n.MakeGolden(context.Background(), "/data/droidpool/base", 5576); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +323,7 @@ func TestMakeGoldenSkipsWhenBaseExists(t *testing.T) {
 
 func TestMakeGoldenStripsOverlayFlagAndAppliesSettings(t *testing.T) {
 	f := &fakeRunner{replies: []reply{
-		{match: "test -d", out: "no\n"},
+		{match: ".droidpool-image", out: "\n"}, // 空 = 还没造过
 		{match: "getprop", out: "1\n"},
 	}}
 	n := testNode(f)
@@ -440,5 +443,43 @@ Mapped:           967680 kB
 	fmt.Sscanf(string(out), "%d %d", &total, &avail)
 	if avail != 5897 {
 		t.Errorf("可用 = %d，期望回落到 MemFree 的 5897", avail)
+	}
+}
+
+// 换了镜像就必须重造 golden 基底。不重造的话，8 台设备会拿着旧镜像的 /data
+// 去跑新镜像——同版本大概率能跑起来，但 fingerprint 变了，属于「跑起来了
+// 但不对」，最难查。
+func TestMakeGoldenRebuildsWhenImageChanged(t *testing.T) {
+	f := &fakeRunner{replies: []reply{
+		{match: ".droidpool-image", out: "redroid/redroid:14.0.0_64only-latest\n"},
+		{match: "getprop", out: "1\n"},
+	}}
+	n := testNode(f)
+	n.Image = "droidpool/redroid:14-custom"
+	_ = n.MakeGolden(context.Background(), "/data/droidpool/base", 5599)
+
+	if f.lastMatching("rm -rf /wipe") == nil {
+		t.Error("镜像变了却没清空旧基底")
+	}
+	if f.lastMatching("--name droidpool-golden") == nil {
+		t.Error("镜像变了却没重造 golden")
+	}
+}
+
+// 同一个镜像就别重造——每次启动都重来一遍要一分多钟。
+func TestMakeGoldenSkipsWhenImageSame(t *testing.T) {
+	f := &fakeRunner{replies: []reply{
+		{match: ".droidpool-image", out: "redroid/redroid:14.0.0_64only-latest\n"},
+	}}
+	n := testNode(f)
+	n.Image = "redroid/redroid:14.0.0_64only-latest"
+	if err := n.MakeGolden(context.Background(), "/data/droidpool/base", 5599); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastMatching("--name droidpool-golden") != nil {
+		t.Error("同一个镜像不该重造")
+	}
+	if f.lastMatching("rm -rf /wipe") != nil {
+		t.Error("同一个镜像不该清空基底")
 	}
 }
