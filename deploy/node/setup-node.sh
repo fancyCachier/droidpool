@@ -32,7 +32,25 @@ MODCONF
   # external_camera_config.xml 里 720p 的 15 上限，HAL 会把整个设备丢掉，
   # 相机数恒为 0——错误信息只说 characteristics 失败，看不出是帧率的事。
   command -v v4l2loopback-ctl >/dev/null || apt-get install -y -qq v4l2loopback-utils
-  echo "   已配置（摄像头默认不启用，用 rtsp-camera.sh 起流才生效）"
+  # 权限：宿主上节点默认是 root:video 0660，而 camera HAL 跑在 cameraserver
+  # 名下、组里没有 video，直接 EACCES。用 udev 规则而不是 chmod——模块每次
+  # 重载都会重建节点，靠人记得补 chmod 必然会漏，而漏了的症状是「相机 0 个」，
+  # 完全不指向权限。
+  cat > /etc/udev/rules.d/99-droidpool-v4l2.rules <<'UDEV'
+KERNEL=="video[0-9]*", ATTR{name}=="droidpool-cam*", MODE="0666"
+UDEV
+  udevadm control --reload-rules 2>/dev/null || true
+
+  # 真的把它加载起来。tun 那段有 modprobe，这段原来只写配置文件就完事了——
+  # 脚本照样报「节点准备完成」，而设备节点一个都没有，症状是给设备设摄像头时
+  # 报「节点不存在」，完全不指向这里。
+  modprobe -r v4l2loopback 2>/dev/null || true
+  modprobe v4l2loopback
+  # udev 建节点要一会儿，等它出来再往下走，否则后面的校验会误判
+  for _ in $(seq 1 10); do [ -e /dev/video21 ] && break; sleep 1; done
+  udevadm trigger --subsystem-match=video4linux 2>/dev/null || true
+  n=$(ls /dev/video2? 2>/dev/null | wc -l)
+  echo "   已加载，$n 个摄像头节点：$(ls /dev/video2? 2>/dev/null | tr '\n' ' ')"
 else
   echo "   跳过：这个内核没有 v4l2loopback，摄像头功能不可用"
 fi

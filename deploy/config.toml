@@ -33,6 +33,10 @@ adb_host    = "192.168.14.54"
 port_range  = [5561, 5576]
 # 实测活跃上限 10 台，取 8 留余量给设备墙与人工操作
 max_devices = 8
+# 自建镜像：带外接摄像头 HAL（device/redroid-patches）。官方镜像没有摄像头。
+# 镜像只在节点本地，没有 registry——节点重装后用 ~/droidpool-node/pull-image.sh
+# 从构建机重新拉。换镜像时 golden 基底会自动重造（.droidpool-image 标记对不上）。
+image       = "droidpool/redroid:14-custom"
 data_root   = "/data/droidpool"
 # 1366x768@160 = 收银机实机 Sunmi D1s 2nd；use_memfd 不可省（.54 无 ashmem）
 # 公网出口：打开后每台设备多起两个辅助容器（tun 边车 + socks5 中继），
@@ -44,5 +48,5 @@ egress_dns = "223.5.5.5"
 # 摄像头：非 0 时每台设备透传 /dev/video<base+序号>（3588-a-1 → /dev/video21）。
 # 一台一个节点，共用的话谁先打开谁独占。需要自建镜像（device/redroid-patches）
 # 与节点上的 v4l2loopback（deploy/node/setup-node.sh），画面用 rtsp-camera.sh 灌。
-camera_video_base = 0
+camera_video_base = 20
 boot_args = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366 androidboot.redroid_height=768 androidboot.redroid_dpi=160 androidboot.redroid_gpu_mode=guest"
