@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -553,5 +554,57 @@ func TestSetCameraNeedsBackend(t *testing.T) {
 	if rec := do(t, h, "PUT", "/api/devices/dev1/camera",
 		map[string]any{"rtsp": ""}, false); rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("未接后端应当 503，实际 %d", rec.Code)
+	}
+}
+
+func TestMaskURLCredentials(t *testing.T) {
+	cases := map[string]string{
+		"rtsp://admin:secret@10.0.0.1:554/live": "rtsp://admin:***@10.0.0.1:554/live",
+		"rtsps://u:p@h/x":                       "rtsps://u:***@h/x",
+		"rtsp://10.0.0.1:554/live":              "rtsp://10.0.0.1:554/live", // 没凭据就不动
+		"":                                      "",
+		"rtsp://onlyuser@h/x":                   "rtsp://onlyuser:***@h/x",
+		"notaurl":                               "notaurl",
+	}
+	for in, want := range cases {
+		if got := maskURLCredentials(in); got != want {
+			t.Errorf("maskURLCredentials(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// /api/wall 是不鉴权的，一条带凭据的摄像头地址等于向整个内网广播。
+func TestWallMasksCameraCredentials(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	d, err := s.Store.GetDevice("dev1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.CameraRTSP = "rtsp://admin:hunter2@cam.lan/live"
+	if err := s.Store.UpsertDevice(d); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.SetDeviceCamera("dev1", "rtsp://admin:hunter2@cam.lan/live"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := do(t, h, "GET", "/api/wall", nil, false)
+	body := rec.Body.String()
+	if strings.Contains(body, "hunter2") {
+		t.Errorf("/api/wall 泄露了摄像头凭据：%s", body)
+	}
+	if !strings.Contains(body, "admin:***@cam.lan") {
+		t.Errorf("应当显示打码后的地址，实际：%s", body)
+	}
+}
+
+// PUT 的响应同样不能把凭据原样回显——它会被写进日志、SSE、页面。
+func TestSetCameraResponseIsMasked(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	s.Camera = &fakeCamera{}
+	rec := do(t, h, "PUT", "/api/devices/dev1/camera",
+		map[string]any{"rtsp": "rtsp://admin:hunter2@cam.lan/live"}, false)
+	if strings.Contains(rec.Body.String(), "hunter2") {
+		t.Errorf("响应泄露了凭据：%s", rec.Body)
 	}
 }

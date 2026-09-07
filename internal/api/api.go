@@ -451,8 +451,36 @@ func (s *Server) handleSetCamera(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.Events.Publish("camera", map[string]any{"device": id, "rtsp": req.RTSP})
-	writeJSON(w, http.StatusOK, map[string]any{"device": id, "camera_rtsp": req.RTSP})
+	masked := maskURLCredentials(req.RTSP)
+	s.Events.Publish("camera", map[string]any{"device": id, "rtsp": masked})
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "camera_rtsp": masked})
+}
+
+// maskURLCredentials 把 URL 里的用户名密码换成 ***，用于任何会被读到的地方。
+//
+// 摄像头的 RTSP 地址通常带凭据，而设备墙的 /api/wall 是不鉴权的（与 /input
+// 同组，信任边界是内网），页面上还会明文回显。不打码的话，一条摄像头凭据
+// 等于向整个内网广播。
+//
+// 打码只覆盖 API 与页面这两层。节点上 `docker inspect droidpool-cam-*` 仍能
+// 看到完整命令行——那要换成挂文件传参才能收掉，是另一件事。
+func maskURLCredentials(u string) string {
+	i := strings.Index(u, "://")
+	if i < 0 {
+		return u
+	}
+	rest := u[i+3:]
+	at := strings.Index(rest, "@")
+	if at < 0 {
+		return u
+	}
+	// 只保留用户名，密码整段换掉；用户名本身不算秘密，留着便于辨认是哪个源
+	cred := rest[:at]
+	user := cred
+	if c := strings.Index(cred, ":"); c >= 0 {
+		user = cred[:c]
+	}
+	return u[:i+3] + user + ":***@" + rest[at+1:]
 }
 
 // validateRTSP 拦掉明显写错的画面源。空串表示停流。

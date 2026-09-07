@@ -100,6 +100,7 @@ pre.clip{margin:0 0 8px;padding:8px 9px;background:#0d1117;border:1px solid var(
         <button id="camsave">应用</button>
       </div>
       <div class="hint" id="camhint">redroid 自身没有摄像头，画面由这路 RTSP 提供。</div>
+      <div class="hint">改动要填完整地址（含凭据）；上面显示的当前值是打码过的，不能直接改。</div>
     </div>
 
     <div class="panel">
@@ -847,9 +848,11 @@ async function loadInfo(){
       ${d.human ? `<dt>接管</dt><dd style="color:var(--busy)">进行中 ${d.note||''}</dd>` : ''}`;
     // 只在没聚焦时回显，否则会把用户正在敲的内容冲掉
     if(document.activeElement !== $('#egress')) $('#egress').value = d.egress_proxy || '';
-    if(document.activeElement !== $('#camera')) $('#camera').value = d.camera_rtsp || '';
-    $('#camhint').textContent = d.camera_rtsp
-      ? '画面源 ' + d.camera_rtsp + '；转码约占节点一个核的 7 成，用完记得停。'
+    // 后端回来的是打码值（rtsp://user:***@host/...），把它当成新地址提交回去
+    // 会把真凭据换成三个星号。所以只拿它做展示，不填进输入框。
+    camMasked = d.camera_rtsp || '';
+    $('#camhint').textContent = camMasked
+      ? '当前画面源 ' + camMasked + '（凭据已打码）。转码约占节点一个核的 7 成，用完记得停。'
       : 'redroid 自身没有摄像头，填一路 RTSP 才有画面。';
     $('#egresshint').textContent = d.egress_proxy
       ? '公网经 ' + d.egress_proxy + ' 落地；内网直连。'
@@ -861,8 +864,11 @@ async function loadInfo(){
   }catch(_){}
 }
 
+let camMasked = '';
 $('#camsave').onclick = async () => {
   const rtsp = $('#camera').value.trim();
+  // 用户没动输入框就什么都别做，免得把空串当成「停流」误发出去
+  if(rtsp === '' && camMasked !== '' && !confirm('输入框是空的，确定要停流吗？')) return;
   const r = await fetch(`/api/devices/${encodeURIComponent(id)}/camera`, {
     method:'PUT', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({rtsp})
