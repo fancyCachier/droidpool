@@ -13,7 +13,9 @@ NODE_SSH=${NODE_SSH:-office-3588-sa}; NODE_IP=${NODE_IP:-192.168.14.54}
 APK=${APK:?需要 APK=path/to/app-debug.apk}
 LEVELS=${LEVELS:-"2 4 6 8 10 12 14 16"}
 SETTLE_S=${SETTLE_S:-60}; SAMPLE_S=${SAMPLE_S:-60}; MIN_AVAIL_MIB=${MIN_AVAIL_MIB:-1500}
-BASE_PORT=5560; PKG=cn.daboshi.cashier_app.dev
+# 5600 段：生产池占 5561~5576（deploy/config.toml 的 port_range），撞上去
+# 要么绑不上端口，要么被 droidpool 的对账当成抢占端口的残留删掉。
+BASE_PORT=${BASE_PORT:-5600}; PKG=cn.daboshi.cashier_app.dev
 export ADB=${ADB:-adb}
 OUT=${OUT:-$HERE/out/resident-$(date +%Y%m%d-%H%M%S)}; mkdir -p "$OUT"
 
@@ -26,7 +28,7 @@ echo "level,ok_devices,mem_used_mib,mem_avail_mib,swap_used_mib,total_cpu_pct,te
 LAST_OK=0
 for n in $LEVELS; do
   log "=== 常驻 N=$n ==="
-  ssh "$NODE_SSH" "/tmp/bench/node-ensure.sh $n" 2>&1 | tee -a "$OUT/resident.log"
+  ssh "$NODE_SSH" "/tmp/bench/node-ensure.sh $n $BASE_PORT" 2>&1 | tee -a "$OUT/resident.log"
 
   ok=0
   for i in $(seq 1 "$n"); do
