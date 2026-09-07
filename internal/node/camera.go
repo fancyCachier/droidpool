@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // 摄像头画面链路：宿主上每台设备一个 v4l2loopback 节点，一个 ffmpeg 容器把
@@ -87,6 +88,14 @@ const camConfigTmpl = `<ExternalCamera>
     </Device>
 </ExternalCamera>`
 
+// settle 返回等推流稳定的时长；测试里可缩短。
+func (n *Node) settle() time.Duration {
+	if n.camSettle > 0 {
+		return n.camSettle
+	}
+	return camFeedSettle
+}
+
 // CamFeedName 某台设备的推流容器名。
 func CamFeedName(deviceID string) string { return "droidpool-cam-" + deviceID }
 
@@ -110,15 +119,49 @@ func (n *Node) SetCamera(ctx context.Context, deviceID, rtsp string) error {
 	// -rtsp_transport tcp：UDP 丢包在容器里表现为花屏，排查成本高。
 	// -c:v mjpeg：external camera HAL 只认 MJPEG 与 Z16，喂别的会被整个丢掉。
 	// --restart unless-stopped：源抖动或对端重启时自己接回来，不然画面就永久黑了。
-	_, err := n.docker(ctx, "run", "-d", "--name", name,
+	if _, err := n.docker(ctx, "run", "-d", "--name", name,
 		"--restart", "unless-stopped", "--device", dev,
 		camFeedImage,
 		"-hide_banner", "-loglevel", "warning", "-nostdin",
 		"-rtsp_transport", "tcp", "-re", "-i", rtsp,
 		"-vf", "scale=1280:720", "-r", strconv.Itoa(camFPS),
-		"-c:v", "mjpeg", "-q:v", "5", "-f", "v4l2", dev)
+		"-c:v", "mjpeg", "-q:v", "5", "-f", "v4l2", dev); err != nil {
+		return err
+	}
+	return n.rescanCamera(ctx, deviceID)
+}
+
+// rescanCamera 让设备侧的 camera HAL 重新扫一遍 /dev/video*。
+//
+// 不做这一步的话，先起的设备永远认不出后接的摄像头：exclusive_caps 的
+// v4l2loopback 节点在**没有 writer 时不暴露 VIDEO_CAPTURE**，而 HAL 只在
+// 启动时扫一次——设备重建时推流还没起，HAL 扫到一个「不支持 VIDEO_CAPTURE」
+// 的节点就永久丢弃了，之后再推流它也不会回头看。日志里是这一行：
+//
+//	W ExtCamPrvdr: deviceAdded device /dev/video23 does not support VIDEO_CAPTURE
+//
+// 重启整个容器也能解决，但那会中断设备与租约；只重启这个 HAL 服务就够，
+// 实测重启后立刻认出 1 个摄像头，设备本身无感。
+func (n *Node) rescanCamera(ctx context.Context, deviceID string) error {
+	// 推流刚起，等它把格式协商出来再让 HAL 扫，否则扫了还是「不支持 CAPTURE」
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(n.settle()):
+	}
+	_, err := n.docker(ctx, "exec", ContainerName(deviceID),
+		"sh", "-c", "setprop ctl.restart "+camHALService)
 	return err
 }
+
+const (
+	// camHALService 设备侧摄像头 HAL 的 init 服务名，与 AOSP 的
+	// android.hardware.camera.provider-V1-external-service.rc 一致。
+	camHALService = "vendor.camera.provider-ext"
+	// camFeedSettle 等推流把 v4l2 节点的格式协商出来。实测几秒即可，
+	// 给足余量——这段等待只在换源时发生，不在热路径上。
+	camFeedSettle = 8 * time.Second
+)
 
 // removeCamFeed 清掉推流容器，设备销毁时调用。
 func (n *Node) removeCamFeed(ctx context.Context, deviceID string) {

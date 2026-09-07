@@ -44,7 +44,9 @@ type Node struct {
 	EgressDNS string // 隧道内用的解析器，如 223.5.5.5；空则沿用 docker 默认
 	// CameraVideoBase 非 0 时给每台设备透传 /dev/video<base+序号>。见 CameraDevice。
 	CameraVideoBase int
-	Runner          Runner
+	// camSettle 换源后等推流稳定的时长；0 = 用默认。只给测试用。
+	camSettle time.Duration
+	Runner    Runner
 }
 
 // CameraDevice 返回该设备要透传的 v4l2 节点路径，未启用时为空。
