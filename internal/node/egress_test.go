@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func egressNode(r Runner) *Node {
@@ -276,6 +277,41 @@ func TestSetCameraBuildsFeedContainer(t *testing.T) {
 }
 
 // 停流只删容器，不该再起一个。
+// 起完推流必须让 HAL 重扫，否则先起的设备永远认不出后接的摄像头：
+// exclusive_caps 的节点没 writer 时不暴露 VIDEO_CAPTURE，而 HAL 只在启动时
+// 扫一次，扫到就永久丢弃。实测日志：
+//
+//	W ExtCamPrvdr: deviceAdded device /dev/video23 does not support VIDEO_CAPTURE
+func TestSetCameraRescansHAL(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	n.camSettle = time.Millisecond // 测试里不真等
+	if err := n.SetCamera(context.Background(), "3588-a-3", "rtsp://cam/live"); err != nil {
+		t.Fatal(err)
+	}
+	j := strings.Join(f.lastMatching("ctl.restart"), " ")
+	if !strings.Contains(j, "vendor.camera.provider-ext") {
+		t.Errorf("未让 HAL 重扫，摄像头不会被认出来：%v", f.calls)
+	}
+	if !strings.Contains(j, "exec droidpool-3588-a-3") {
+		t.Errorf("该在设备容器里重启 HAL，而不是别处：%s", j)
+	}
+}
+
+// 停流不必重扫——HAL 会自己发现节点没了。
+func TestSetCameraEmptySkipsRescan(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	if err := n.SetCamera(context.Background(), "3588-a-3", ""); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastMatching("ctl.restart") != nil {
+		t.Error("停流不该重启 HAL")
+	}
+}
+
 func TestSetCameraEmptyStopsFeed(t *testing.T) {
 	f := &fakeRunner{}
 	n := testNode(f)
