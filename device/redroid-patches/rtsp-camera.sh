@@ -2,12 +2,14 @@
 # 在节点上把一路 RTSP 变成一个 v4l2 摄像头节点，供 redroid 的外接摄像头 HAL 使用。
 #
 #   rtsp-camera.sh start <设备号> <rtsp-url>   例: start 20 rtsp://cam/live
+#   （帧率默认 15，用 FPS=10 rtsp-camera.sh start ... 覆盖）
 #   rtsp-camera.sh stop  <设备号>
 #   rtsp-camera.sh status
 #
 # 设备号即 /dev/videoN 的 N，一台 redroid 用一个，容器起的时候 --device 进去。
 #
-# 前提：节点要有 v4l2loopback 模块（Ubuntu rockchip 内核自带，不用 DKMS 编）。
+# 前提：节点要有 v4l2loopback 模块（Ubuntu rockchip 内核自带，不用 DKMS 编）
+# 和 v4l2loopback-ctl（apt install v4l2loopback-utils）。
 # 首次用 `modprobe v4l2loopback`，持久化写 /etc/modules-load.d/。
 set -euo pipefail
 
@@ -26,6 +28,8 @@ need_module() {
 case "${1:-}" in
 start)
   N=${2:?设备号}; URL=${3:?rtsp url}
+  # 改 FPS 时 external_camera_config.xml 里对应分辨率的 fpsBound 要 >= 它
+  FPS=${FPS:-15}
   need_module
   DEV=/dev/video$N
   [ -e "$DEV" ] || { echo "$DEV 不存在（v4l2loopback 的 video_nr 覆盖到了吗）"; exit 1; }
@@ -48,10 +52,19 @@ start)
   # -rtsp_transport tcp：UDP 丢包在容器里表现为花屏，排查成本高，直接走 TCP。
   nohup ffmpeg -hide_banner -loglevel warning -nostdin \
     -rtsp_transport tcp -re -i "$URL" \
-    -vf scale=1280:720 -r 15 -c:v mjpeg -q:v 5 -f v4l2 "$DEV" \
+    -vf scale=1280:720 -r "$FPS" -c:v mjpeg -q:v 5 -f v4l2 "$DEV" \
     > "$PIDDIR/$N.log" 2>&1 &
   echo $! > "$PID"
   sleep 2
+
+  # 必须显式把设备的 fps 设成与推流一致。
+  #
+  # v4l2loopback 默认报 30 fps，而 external_camera_config.xml 里 1280x720 的
+  # fpsBound 是 15；设备报的 fps 超过配置上限时，HAL 会 initCameraCharacteristics
+  # 失败并把设备整个丢掉——对照实验实测：设 30 → "Number of camera devices: 0"，
+  # 设 15 → 1 个，来回切换稳定复现。这一步漏掉的话，前面全对也是 0 个摄像头。
+  v4l2loopback-ctl set-fps "$FPS" "$DEV" >/dev/null 2>&1 || \
+    echo "⚠ set-fps 失败（装了 v4l2loopback-utils 吗）——相机很可能会报 0 个设备"
   if kill -0 "$(cat "$PID")" 2>/dev/null; then
     echo "✅ $URL → $DEV （pid $(cat "$PID")）"
   else
