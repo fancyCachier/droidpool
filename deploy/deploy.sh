@@ -5,6 +5,8 @@ set -euo pipefail
 HOST=${1:-office-devopt}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 JAR=${SCRCPY_SERVER_JAR:-$(ls /opt/homebrew/Cellar/scrcpy/*/share/scrcpy/scrcpy-server 2>/dev/null | tail -1)}
+# uiagent.dex 给 /api/devices/{id}/ui 用。缺了不阻断部署，那个接口返回 503 而已。
+DEX=${DROIDPOOL_UIAGENT_DEX:-$HERE/device/uiagent/uiagent.dex}
 
 [ -f "$HERE/dist/droidpoold-linux-amd64" ] || { echo "先构建: make dist"; exit 1; }
 [ -f "$JAR" ] || { echo "找不到 scrcpy-server jar，设 SCRCPY_SERVER_JAR"; exit 1; }
@@ -15,6 +17,11 @@ scp -q "$HERE/dist/droidpoold-linux-amd64" "$HOST:/opt/droidpool/droidpoold.new"
 scp -q "$HERE/dist/droidpool-linux-amd64"  "$HOST:/opt/droidpool/droidpool"
 scp -q "$HERE/deploy/config.toml"           "$HOST:/opt/droidpool/config.toml"
 scp -q "$JAR"                                "$HOST:/opt/droidpool/scrcpy-server"
+if [ -f "$DEX" ]; then
+  scp -q "$DEX" "$HOST:/opt/droidpool/uiagent.dex"
+else
+  echo "  ⚠ 没有 $DEX（跑 device/uiagent/build.sh 生成），界面层级接口将返回 503"
+fi
 scp -q "$HERE/deploy/droidpoold.service"    "$HOST:/tmp/droidpoold.service"
 scp -q "$HERE/deploy/cert/recv-cert.sh"     "$HOST:/tmp/recv-cert.sh"
 

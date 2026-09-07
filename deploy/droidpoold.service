@@ -12,6 +12,8 @@ Environment=HOME=/home/sa
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # scrcpy-server jar：H.264 流与控制通道用；缺失时自动退回截图流
 Environment=SCRCPY_SERVER_JAR=/opt/droidpool/scrcpy-server
+# 未设置时 /api/devices/{id}/ui 返回 503，其余功能不受影响
+Environment=DROIDPOOL_UIAGENT_DEX=/opt/droidpool/uiagent.dex
 EnvironmentFile=-/opt/droidpool/env
 # 设备墙 HTTPS 监听 443（[tls]），非 root 绑低端口要这个能力
 AmbientCapabilities=CAP_NET_BIND_SERVICE

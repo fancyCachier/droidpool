@@ -105,10 +105,14 @@ func (n *Node) startTun(ctx context.Context, deviceID string, port int, dns stri
 
 // applyEgressRoutes 把设备流量导进隧道。**必须在 Android 起来之后调用。**
 //
-// Android 的 netd 开机时会在 netns 里装自己的 ip rule（实测 18000~32000），
-// 压过 tun2socks 自带的那条 32765，其中 `32000: from all unreachable` 还会把
-// 带 fwmark 的代理上行一并堵死。所以要插两条更高优先级的规则抢在 netd 前面，
-// 且顺序要紧：代理自身先拿到真实网卡，其余才进隧道。
+// Android 的 netd 开机时会在 netns 里装自己的 ip rule，压过 tun2socks 自带的
+// 那条 32765，其中 `32000: from all unreachable` 还会把带 fwmark 的代理上行
+// 一并堵死。所以要插两条更高优先级的规则抢在 netd 前面，且顺序要紧：
+// 代理自身先拿到真实网卡，其余才进隧道。
+//
+// 优先级取 9000/9001 是因为实测 netd 自己占着 10000~32000（含 17000，
+// 最初选的就是它，撞号了）。9000 在 netd 之下、local 表（0）之上，
+// 既一定先于 netd 生效，又不会挡住本地回环。
 func (n *Node) applyEgressRoutes(ctx context.Context, deviceID, gateway string) error {
 	tun := TunName(deviceID)
 	for _, cidr := range lanRoutes {
@@ -118,8 +122,8 @@ func (n *Node) applyEgressRoutes(ctx context.Context, deviceID, gateway string) 
 		}
 	}
 	rules := [][]string{
-		{"ip", "rule", "add", "pref", "17000", "fwmark", egressFwmark, "lookup", "main"},
-		{"ip", "rule", "add", "pref", "17001", "not", "fwmark", egressFwmark, "lookup", egressTable},
+		{"ip", "rule", "add", "pref", "9000", "fwmark", egressFwmark, "lookup", "main"},
+		{"ip", "rule", "add", "pref", "9001", "not", "fwmark", egressFwmark, "lookup", egressTable},
 	}
 	for _, r := range rules {
 		if _, err := n.docker(ctx, append([]string{"exec", tun}, r...)...); err != nil {

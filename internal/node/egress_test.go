@@ -88,10 +88,10 @@ func TestFinishEgressRuleOrderAndLANSplit(t *testing.T) {
 	if len(rules) != 2 {
 		t.Fatalf("应当只加两条规则，实际 %d 条：%v", len(rules), rules)
 	}
-	if !strings.Contains(rules[0], "pref 17000 fwmark 0x22b lookup main") {
+	if !strings.Contains(rules[0], "pref 9000 fwmark 0x22b lookup main") {
 		t.Errorf("第一条必须放行代理自身上行，实际：%s", rules[0])
 	}
-	if !strings.Contains(rules[1], "pref 17001 not fwmark 0x22b lookup 555") {
+	if !strings.Contains(rules[1], "pref 9001 not fwmark 0x22b lookup 555") {
 		t.Errorf("第二条才是把其余流量导入隧道，实际：%s", rules[1])
 	}
 

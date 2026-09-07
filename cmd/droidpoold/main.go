@@ -142,6 +142,11 @@ func run() error {
 		Events:      hub,
 		Resetter:    mgr,
 		Egress:      mgr,
+		UI: api.UIConfig{
+			// 未设置时界面层级接口返回 503；deploy.sh 会把 dex 推过来
+			DexPath:  os.Getenv("DROIDPOOL_UIAGENT_DEX"),
+			PortBase: 27400,
+		},
 		Scrcpy: api.ScrcpyConfig{
 			// 未设置时 H.264 端点返回 503，前端自动退回截图流
 			ServerJar: os.Getenv("SCRCPY_SERVER_JAR"),

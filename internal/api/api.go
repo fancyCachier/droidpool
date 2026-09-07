@@ -57,6 +57,9 @@ type Server struct {
 	Resetter Resetter
 	// Egress 为 nil 时出口设置接口返回 503，其余不受影响。
 	Egress EgressSetter
+	// UI 配置界面层级接口；DexPath 为空时该接口返回 503。
+	UI UIConfig
+	ui uiSessions
 	// WallURL 非空时，走明文 http 打开的设备墙页面 302 到这里。WebCodecs 只在安全
 	// 上下文里存在，http://内网IP 上的放大视图只有 3 fps 截图流；API 不跳转，agent 照旧。
 	WallURL string
@@ -72,8 +75,8 @@ type EgressSetter interface {
 	SetEgress(ctx context.Context, deviceID, proxy string) error
 }
 
-// CloseSessions 收尾所有设备墙实时会话，返回被取消的会话数。关停前调用。
-func (s *Server) CloseSessions() int { return s.h264.CloseAll() }
+// CloseSessions 收尾所有设备墙实时会话与 uiagent 会话，返回被取消的数量。关停前调用。
+func (s *Server) CloseSessions() int { return s.h264.CloseAll() + s.ui.closeAll() }
 
 func (s *Server) now() time.Time {
 	if s.Now != nil {
@@ -113,6 +116,7 @@ func (s *Server) Routes() http.Handler {
 	// 与设备墙其余接口同组，不走 Bearer：页面本身没有 token。信任边界就是内网——
 	// 同组的 /input 已经等于完全控制设备，出口设置不比它更宽。
 	mux.HandleFunc("PUT /api/devices/{id}/egress", s.handleSetEgress)
+	mux.HandleFunc("GET /api/devices/{id}/ui", s.handleUIDump)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
 	return mux
