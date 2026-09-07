@@ -22,7 +22,9 @@ tapX() { local c; c=$(centerX "$1"); [ -z "$c" ] && return 1; a shell input tap 
 tapF() { local c; c=$(centerF "$1"); [ -z "$c" ] && return 1; a shell input tap $c; echo "tap [~$1] @ $c"; }
 shot() { a exec-out screencap -p > "$OUT/$1.png"; }
 now() { date +%s.%N; }
-dt() { echo "$2 - $1" | bc; }
+# 不用 bc：它不是各发行版的标配（实测控制面 .32 上就没有），而缺了之后
+# dt 静默返回空、printf %.1f 打成 0.0，读起来像「应用秒开」——比直接报错难发现得多。
+dt() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.3f", b-a}'; }
 
 T_start=$(now)
 a shell "am start -W -n $PKG/cn.daboshi.cashier_app.MainActivity" 2>&1 | grep -E "TotalTime" | tr -d ' ' | sed 's/^/cold_start_ms=/; s/TotalTime://'
