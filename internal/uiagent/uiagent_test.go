@@ -50,11 +50,13 @@ func fakeADB(t *testing.T) (adbPath, dexPath string) {
 	t.Helper()
 	dir := t.TempDir()
 	adbPath = filepath.Join(dir, "adb")
-	// app_process 那条要挂住不退出，否则 Session.cmd 立刻结束，和真设备行为不符
-	script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = app_process ] && exec sleep 30; done\nexit 0\n"
+	// 记下每次调用，好断言「复用时没去推 dex / 启动进程」
+	logPath := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\nexit 0\n"
 	if err := os.WriteFile(adbPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("UIAGENT_TEST_ADBLOG", logPath)
 	dexPath = filepath.Join(dir, "uiagent.dex")
 	if err := os.WriteFile(dexPath, []byte("dex"), 0o644); err != nil {
 		t.Fatal(err)
@@ -165,5 +167,81 @@ func TestStartFailsWhenDeviceNeverReady(t *testing.T) {
 	_, err := Start(ctx, Options{Serial: "s", ADBPath: adbPath, DexPath: dexPath, LocalPort: port})
 	if err == nil {
 		t.Fatal("连不上时 Start 必须报错，不能返回一个用不了的会话")
+	}
+}
+
+func adbCalls(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(os.Getenv("UIAGENT_TEST_ADBLOG"))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// 设备上已有 agent 在应答时，Start 不该再推 dex 或拉进程——那正是省下
+// 1~2 s 冷启动的地方。复用失效的话性能悄悄退回去，测试之外看不出来。
+func TestStartReusesRunningAgent(t *testing.T) {
+	port := fakeDevice(t, "<hierarchy/>")
+	adbPath, dexPath := fakeADB(t)
+
+	s, err := Start(context.Background(), Options{
+		Serial: "s", ADBPath: adbPath, DexPath: dexPath, LocalPort: port,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if !s.Reused() {
+		t.Error("假设备一直在应答 PING，应当判定为复用")
+	}
+	calls := adbCalls(t)
+	if strings.Contains(calls, "push") {
+		t.Errorf("复用时不该推 dex：\n%s", calls)
+	}
+	if strings.Contains(calls, "app_process") {
+		t.Errorf("复用时不该再拉起进程：\n%s", calls)
+	}
+	if !strings.Contains(calls, "forward") {
+		t.Errorf("仍然要建 forward：\n%s", calls)
+	}
+}
+
+// Close 不能杀设备侧 agent，否则下次调用又要付冷启动。
+func TestCloseLeavesDeviceAgentRunning(t *testing.T) {
+	port := fakeDevice(t, "<hierarchy/>")
+	adbPath, dexPath := fakeADB(t)
+	s, err := Start(context.Background(), Options{
+		Serial: "s", ADBPath: adbPath, DexPath: dexPath, LocalPort: port,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := adbCalls(t)
+	_ = s.Close()
+	added := strings.TrimPrefix(adbCalls(t), before)
+	if strings.Contains(added, "pkill") {
+		t.Errorf("Close 不该杀设备侧 agent：%s", added)
+	}
+	if !strings.Contains(added, "forward --remove") {
+		t.Errorf("Close 应当撤掉 forward：%s", added)
+	}
+}
+
+func TestStopKillsDeviceAgent(t *testing.T) {
+	port := fakeDevice(t, "<hierarchy/>")
+	adbPath, dexPath := fakeADB(t)
+	s, err := Start(context.Background(), Options{
+		Serial: "s", ADBPath: adbPath, DexPath: dexPath, LocalPort: port,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := adbCalls(t)
+	_ = s.Stop(context.Background())
+	added := strings.TrimPrefix(adbCalls(t), before)
+	if !strings.Contains(added, "pkill") {
+		t.Errorf("Stop 应当收掉设备侧 agent：%s", added)
 	}
 }
