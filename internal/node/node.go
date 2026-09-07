@@ -163,6 +163,9 @@ func (n *Node) Running(ctx context.Context) ([]string, error) {
 	var names []string
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
+		if _, isSidecar := SidecarDeviceID(line); isSidecar {
+			continue // 出口边车不是设备，别混进设备清单
+		}
 		if strings.HasPrefix(line, "droidpool-") {
 			names = append(names, line)
 		}
@@ -342,10 +345,17 @@ func (n *Node) Reconcile(ctx context.Context, keep map[string]bool, ports []int)
 		if len(parts) > 1 {
 			portsCol = parts[1]
 		}
-		stale := strings.HasPrefix(name, "droidpool-") && !keep[name] && name != "droidpool-golden"
+		// 出口边车跟着它服务的那台设备走：设备留它就留，设备走它才走。
+		// 边车不在 keep 里（keep 装的是设备容器名），照前缀判定会被当成
+		// 残留删掉，而删掉 tun 边车就是把那台设备的网络拔了。
+		kept := keep[name]
+		if devID, isSidecar := SidecarDeviceID(name); isSidecar {
+			kept = keep[ContainerName(devID)]
+		}
+		stale := strings.HasPrefix(name, "droidpool-") && !kept && name != "droidpool-golden"
 		hogging := false
 		for p := range portSet {
-			if strings.Contains(portsCol, p) && !keep[name] {
+			if strings.Contains(portsCol, p) && !kept {
 				hogging = true
 			}
 		}
