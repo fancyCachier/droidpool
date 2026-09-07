@@ -48,6 +48,21 @@ once, zoom into one, and take over when an agent needs help.
   says so. See "HTTPS for the device wall" below.
 - **Human takeover protocol.** An operator can flag a lease as "human takeover";
   `droidpool status` exits 10 so the agent knows to stop and wait.
+- **Per-device egress.** Each device can route its public traffic through its own
+  SOCKS5 upstream, set from the device wall and switchable while a lease is
+  running — the upstream lives in a separate relay container, so changing it
+  rebuilds only that container and the device never notices. LAN stays direct:
+  adb, the backend and the control plane must not detour through a proxy, and
+  the device would go unreachable if they did. Off by default (`egress` in the
+  node config); the node needs the `tun` module loaded.
+- **Fast UI dumps.** `uiautomator dump` spends its time starting an ART process
+  and loading the framework jar, not walking the tree — measured 321–622 ms for
+  a 27-node hierarchy. A resident agent keeps the process and the UiAutomation
+  connection alive, which brings a dump down to ~20 ms. Available as
+  `droidpool ui-dump` and as `GET /api/devices/{id}/ui`.
+- **A camera, if you want one.** Redroid ships no camera at all. Feed an RTSP
+  stream into a v4l2loopback node on the host and the device gets a working
+  Camera2 device (`device/redroid-patches/`, needs a self-built image).
 
 ## Measured on an 8-core RK3588S with 16 GB RAM
 
@@ -147,6 +162,8 @@ playbook, including the UI-driving pitfalls we hit.
 | `heartbeat` / `watch` | Prove liveness once / continuously |
 | `release` | Return the device (it gets wiped and rebuilt) |
 | `devices` | List the pool |
+| `battery [--level 1..100]` | Fake a battery. Redroid has none, so apps read 0 % — `--status charging\|discharging\|full`, `--temp`, or `--reset` |
+| `ui-dump [--n 5]` | Dump the view hierarchy as XML through a resident agent (~25 ms vs ~380 ms for `uiautomator dump`) |
 
 ## Integrations
 
@@ -179,12 +196,15 @@ GET    /api/devices/{id}/ws            WebSocket: H.264 access units and device 
 GET    /api/devices/{id}/stream.h264   multipart H.264 (scrcpy), kept for curl-based measurements
 GET    /api/devices/{id}/stream.mjpg   multipart JPEG/PNG (screencap fallback)
 POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …} (fallback when no WebSocket session)
+GET    /api/devices/{id}/ui            view hierarchy XML via the resident agent
+PUT    /api/devices/{id}/egress        {proxy: "socks5://host:port"} — empty string means direct
 ```
 
 ## What it deliberately does not do
 
-- No Bluetooth, USB passthrough, camera or GMS inside the containers. Test those
-  on real hardware.
+- No Bluetooth, USB passthrough or GMS inside the containers. Test those on real
+  hardware. A camera is possible but not on by default: it needs a self-built
+  image plus an RTSP feed on the host, see `device/redroid-patches/`.
 - No hardware video encoding. RK3588 has one, but redroid's Android side only
   ships software codecs; the bottleneck is display readback, not encoding.
 - No multi-tenant auth. This is an internal-network tool.
@@ -201,6 +221,9 @@ internal/node         docker-over-SSH node driver, golden image, reconciliation
 internal/adb          screenshot / input via adb (fallback path)
 internal/scrcpy       scrcpy 4.1 protocol client: video + control socket
 internal/api          HTTP API, SSE hub, device wall (embedded htmx pages)
+internal/uiagent      client for the resident on-device UI dump agent
+device/uiagent        that agent's source (Java, built to a dex with the public SDK)
+device/redroid-patches  camera support for a self-built redroid image + host RTSP pipeline
 bench/                reproducible smoke, login-flow, concurrency sweep scripts
 deploy/               systemd unit, config template, deploy script
 docs/                 roadmap, baselines, design comparisons (Chinese)
