@@ -24,11 +24,17 @@ else
 # 外接摄像头：画面来自宿主的 v4l2loopback（RTSP → ffmpeg → /dev/videoN），
 # 容器以 --device 拿到该节点。用 AOSP 现成的 external provider，不写 HAL 代码。
 #
+# 用 AIDL 版而不是 HIDL 的 @2.7-external-service：Android 14 的 camera
+# provider 已转 AIDL，HIDL 那个模块虽然还在 Android.bp 里，但对这个 product
+# 并没有产出（module-info.json 里只有 -V1-external-service 与
+# @2.7-external-vsock-service）。写 HIDL 的话编译不报错，产物里却没有
+# 二进制，要到设备上才发现 HAL 根本没起。
+#
 # 只拷 camera.external.xml：它本身就声明了 android.hardware.camera.any，
 # 而 camera.any.xml 这个文件在 AOSP 14 里并不存在（写上去 ninja 直接报
 # missing and no known rule to make it）。
 PRODUCT_PACKAGES += \
-    android.hardware.camera.provider@2.7-external-service
+    android.hardware.camera.provider-V1-external-service
 
 PRODUCT_COPY_FILES += \
     frameworks/native/data/etc/android.hardware.camera.external.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.camera.external.xml \
@@ -46,14 +52,10 @@ else
 import io, sys
 p = sys.argv[1]
 s = io.open(p, encoding='utf-8').read()
-frag = '''    <hal format="hidl">
+frag = '''    <hal format="aidl">
         <name>android.hardware.camera.provider</name>
-        <transport>hwbinder</transport>
-        <version>2.7</version>
-        <interface>
-            <name>ICameraProvider</name>
-            <instance>external/0</instance>
-        </interface>
+        <version>1</version>
+        <fqname>ICameraProvider/external/0</fqname>
     </hal>
 </manifest>'''
 assert s.count('</manifest>') == 1, 'manifest.xml 结构意外'
