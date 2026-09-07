@@ -214,3 +214,42 @@ func TestRunningExcludesSidecars(t *testing.T) {
 		t.Errorf("Running 应当只返回设备，实际 %v", names)
 	}
 }
+
+func TestCameraDevicePerDevice(t *testing.T) {
+	n := testNode(&fakeRunner{})
+	if got := n.CameraDevice("3588-a-1"); got != "" {
+		t.Errorf("未配置时应当为空，得到 %q", got)
+	}
+	n.CameraVideoBase = 20
+	// 一台设备一个节点：共用的话谁先打开谁独占，其余拿不到画面
+	for id, want := range map[string]string{
+		"3588-a-1": "/dev/video21",
+		"3588-a-8": "/dev/video28",
+	} {
+		if got := n.CameraDevice(id); got != want {
+			t.Errorf("CameraDevice(%q) = %q，期望 %q", id, got, want)
+		}
+	}
+}
+
+func TestCreatePassesCameraDevice(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	if err := n.Create(context.Background(), "3588-a-3", 5563, ""); err != nil {
+		t.Fatal(err)
+	}
+	if j := strings.Join(f.lastMatching("--name droidpool-3588-a-3"), " "); !strings.Contains(j, "--device /dev/video23") {
+		t.Errorf("未透传摄像头节点：%s", j)
+	}
+}
+
+func TestCreateOmitsCameraWhenDisabled(t *testing.T) {
+	f := &fakeRunner{}
+	if err := testNode(f).Create(context.Background(), "3588-a-3", 5563, ""); err != nil {
+		t.Fatal(err)
+	}
+	if j := strings.Join(f.lastMatching("--name droidpool-3588-a-3"), " "); strings.Contains(j, "/dev/video") {
+		t.Errorf("未启用时不该透传任何 video 节点：%s", j)
+	}
+}

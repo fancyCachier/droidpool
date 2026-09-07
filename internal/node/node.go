@@ -41,7 +41,33 @@ type Node struct {
 	// 每台设备一条独立链路，出口地址可在运行中热切换。见 egress.go。
 	Egress    bool
 	EgressDNS string // 隧道内用的解析器，如 223.5.5.5；空则沿用 docker 默认
-	Runner    Runner
+	// CameraVideoBase 非 0 时给每台设备透传 /dev/video<base+序号>。见 CameraDevice。
+	CameraVideoBase int
+	Runner          Runner
+}
+
+// CameraDevice 返回该设备要透传的 v4l2 节点路径，未启用时为空。
+//
+// 一台设备一个节点：external camera HAL 会把它看到的每个 /dev/video* 都当成
+// 一个摄像头，几台设备共用一个节点的话，谁先打开谁独占，其余的拿不到画面。
+func (n *Node) CameraDevice(deviceID string) string {
+	if n.CameraVideoBase == 0 {
+		return ""
+	}
+	return "/dev/video" + strconv.Itoa(n.CameraVideoBase+trailingNumber(deviceID))
+}
+
+// trailingNumber 取字符串末尾那串数字（3588-a-1 → 1），没有则 0。
+func trailingNumber(s string) int {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	v, err := strconv.Atoi(s[i:])
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 func (n *Node) docker(ctx context.Context, args ...string) (string, error) {
@@ -75,6 +101,9 @@ func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBas
 		args = append(args, "--network", "container:"+TunName(deviceID))
 	} else {
 		args = append(args, "-p", strconv.Itoa(port)+":5555")
+	}
+	if dev := n.CameraDevice(deviceID); dev != "" {
+		args = append(args, "--device", dev)
 	}
 	if overlayBase != "" {
 		args = append(args,

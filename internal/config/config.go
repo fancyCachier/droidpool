@@ -80,6 +80,10 @@ type Node struct {
 	// EgressDNS 隧道内用的解析器，如 223.5.5.5。留空则沿用 docker 默认，
 	// 但那通常是宿主的 resolver，在隧道里不可达，域名会全部解析不了。
 	EgressDNS string `toml:"egress_dns"`
+	// CameraVideoBase 非 0 时，每台设备透传 /dev/video<base+序号>，
+	// 配合自建镜像里的外接摄像头 HAL。画面由宿主侧的 rtsp-camera.sh 灌进去。
+	// 需要节点跑过 deploy/node/setup-node.sh（v4l2loopback）。
+	CameraVideoBase int `toml:"camera_video_base"`
 }
 
 // Duration 让 TOML 里能写 "4h" 这样的字符串。

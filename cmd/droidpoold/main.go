@@ -55,6 +55,7 @@ func run() error {
 		Name: nc.Name, DockerHost: nc.DockerHost, ADBHost: nc.ADBHost,
 		Image: nc.Image, DataRoot: nc.DataRoot, BootArgs: nc.BootArgs,
 		Egress: nc.Egress, EgressDNS: nc.EgressDNS,
+		CameraVideoBase: nc.CameraVideoBase,
 	}
 	mgr := &pool.Manager{
 		NodeName: nc.Name, ADBHost: nc.ADBHost, Driver: nd, Store: st,
