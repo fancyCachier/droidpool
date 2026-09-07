@@ -9,7 +9,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 NODE_SSH=${NODE_SSH:-office-3588-sa}; NODE_IP=${NODE_IP:-192.168.14.54}
 APK=${APK:?需要 APK=path/to/app-debug.apk}
 LEVELS=${LEVELS:-"1 2 4 6 8"}; ROUNDS=${ROUNDS:-3}; ROUNDS_N1=${ROUNDS_N1:-5}; IDLE_S=${IDLE_S:-45}
-BASE_PORT=5560; PKG=cn.daboshi.cashier_app.dev
+# 5600 段：生产池占 5561~5576（deploy/config.toml 的 port_range），撞上去
+# 要么绑不上端口，要么被 droidpool 的对账当成抢占端口的残留删掉。
+BASE_PORT=${BASE_PORT:-5600}; PKG=cn.daboshi.cashier_app.dev
 export ADB=${ADB:-adb}
 OUT=${OUT:-$HERE/out/sweep-$(date +%Y%m%d-%H%M%S)}; mkdir -p "$OUT"
 MAXN=$(echo "$LEVELS" | awk '{print $NF}')
@@ -49,7 +51,7 @@ ssh "$NODE_SSH" "mkdir -p /tmp/bench" && scp -q "$HERE/redroid-up.sh" "$HERE/sam
 
 for n in $LEVELS; do
   log "=== N=$n ==="
-  ssh "$NODE_SSH" "/tmp/bench/node-ensure.sh $n" | tee -a "$OUT/sweep.log"
+  ssh "$NODE_SSH" "/tmp/bench/node-ensure.sh $n $BASE_PORT" | tee -a "$OUT/sweep.log"
   for i in $(seq 1 "$n"); do ensure_app "$(dev "$i")"; done | tee -a "$OUT/sweep.log"
   mkdir -p "$OUT/N$n"
   sampler_start "sample-N$n"
