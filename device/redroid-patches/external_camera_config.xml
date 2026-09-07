@@ -1,8 +1,9 @@
 <!-- redroid 外接摄像头 HAL 配置。
-     画面由宿主灌进 v4l2loopback（RTSP → ffmpeg → /dev/videoN），容器
-     以 --device 拿到该节点，HAL 把它当成一个普通 UVC 摄像头。
+     画面由宿主灌进 v4l2loopback（RTSP 经 ffmpeg 写入 /dev/videoN），容器
+     用 docker 的 device 参数拿到该节点，HAL 把它当成普通 UVC 摄像头。
      参数以 AOSP device/linaro/dragonboard 的样例为基准，按收银机场景收窄：
-     只做到 720p，redroid 是软件编解码，再高没有意义只会更卡。 -->
+     只做到 720p，redroid 是软件编解码，再高没有意义只会更卡。
+     注意：XML 注释里不能出现连续两个连字符，xmllint 会直接判语法错。 -->
 <ExternalCamera>
     <Provider>
         <ignore> <!-- 宿主的编解码节点不是摄像头，别让 HAL 认领 -->

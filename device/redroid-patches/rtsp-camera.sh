@@ -33,11 +33,22 @@ start)
   if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then
     echo "$DEV 已有推流在跑（pid $(cat "$PID")），先 stop"; exit 1
   fi
-  # -rtsp_transport tcp：UDP 丢包在容器里表现为花屏，排查成本高，直接走 TCP
-  # -pix_fmt yuyv422：external camera HAL 认这个，用别的它会拒绝这个设备
+  # 设备节点必须让容器里的 cameraserver 读得到。宿主上它是 root:video 0660，
+  # 而 HAL 跑在 cameraserver 名下、组是 audio/camera/input/drmrpc/usb——没有
+  # video，直接 EACCES。容器和宿主共用 uid 空间，宿主的 video 组（gid 44）
+  # 在 Android 侧也不对应 camera（1006），所以只能放开权限位。
+  chmod 0666 "$DEV"
+
+  # 必须编成 MJPEG。AOSP 的 external camera HAL 只认两种 fourcc：
+  #   const std::array<uint32_t, 2> kSupportedFourCCs{{V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_Z16}};
+  # （Z16 是深度相机）。喂 YUYV 之类的它会判 "Unsupported format found" 并把
+  # 这个设备整个丢掉，症状是 /dev/video* 在容器里看得见、相机却报 0 个设备
+  # ——redroid-doc#178 那个悬着的问题就是这个形状。
+  #
+  # -rtsp_transport tcp：UDP 丢包在容器里表现为花屏，排查成本高，直接走 TCP。
   nohup ffmpeg -hide_banner -loglevel warning -nostdin \
     -rtsp_transport tcp -re -i "$URL" \
-    -vf scale=1280:720 -r 15 -pix_fmt yuyv422 -f v4l2 "$DEV" \
+    -vf scale=1280:720 -r 15 -c:v mjpeg -q:v 5 -f v4l2 "$DEV" \
     > "$PIDDIR/$N.log" 2>&1 &
   echo $! > "$PID"
   sleep 2
