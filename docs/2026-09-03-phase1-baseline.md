@@ -84,7 +84,7 @@
 | 专项 | 状态 |
 |---|---|
 | A 渲染器（Impeller/Vulkan on SwiftShader） | ✅ Phase 0 已通过，见 `2026-09-03-phase0-smoke.md` |
-| B GPU host 模式（宿主已有补丁版 panfrost） | 未做 |
+| B GPU host 模式 | ❌ 2026-09-06 做了，不通，见 `2026-09-06-gpu-host-spike.md`。「宿主已有补丁版 panfrost」这个前提本身是错的 |
 | C overlayfs 共享 data（`use_redroid_overlayfs`） | 未做，是 §5 复位机制的前提 |
 | D scrcpy 软编码成本 | 未做，决定设备墙放大视图的并发路数 |
 
