@@ -168,3 +168,75 @@ func TestClaimStaysQuietFromSubdirOfOwnWorktree(t *testing.T) {
 		t.Errorf("在自己 worktree 的子目录里复用不该提示，stderr = %q", stderr())
 	}
 }
+
+// TestBatterySetsLevelBeforePresent 锁住一条安全不变式：level 必须先于 present。
+//
+// 反过来的话（present=1 而 level 还是 0），Android 判定电量耗尽发起关机，
+// 容器约 20 s 后退出——2026-09-06 实测把一台在线设备干下线过。关机是异步的，
+// 期间后面的命令还照常返回，所以一旦顺序写反，测试之外几乎不可能靠现场归因。
+func TestBatterySetsLevelBeforePresent(t *testing.T) {
+	log := batteryFakeADB(t)
+	cmdBattery([]string{"--level", "67", "--status", "discharging"})
+
+	got := batteryCalls(t, log)
+	lvl, pres := indexOfCall(got, "set level 67"), indexOfCall(got, "set present 1")
+	if lvl < 0 || pres < 0 {
+		t.Fatalf("没发出 set level / set present：%v", got)
+	}
+	if lvl > pres {
+		t.Errorf("set level 必须早于 set present，实际顺序：%v", got)
+	}
+	if i := indexOfCall(got, "unplug"); i < 0 {
+		t.Errorf("discharging 应当 unplug，实际：%v", got)
+	}
+}
+
+func TestBatteryChargingPlugsAC(t *testing.T) {
+	log := batteryFakeADB(t)
+	cmdBattery([]string{"--level", "50", "--status", "charging"})
+
+	got := batteryCalls(t, log)
+	if indexOfCall(got, "set ac 1") < 0 {
+		t.Errorf("charging 应当插上 ac，实际：%v", got)
+	}
+	if indexOfCall(got, "unplug") >= 0 {
+		t.Errorf("charging 不该 unplug，实际：%v", got)
+	}
+}
+
+// batteryFakeADB 用一个把参数记进文件的假 adb 挡住真设备，返回日志路径。
+func batteryFakeADB(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls")
+	script := "#!/bin/sh\necho \"$@\" >> " + log + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "adb"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DROIDPOOL_SESSION", "")
+	t.Chdir(t.TempDir())
+	if err := saveState(leaseState{ADBAddr: "127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	return log
+}
+
+func batteryCalls(t *testing.T, log string) []string {
+	t.Helper()
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("假 adb 没被调用: %v", err)
+	}
+	return strings.Split(strings.TrimSpace(string(b)), "\n")
+}
+
+// indexOfCall 找出第一条含 want 的调用下标，没有则 -1。
+func indexOfCall(calls []string, want string) int {
+	for i, c := range calls {
+		if strings.Contains(c, want) {
+			return i
+		}
+	}
+	return -1
+}

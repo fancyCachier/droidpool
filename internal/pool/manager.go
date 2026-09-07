@@ -15,6 +15,11 @@ type NodeDriver interface {
 	// 宿主上的数据目录还在，上一个 agent 的状态会留给下一个。
 	WipeData(ctx context.Context, deviceID, overlayBase string) error
 	WaitBoot(ctx context.Context, deviceID string, timeout time.Duration) error
+	// FinishEgress 在设备起来之后把流量导进出口隧道。必须等 Android 的 netd
+	// 装完它自己的路由规则，早了会被覆盖。未开出口时是空操作。
+	FinishEgress(ctx context.Context, deviceID string) error
+	// SetEgress 换这台设备的上游出口。只重建中继容器，设备不重启。
+	SetEgress(ctx context.Context, deviceID, proxy string) error
 }
 
 // DeviceStore 是 Manager 需要的存储能力子集。
@@ -23,6 +28,7 @@ type DeviceStore interface {
 	GetDevice(id string) (*Device, error)
 	ListDevices() ([]*Device, error)
 	SetDeviceState(id string, to DeviceState) error
+	SetDeviceEgress(id, proxy string) error
 }
 
 // Manager 负责把设备拉起来、复位、以及节点上的容器与库内记录对账。
@@ -98,6 +104,11 @@ func (m *Manager) createOne(ctx context.Context, i int) error {
 		_ = m.Store.UpsertDevice(d)
 		return err
 	}
+	if err := m.applyEgress(ctx, id); err != nil {
+		// 出口没接上不至于让设备不可用（此时是直连），但要留下痕迹，
+		// 否则「以为走了代理其实没走」比直接失败更危险。
+		m.log().Error("出口配置失败，该设备当前为直连", "device", id, "err", err)
+	}
 	d.State = StateReady
 	d.LastHealthy = time.Now()
 	if err := m.Store.UpsertDevice(d); err != nil {
@@ -105,6 +116,30 @@ func (m *Manager) createOne(ctx context.Context, i int) error {
 	}
 	m.log().Info("设备就绪", "device", id, "adb", d.ADBAddr)
 	return nil
+}
+
+// applyEgress 把库里记着的出口设置落到刚起来的设备上。
+// 设备重建（复位、节点重启）后容器是全新的，出口不会自己回来，必须重放一次。
+func (m *Manager) applyEgress(ctx context.Context, deviceID string) error {
+	if err := m.Driver.FinishEgress(ctx, deviceID); err != nil {
+		return err
+	}
+	d, err := m.Store.GetDevice(deviceID)
+	if err != nil || d.EgressProxy == "" {
+		return err
+	}
+	return m.Driver.SetEgress(ctx, deviceID, d.EgressProxy)
+}
+
+// SetEgress 改一台设备的上游出口并落库。中继重建不影响设备与租约。
+func (m *Manager) SetEgress(ctx context.Context, deviceID, proxy string) error {
+	if _, err := m.Store.GetDevice(deviceID); err != nil {
+		return err
+	}
+	if err := m.Driver.SetEgress(ctx, deviceID, proxy); err != nil {
+		return err
+	}
+	return m.Store.SetDeviceEgress(deviceID, proxy)
 }
 
 // ReconcileStore 让库与节点对齐，在 Ensure 之前跑。

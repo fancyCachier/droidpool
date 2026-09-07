@@ -427,3 +427,76 @@ func TestReleaseWithoutResetter(t *testing.T) {
 		t.Errorf("无 Resetter 时 release 也应 204，得到 %d", rec.Code)
 	}
 }
+
+type fakeEgress struct {
+	mu  sync.Mutex
+	set map[string]string
+	err error
+}
+
+func (f *fakeEgress) SetEgress(_ context.Context, id, proxy string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	if f.set == nil {
+		f.set = map[string]string{}
+	}
+	f.set[id] = proxy
+	return nil
+}
+
+func TestSetEgressAppliesAndValidates(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	fe := &fakeEgress{}
+	s.Egress = fe
+
+	rec := do(t, h, "PUT", "/api/devices/dev1/egress",
+		map[string]any{"proxy": "socks5://10.0.0.9:1080"}, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态 %d：%s", rec.Code, rec.Body)
+	}
+	if fe.set["dev1"] != "socks5://10.0.0.9:1080" {
+		t.Errorf("未下发：%v", fe.set)
+	}
+
+	// 空串 = 直连，是合法输入
+	if rec := do(t, h, "PUT", "/api/devices/dev1/egress",
+		map[string]any{"proxy": ""}, true); rec.Code != http.StatusOK {
+		t.Errorf("留空应当表示直连，实际 %d：%s", rec.Code, rec.Body)
+	}
+
+	// http:// 会被 gost 当成 HTTP 代理，症状是静悄悄连不上外网，必须挡住
+	for _, bad := range []string{"http://1.2.3.4:8080", "1.2.3.4:1080", "socks5://noport"} {
+		if rec := do(t, h, "PUT", "/api/devices/dev1/egress",
+			map[string]any{"proxy": bad}, true); rec.Code != http.StatusBadRequest {
+			t.Errorf("%q 应当被拒，实际 %d", bad, rec.Code)
+		}
+	}
+}
+
+func TestSetEgressNeedsBackend(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	s.Egress = &fakeEgress{}
+	// 与设备墙其余接口一样不要 token —— 页面自己没有
+	if rec := do(t, h, "PUT", "/api/devices/dev1/egress",
+		map[string]any{"proxy": ""}, false); rec.Code != http.StatusOK {
+		t.Errorf("设备墙接口不该要 token，实际 %d：%s", rec.Code, rec.Body)
+	}
+	// 没接后端时明确报 503，而不是假装成功
+	s.Egress = nil
+	if rec := do(t, h, "PUT", "/api/devices/dev1/egress",
+		map[string]any{"proxy": ""}, true); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("未接后端应当 503，实际 %d", rec.Code)
+	}
+}
+
+func TestSetEgressUnknownDevice(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	s.Egress = &fakeEgress{err: store.ErrNotFound}
+	if rec := do(t, h, "PUT", "/api/devices/nope/egress",
+		map[string]any{"proxy": ""}, true); rec.Code != http.StatusNotFound {
+		t.Errorf("设备不存在应当 404，实际 %d", rec.Code)
+	}
+}

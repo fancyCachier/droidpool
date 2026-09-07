@@ -32,6 +32,12 @@ max_devices = 8
 data_root   = "/data/droidpool"
 # 分辨率与密度 = 收银机实机 Sunmi D1s 2nd 实测（1366×768 @ 160 dpi）
 # use_memfd 不可省：.54 内核无 ashmem
+# 公网出口：打开后每台设备多起两个辅助容器（tun 边车 + socks5 中继），
+# 公网流量经中继落地、内网（Edge/adb/控制面）始终直连；
+# 具体出口地址每台设备在设备墙上单独设，运行中可改且不中断租约。
+# 前提：节点上要有 tun 模块（modprobe tun，并写进 /etc/modules-load.d/）。
+egress     = false
+egress_dns = "223.5.5.5"
 boot_args = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366 androidboot.redroid_height=768 androidboot.redroid_dpi=160 androidboot.redroid_gpu_mode=guest"
 
 # --- watchdog：防止 agent 僵死后一直占着机器 ---

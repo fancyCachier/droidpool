@@ -383,3 +383,51 @@ func TestActiveLeasesExcludesReleased(t *testing.T) {
 		t.Errorf("归还的租约不应出现在活跃列表，得到 %+v", ls)
 	}
 }
+
+func TestSetDeviceEgressRoundTrip(t *testing.T) {
+	s := open(t)
+	d := &pool.Device{ID: "d1", Node: "n", Container: "c", ADBAddr: "1.2.3.4:5555",
+		State: pool.StateReady, CreatedAt: time.Now()}
+	if err := s.UpsertDevice(d); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetDevice("d1"); got.EgressProxy != "" {
+		t.Errorf("默认应为直连，实际 %q", got.EgressProxy)
+	}
+	if err := s.SetDeviceEgress("d1", "socks5://up:1080"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetDevice("d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EgressProxy != "socks5://up:1080" {
+		t.Errorf("EgressProxy = %q", got.EgressProxy)
+	}
+	if err := s.SetDeviceEgress("nope", "x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("对不存在的设备应返回 ErrNotFound，实际 %v", err)
+	}
+}
+
+// UpsertDevice 每次健康检查都会跑；它绝不能把用户在 WebUI 上设的出口冲掉。
+func TestUpsertDeviceKeepsEgress(t *testing.T) {
+	s := open(t)
+	d := &pool.Device{ID: "d1", Node: "n", Container: "c", ADBAddr: "1.2.3.4:5555",
+		State: pool.StateReady, CreatedAt: time.Now()}
+	if err := s.UpsertDevice(d); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetDeviceEgress("d1", "socks5://up:1080"); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟一次健康检查回写：拿到的对象没带 EgressProxy 也不该覆盖
+	d.HealthFails = 1
+	d.EgressProxy = ""
+	if err := s.UpsertDevice(d); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetDevice("d1")
+	if got.EgressProxy != "socks5://up:1080" {
+		t.Errorf("健康检查回写把出口冲掉了：%q", got.EgressProxy)
+	}
+}
