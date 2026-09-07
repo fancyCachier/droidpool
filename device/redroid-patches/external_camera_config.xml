@@ -13,9 +13,16 @@
         <MaxJpegBufferSize bytes="3145728"/>
         <NumVideoBuffers count="4"/>
         <NumStillBuffers count="2"/>
+        <!-- fpsBound 一律给到 30：v4l2loopback 的设备默认就报 30 fps，而设备报的
+             fps 一旦超过这里的上限，HAL 会 initCameraCharacteristics 失败并把整个
+             设备丢掉（相机数恒为 0，报错却只说 characteristics 失败）。
+             把上限压到 15 的话，就必须有人在推流之后到宿主上跑
+             v4l2loopback-ctl set-fps —— 而控制面只会 docker，做不到这件事，
+             等于给运维留了一个必踩的坑。实际帧率由推流侧的 -r 决定，
+             这里只是「允许到多少」。 -->
         <FpsList>
             <Limit width="640" height="480" fpsBound="30.0"/>
-            <Limit width="1280" height="720" fpsBound="15.0"/>
+            <Limit width="1280" height="720" fpsBound="30.0"/>
         </FpsList>
     </Device>
 </ExternalCamera>

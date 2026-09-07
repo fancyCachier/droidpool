@@ -192,7 +192,7 @@ type wallDevice struct {
 	LeaseID  string     `json:"lease_id,omitempty"`
 	// Egress 这台设备的公网出口，空 = 直连。设备页据此回显当前设置。
 	Egress string `json:"egress_proxy,omitempty"`
-	// Camera 这台设备的摄像头画面源，空 = 未推流。
+	// Camera 这台设备的摄像头画面源，空 = 未推流。凭据已打码。
 	Camera string `json:"camera_rtsp,omitempty"`
 }
 
@@ -213,7 +213,7 @@ func (s *Server) wallSnapshot() map[string]any {
 	}
 	out := make([]wallDevice, 0, len(devices))
 	for _, d := range devices {
-		wd := wallDevice{ID: d.ID, ADBAddr: d.ADBAddr, State: string(d.State), Egress: d.EgressProxy, Camera: d.CameraRTSP}
+		wd := wallDevice{ID: d.ID, ADBAddr: d.ADBAddr, State: string(d.State), Egress: d.EgressProxy, Camera: maskURLCredentials(d.CameraRTSP)}
 		if i, ok := byDevice[d.ID]; ok {
 			l := leases[i]
 			exp := l.ExpiresAt
