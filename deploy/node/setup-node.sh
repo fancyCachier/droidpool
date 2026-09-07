@@ -18,8 +18,11 @@ echo "== v4l2loopback：外接摄像头用（device/redroid-patches）"
 if modinfo v4l2loopback >/dev/null 2>&1; then
   # Ubuntu 的 rockchip 内核自带这个模块，不需要 DKMS 现编。
   # devices=8 对应 max_devices，video_nr 从 20 起避开板载的编解码节点。
+  # exclusive_caps 要逐个写满 8 个：它是数组参数，写一个 1 只作用于第 0 个，
+  # 其余设备会同时暴露 Video Capture 与 Video Output（实测 video21 就是
+  # 0x05200003 两个都有），而 exclusive 模式才是摄像头 HAL 期望的形态。
   cat > /etc/modprobe.d/droidpool-v4l2.conf <<'MODCONF'
-options v4l2loopback devices=8 video_nr=20,21,22,23,24,25,26,27 card_label=droidpool-cam0,droidpool-cam1,droidpool-cam2,droidpool-cam3,droidpool-cam4,droidpool-cam5,droidpool-cam6,droidpool-cam7 exclusive_caps=1
+options v4l2loopback devices=8 video_nr=20,21,22,23,24,25,26,27 card_label=droidpool-cam0,droidpool-cam1,droidpool-cam2,droidpool-cam3,droidpool-cam4,droidpool-cam5,droidpool-cam6,droidpool-cam7 exclusive_caps=1,1,1,1,1,1,1,1
 MODCONF
   echo v4l2loopback > /etc/modules-load.d/droidpool-v4l2.conf
   # v4l2loopback-ctl 用来设 fps。不设的话设备报 30 fps，超出
