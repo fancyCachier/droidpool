@@ -114,7 +114,14 @@ func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBas
 		args = append(args, "-p", strconv.Itoa(port)+":5555")
 	}
 	if dev := n.CameraDevice(deviceID); dev != "" {
-		args = append(args, "--device", dev)
+		// --device 只是让节点出现在容器里；真正决定 HAL 认哪个的是下面这份
+		// 按设备生成的配置——特权容器看得见宿主整个 /dev，光靠 --device
+		// 隔离不了。见 camera.go 的 WriteCameraConfig。
+		if err := n.WriteCameraConfig(ctx, deviceID); err != nil {
+			return err
+		}
+		args = append(args, "--device", dev,
+			"-v", n.camConfigPath(deviceID)+":/vendor/etc/external_camera_config.xml:ro")
 	}
 	if overlayBase != "" {
 		args = append(args,

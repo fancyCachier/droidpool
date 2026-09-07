@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // 摄像头画面链路：宿主上每台设备一个 v4l2loopback 节点，一个 ffmpeg 容器把
@@ -25,6 +26,66 @@ const (
 	// 相机数恒为 0，而错误信息只说 characteristics 失败，看不出是帧率的事。
 	camFPS = 15
 )
+
+// camConfigPath 每台设备自己那份 external camera 配置在宿主上的位置。
+func (n *Node) camConfigPath(deviceID string) string {
+	return n.DataRoot + "/camcfg/" + deviceID + ".xml"
+}
+
+// WriteCameraConfig 给这台设备生成一份只认它自己那个 v4l2 节点的 HAL 配置。
+//
+// 为什么非做不可：--device 在这里**不构成隔离**。redroid 必须 --privileged
+// （binder 要求），而特权容器直接看得到宿主整个 /dev——实测每台设备都能列出
+// 全部 8 个 /dev/video*。而 external camera HAL 会把它看到的每个 /dev/video*
+// 都当成一个摄像头。没推流的节点因为拿不到格式会被 HAL 自己丢掉，所以平时
+// 看不出问题；一旦有别的设备在推流，那一路就会出现在**每台**设备的相机列表里
+// ——设备 1 能读到设备 3 的画面。
+//
+// HAL 的配置路径写死在 /vendor/etc/external_camera_config.xml（AOSP 的
+// kDefaultCfgPath），但那是容器内的路径，按设备挂一份进去就能覆盖掉镜像里
+// 那份公共的。<ignore> 段收的是设备号，把不属于自己的号全列进去。
+func (n *Node) WriteCameraConfig(ctx context.Context, deviceID string) error {
+	if n.CameraVideoBase == 0 {
+		return nil
+	}
+	mine := n.CameraVideoBase + trailingNumber(deviceID)
+	var ignores strings.Builder
+	// 覆盖整个号段：不知道节点上到底建了几个，多列几个无害
+	for i := n.CameraVideoBase; i <= n.CameraVideoBase+camMaxDevices; i++ {
+		if i != mine {
+			fmt.Fprintf(&ignores, "<id>%d</id>", i)
+		}
+	}
+	cfg := fmt.Sprintf(camConfigTmpl, ignores.String())
+	dir := n.DataRoot + "/camcfg"
+	// 经一次性容器写，不依赖节点的 sudo——与 WipeData 同一条权限通道
+	_, err := n.docker(ctx, "run", "--rm", "-v", dir+":/out", "busybox:stable",
+		"sh", "-c", "cat > /out/"+deviceID+".xml <<'DROIDPOOLEOF'\n"+cfg+"\nDROIDPOOLEOF")
+	if err != nil {
+		return fmt.Errorf("写 %s 的摄像头配置: %w", deviceID, err)
+	}
+	return nil
+}
+
+// camMaxDevices 号段宽度，够覆盖 max_devices。
+const camMaxDevices = 16
+
+// camConfigTmpl 与 device/redroid-patches/external_camera_config.xml 保持一致，
+// 只是 <ignore> 由每台设备各自填。fpsBound 给到 30 的理由见那个文件的注释。
+const camConfigTmpl = `<ExternalCamera>
+    <Provider>
+        <ignore>%s</ignore>
+    </Provider>
+    <Device>
+        <MaxJpegBufferSize bytes="3145728"/>
+        <NumVideoBuffers count="4"/>
+        <NumStillBuffers count="2"/>
+        <FpsList>
+            <Limit width="640" height="480" fpsBound="30.0"/>
+            <Limit width="1280" height="720" fpsBound="30.0"/>
+        </FpsList>
+    </Device>
+</ExternalCamera>`
 
 // CamFeedName 某台设备的推流容器名。
 func CamFeedName(deviceID string) string { return "droidpool-cam-" + deviceID }

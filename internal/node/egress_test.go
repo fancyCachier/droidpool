@@ -316,3 +316,49 @@ func TestReconcileKeepsCamFeedOfLiveDevice(t *testing.T) {
 		t.Errorf("在用设备的推流容器被删了：%v", removed)
 	}
 }
+
+// --device 在特权容器里不构成隔离：redroid 必须 --privileged，而特权容器
+// 看得见宿主整个 /dev。真正决定 HAL 认哪个节点的是按设备挂进去的配置。
+// 不挂的话，一台设备在推流，那一路会出现在**每台**设备的相机列表里。
+func TestCreateMountsPerDeviceCameraConfig(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	if err := n.Create(context.Background(), "3588-a-3", 5563, ""); err != nil {
+		t.Fatal(err)
+	}
+	j := strings.Join(f.lastMatching("--name droidpool-3588-a-3"), " ")
+	want := "/data/droidpool/camcfg/3588-a-3.xml:/vendor/etc/external_camera_config.xml:ro"
+	if !strings.Contains(j, want) {
+		t.Errorf("未挂按设备的摄像头配置\n实际: %s", j)
+	}
+}
+
+// 配置里要把不属于自己的节点全部 ignore 掉，自己那个不能被 ignore。
+func TestWriteCameraConfigIgnoresOtherNodes(t *testing.T) {
+	f := &fakeRunner{}
+	n := testNode(f)
+	n.CameraVideoBase = 20
+	if err := n.WriteCameraConfig(context.Background(), "3588-a-3"); err != nil {
+		t.Fatal(err)
+	}
+	j := strings.Join(f.lastMatching("camcfg"), " ")
+	if strings.Contains(j, "<id>23</id>") {
+		t.Error("把自己那个节点 ignore 掉了，相机会变成 0 个")
+	}
+	for _, other := range []string{"<id>21</id>", "<id>22</id>", "<id>24</id>", "<id>28</id>"} {
+		if !strings.Contains(j, other) {
+			t.Errorf("没 ignore %s —— 别的设备在推流时这一路会串到本设备", other)
+		}
+	}
+}
+
+func TestWriteCameraConfigNoopWhenDisabled(t *testing.T) {
+	f := &fakeRunner{}
+	if err := testNode(f).WriteCameraConfig(context.Background(), "3588-a-3"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("未启用摄像头时不该写配置：%v", f.calls)
+	}
+}
