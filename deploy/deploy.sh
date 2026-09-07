@@ -53,6 +53,22 @@ sleep 2
 systemctl is-active droidpoold
 REMOTE
 
+# 节点侧脚本：从 config.toml 的 docker_host 认出节点，把 deploy/node/ 推过去。
+# 之前不带这一步，setup-node.sh 与 pull-image.sh 只能手工 scp——节点重装一次
+# 就得靠人记得有这两个东西。推过去只是放着，不自动执行：setup-node.sh 要 root，
+# 而且加载内核模块这种事该由人明确触发。
+NODE_SSH=$(sed -n 's|^docker_host *= *"ssh://\(.*\)"|\1|p' "$HERE/deploy/config.toml" | head -1)
+if [ -n "$NODE_SSH" ]; then
+  echo "→ 推节点脚本到 $NODE_SSH"
+  if ssh -o BatchMode=yes -o ConnectTimeout=8 "$NODE_SSH" 'mkdir -p ~/droidpool-node' 2>/dev/null; then
+    scp -q "$HERE"/deploy/node/*.sh "$NODE_SSH:~/droidpool-node/" && \
+      ssh -o BatchMode=yes "$NODE_SSH" 'chmod +x ~/droidpool-node/*.sh' && \
+      echo "  已放到 ~/droidpool-node/（首次装节点跑 sudo bash ~/droidpool-node/setup-node.sh）"
+  else
+    echo "  ⚠ 连不上节点，跳过（节点脚本要手工 scp）"
+  fi
+fi
+
 echo "→ 探活（端口应立即可达，补池在后台）"
 for i in $(seq 1 10); do
   ssh "$HOST" 'curl -sf -m 2 http://127.0.0.1:8600/api/health' >/dev/null 2>&1 && break
