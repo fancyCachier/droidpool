@@ -37,7 +37,11 @@ type Node struct {
 	Image      string
 	DataRoot   string
 	BootArgs   string
-	Runner     Runner
+	// Egress 打开后，设备的公网出口经由 socks5 中继（内网仍直连），
+	// 每台设备一条独立链路，出口地址可在运行中热切换。见 egress.go。
+	Egress    bool
+	EgressDNS string // 隧道内用的解析器，如 223.5.5.5；空则沿用 docker 默认
+	Runner    Runner
 }
 
 func (n *Node) docker(ctx context.Context, args ...string) (string, error) {
@@ -61,8 +65,17 @@ func ContainerName(deviceID string) string { return "droidpool-" + deviceID }
 func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBase string) error {
 	name := ContainerName(deviceID)
 	_, _ = n.docker(ctx, "rm", "-f", name) // 忽略「不存在」
-	args := []string{"run", "-d", "--privileged", "--name", name,
-		"-p", strconv.Itoa(port) + ":5555"}
+	args := []string{"run", "-d", "--privileged", "--name", name}
+	if n.Egress {
+		// 走出口链路时端口发布在边车上，redroid 自己不能带 -p（共享 netns 的
+		// 容器不允许发布端口），网络也改为加入边车的 netns。见 egress.go。
+		if err := n.startEgress(ctx, deviceID, port); err != nil {
+			return err
+		}
+		args = append(args, "--network", "container:"+TunName(deviceID))
+	} else {
+		args = append(args, "-p", strconv.Itoa(port)+":5555")
+	}
 	if overlayBase != "" {
 		args = append(args,
 			"-v", overlayBase+":/data-base",
@@ -76,9 +89,11 @@ func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBas
 	return err
 }
 
-// Remove 删除容器。
+// Remove 删除容器。出口链路上的辅助容器一并清掉，否则它们会占着端口，
+// 下次 Create 起边车时直接失败。
 func (n *Node) Remove(ctx context.Context, deviceID string) error {
 	_, err := n.docker(ctx, "rm", "-f", ContainerName(deviceID))
+	n.removeEgress(ctx, deviceID)
 	return err
 }
 

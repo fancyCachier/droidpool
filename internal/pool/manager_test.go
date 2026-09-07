@@ -19,6 +19,8 @@ type fakeDriver struct {
 	ports       []int
 	createErr   map[string]error
 	bootErr     map[string]error
+	egress      map[string]string
+	finished    []string
 }
 
 func (f *fakeDriver) Create(_ context.Context, id string, port int, overlayBase string) error {
@@ -30,6 +32,23 @@ func (f *fakeDriver) Create(_ context.Context, id string, port int, overlayBase 
 	f.created = append(f.created, id)
 	f.ports = append(f.ports, port)
 	f.overlayArgs = append(f.overlayArgs, overlayBase)
+	return nil
+}
+
+func (f *fakeDriver) FinishEgress(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.finished = append(f.finished, id)
+	return nil
+}
+
+func (f *fakeDriver) SetEgress(_ context.Context, id, proxy string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.egress == nil {
+		f.egress = map[string]string{}
+	}
+	f.egress[id] = proxy
 	return nil
 }
 
@@ -71,7 +90,24 @@ func (s *memStore) UpsertDevice(d *Device) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := *d
+	// 与真库保持一致：SQL 的 ON CONFLICT 分支不更新 egress_proxy，
+	// 否则每次健康检查回写都会把用户设的出口冲掉。假实现也必须这样，
+	// 不然它会掩盖真实行为。
+	if old, ok := s.m[d.ID]; ok && c.EgressProxy == "" {
+		c.EgressProxy = old.EgressProxy
+	}
 	s.m[d.ID] = &c
+	return nil
+}
+
+func (s *memStore) SetDeviceEgress(id, proxy string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.m[id]
+	if !ok {
+		return errors.New("不存在")
+	}
+	d.EgressProxy = proxy
 	return nil
 }
 
@@ -376,5 +412,57 @@ func TestReconcileStoreHandlesLeasedWithoutContainer(t *testing.T) {
 	d, _ = st.GetDevice("3588-a-1")
 	if d.State != StateBroken {
 		t.Errorf("leased 但节点无容器应标 broken，得到 %s", d.State)
+	}
+}
+
+// 设备重建后容器是全新的，库里记着的出口必须被重放，否则「以为走代理其实直连」。
+func TestCreateReplaysStoredEgress(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	// broken 才会被 Ensure 重建，正好模拟「设备重建后出口要回来」
+	_ = st.UpsertDevice(&Device{ID: "3588-a-1", State: StateBroken, EgressProxy: "socks5://up:1080"})
+	m := newManager(drv, st, 1)
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(drv.finished) == 0 {
+		t.Error("未调用 FinishEgress，流量不会进隧道")
+	}
+	if got := drv.egress["3588-a-1"]; got != "socks5://up:1080" {
+		t.Errorf("未重放库里的出口设置，实际 %q", got)
+	}
+}
+
+func TestCreateSkipsEgressWhenUnset(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	m := newManager(drv, st, 1)
+	if err := m.Ensure(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := drv.egress["3588-a-1"]; ok {
+		t.Error("没设过出口就不该调 SetEgress")
+	}
+}
+
+func TestSetEgressPersistsAndApplies(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	_ = st.UpsertDevice(&Device{ID: "d1"})
+	m := newManager(drv, st, 1)
+	if err := m.SetEgress(context.Background(), "d1", "socks5://x:1080"); err != nil {
+		t.Fatal(err)
+	}
+	if drv.egress["d1"] != "socks5://x:1080" {
+		t.Errorf("未下发到节点：%q", drv.egress["d1"])
+	}
+	d, _ := st.GetDevice("d1")
+	if d.EgressProxy != "socks5://x:1080" {
+		t.Errorf("未落库：%q", d.EgressProxy)
+	}
+	// 设备不存在时不该去动节点
+	drv.egress = map[string]string{}
+	if err := m.SetEgress(context.Background(), "nope", "socks5://y:1080"); err == nil {
+		t.Error("对不存在的设备应当报错")
+	}
+	if len(drv.egress) != 0 {
+		t.Errorf("设备不存在却动了节点：%v", drv.egress)
 	}
 }

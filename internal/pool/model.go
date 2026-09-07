@@ -62,6 +62,9 @@ type Device struct {
 	LastHealthy time.Time   `json:"last_health_at"`
 	// HealthFails 连续健康检查失败次数，达到 HealthFailThreshold 即转 broken。
 	HealthFails int `json:"health_fails"`
+	// EgressProxy 这台设备公网出口用的上游 socks5（如 socks5://host:1080），
+	// 空 = 直连。每台设备一份，运行中可改，见 node/egress.go。
+	EgressProxy string `json:"egress_proxy"`
 }
 
 // HealthFailThreshold 连续失败多少次判定设备损坏。

@@ -83,6 +83,16 @@ pre.clip{margin:0 0 8px;padding:8px 9px;background:#0d1117;border:1px solid var(
     </div>
 
     <div class="panel">
+      <h2>公网出口</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="egress" placeholder="socks5://主机:端口，留空＝直连"
+               style="flex:1;min-width:180px">
+        <button id="egressave">应用</button>
+      </div>
+      <div class="hint" id="egresshint">内网（Edge、adb、控制面）始终直连，只有公网走代理。</div>
+    </div>
+
+    <div class="panel">
       <h2>控制</h2>
       <div class="nav3">
         <button data-key="back" title="返回">
@@ -825,12 +835,34 @@ async function loadInfo(){
       <dt>分支</dt><dd>${d.branch||''} ${d.head_sha||''}</dd>
       <dt>持有者</dt><dd>${d.owner||''}</dd>` : '<dt>租约</dt><dd>空闲</dd>'}
       ${d.human ? `<dt>接管</dt><dd style="color:var(--busy)">进行中 ${d.note||''}</dd>` : ''}`;
+    // 只在没聚焦时回显，否则会把用户正在敲的内容冲掉
+    if(document.activeElement !== $('#egress')) $('#egress').value = d.egress_proxy || '';
+    $('#egresshint').textContent = d.egress_proxy
+      ? '公网经 ' + d.egress_proxy + ' 落地；内网直连。'
+      : '公网直连（未设代理）；内网始终直连。';
     $('#takeover').textContent = d.human ? '交还' : '接管';
     $('#takeover').disabled = !lease;
     $('#release').disabled = !lease;
     $('#takeover').dataset.on = d.human ? '1' : '';
   }catch(_){}
 }
+
+$('#egressave').onclick = async () => {
+  const proxy = $('#egress').value.trim();
+  const r = await fetch(`/api/devices/${encodeURIComponent(id)}/egress`, {
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({proxy})
+  });
+  if(r.ok){
+    // 只重建中继容器，设备与租约都不中断，所以这里不需要提示重连
+    flash(proxy ? '出口已切到 ' + proxy : '已改为直连');
+  }else{
+    let msg = r.status;
+    try{ msg = (await r.json()).message || msg; }catch(_){}
+    flash('出口设置失败: ' + msg, true);
+  }
+  loadInfo();
+};
 
 $('#takeover').onclick = async () => {
   if(!lease) return;
@@ -851,7 +883,7 @@ $('#release').onclick = async () => {
 
 // 租约变更走 SSE，不必轮询
 const es = new EventSource('/api/events');
-['snapshot','tick','claim','release','human','reap'].forEach(k => es.addEventListener(k, loadInfo));
+['snapshot','tick','claim','release','human','reap','egress'].forEach(k => es.addEventListener(k, loadInfo));
 
 // 页面隐藏时断流，别让后台标签页一直占着节点 CPU 和设备的编码器
 document.addEventListener('visibilitychange', () => {

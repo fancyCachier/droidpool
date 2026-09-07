@@ -182,6 +182,9 @@ func main() {
 	case "seed-edge":
 		touchIfLeased(c)
 		cmdSeedEdge(os.Args[2:])
+	case "battery":
+		touchIfLeased(c)
+		cmdBattery(os.Args[2:])
 	case "run":
 		touchIfLeased(c)
 		cmdRun(os.Args[2:])
@@ -324,6 +327,61 @@ const cashierPkg = "cn.daboshi.cashier_app.dev"
 //
 // 写的是 shared_prefs/FlutterSharedPreferences.xml 的两个 key，格式与 app 一致；
 // run-as 里相对路径的 cwd 不可靠，一律 push 到 /data/local/tmp 再用绝对路径 cp。
+// cmdBattery 给设备伪造一块电池。redroid 默认 present=false、level=0，
+// 也就是「没有电池」——需要看电量的应用在这上面拿到的是 0。
+//
+// 顺序不能反：**level 必须先于 present 设置**。实测（2026-09-06，一次性容器）
+// 单独执行 `cmd battery set present 1` 而 level 还是 0 时，Android 会判定电量
+// 耗尽并发起关机，容器约 20 s 后以 130（SIGINT，即正常关机）退出。关机是异步的，
+// 期间后续命令还能正常返回，所以现场看起来像是「后面某条命令搞的」，很难归因。
+// 同样实测：level=0 即使插着电（ac=1、status=charging）也照样关机，
+// 所以这里直接把 0 挡在外面，而不是靠「插电就安全」这种假设。
+func cmdBattery(args []string) {
+	fs := flag.NewFlagSet("battery", flag.ExitOnError)
+	level := fs.Int("level", -1, "电量百分比 1~100")
+	status := fs.String("status", "discharging", "charging | discharging | full")
+	temp := fs.Float64("temp", 0, "电池温度摄氏度，如 31.5；不给则不设")
+	reset := fs.Bool("reset", false, "撤销伪造，回到 redroid 默认的「无电池」")
+	fs.Parse(args)
+
+	if *reset {
+		runBattery("reset")
+		fmt.Println("已撤销电池伪造，回到默认的无电池状态")
+		return
+	}
+	if *level < 1 || *level > 100 {
+		fatal("--level 必须在 1~100：0 会让 Android 判定电量耗尽并关机（插着电也一样），设备会直接退出")
+	}
+	st, ok := map[string]string{"charging": "2", "discharging": "3", "full": "5"}[*status]
+	if !ok {
+		fatal("--status 只能是 charging / discharging / full，收到 %q", *status)
+	}
+
+	// level 先于 present，见上面的注释。
+	runBattery("set", "level", strconv.Itoa(*level))
+	runBattery("set", "present", "1") // 只吃 int，给 "true" 会报 Bad value
+	runBattery("set", "status", st)
+	if *status == "charging" {
+		runBattery("set", "ac", "1")
+	} else {
+		runBattery("unplug")
+	}
+	if *temp != 0 {
+		// 框架里的单位是 0.1 °C
+		runBattery("set", "temp", strconv.Itoa(int(*temp*10)))
+	}
+	fmt.Printf("电池：%d%% %s\n", *level, *status)
+}
+
+func runBattery(args ...string) {
+	out, err := adbDev(append([]string{"shell", "cmd", "battery"}, args...)...).CombinedOutput()
+	// cmd battery 出错时退出码仍是 0，只在 stdout 上写 Bad value / Unknown set option，
+	// 所以退出码和输出都要看。
+	if err != nil || bytes.Contains(out, []byte("Bad value")) || bytes.Contains(out, []byte("Unknown")) {
+		fatal("cmd battery %s 失败: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
 func cmdSeedEdge(args []string) {
 	fs := flag.NewFlagSet("seed-edge", flag.ExitOnError)
 	host := fs.String("host", os.Getenv("DROIDPOOL_EDGE_HOST"), "Edge 主机（或设 DROIDPOOL_EDGE_HOST）")
@@ -533,6 +591,8 @@ func usage() {
   devices   列出池中所有设备
   seed-edge 给已装的 cashier-app 写 Edge 端点 + 证书 pin（免走引导页）
             [--host <edge-host>] [--port 8090]，或设 DROIDPOOL_EDGE_HOST
+  battery   伪造一块电池（redroid 默认没有电池，应用读到的电量是 0）
+            [--level 1~100] [--status charging|discharging|full] [--temp 31.5] | --reset
   run       一步到位：装包 → seed-edge → 启动 → 自动过引导页到登录页
             [--apk build/app/outputs/flutter-apk/app-debug.apk] [--no-seed] [--no-onboard]
   heartbeat 发一次心跳（告诉 watchdog 自己还活着）

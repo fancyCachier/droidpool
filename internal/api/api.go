@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -54,6 +55,8 @@ type Server struct {
 	// Resetter 在 release 后把设备洗干净放回池子。为 nil 时设备会卡在 resetting——
 	// 首次部署时踩到的坑：release 走通了但没人去复位。
 	Resetter Resetter
+	// Egress 为 nil 时出口设置接口返回 503，其余不受影响。
+	Egress EgressSetter
 	// WallURL 非空时，走明文 http 打开的设备墙页面 302 到这里。WebCodecs 只在安全
 	// 上下文里存在，http://内网IP 上的放大视图只有 3 fps 截图流；API 不跳转，agent 照旧。
 	WallURL string
@@ -62,6 +65,11 @@ type Server struct {
 // Resetter 复位一台设备（由 pool.Manager 实现）。
 type Resetter interface {
 	Reset(ctx context.Context, deviceID string) error
+}
+
+// EgressSetter 改一台设备的公网出口（由 pool.Manager 实现）。
+type EgressSetter interface {
+	SetEgress(ctx context.Context, deviceID, proxy string) error
 }
 
 // CloseSessions 收尾所有设备墙实时会话，返回被取消的会话数。关停前调用。
@@ -102,6 +110,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/devices/{id}/stream.h264", s.handleH264Stream)
 	mux.HandleFunc("GET /api/devices/{id}/ws", s.handleWS)
 	mux.HandleFunc("POST /api/devices/{id}/input", s.handleInput)
+	// 与设备墙其余接口同组，不走 Bearer：页面本身没有 token。信任边界就是内网——
+	// 同组的 /input 已经等于完全控制设备，出口设置不比它更宽。
+	mux.HandleFunc("PUT /api/devices/{id}/egress", s.handleSetEgress)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
 	return mux
@@ -368,6 +379,58 @@ func (s *Server) handleHuman(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Events.Publish("human", map[string]any{"lease": id, "takeover": req.Takeover})
 	writeJSON(w, http.StatusOK, map[string]any{"human_takeover": req.Takeover})
+}
+
+// handleSetEgress 改一台设备的公网出口。只重建中继容器，设备与租约都不中断。
+func (s *Server) handleSetEgress(w http.ResponseWriter, r *http.Request) {
+	if s.Egress == nil {
+		writeErr(w, http.StatusServiceUnavailable, "unavailable", "本实例未接出口管理")
+		return
+	}
+	id := r.PathValue("id")
+	var req struct {
+		Proxy string `json:"proxy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
+		return
+	}
+	req.Proxy = strings.TrimSpace(req.Proxy)
+	if err := validateProxy(req.Proxy); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if err := s.Egress.SetEgress(r.Context(), id, req.Proxy); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "设备不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.Events.Publish("egress", map[string]any{"device": id, "proxy": req.Proxy})
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "egress_proxy": req.Proxy})
+}
+
+// validateProxy 拦掉明显写错的出口地址。空串表示直连。
+//
+// 只认 socks5：中继用的是 gost 的 -F，写成 http:// 它会当 HTTP 代理去连，
+// 症状是设备静悄悄地连不上外网，比直接报错难查得多。
+func validateProxy(p string) error {
+	if p == "" {
+		return nil
+	}
+	if !strings.HasPrefix(p, "socks5://") && !strings.HasPrefix(p, "socks5h://") {
+		return errors.New("出口地址要以 socks5:// 开头，留空表示直连")
+	}
+	hostport := strings.TrimPrefix(strings.TrimPrefix(p, "socks5h://"), "socks5://")
+	if i := strings.LastIndex(hostport, "@"); i >= 0 { // 去掉 user:pass@
+		hostport = hostport[i+1:]
+	}
+	if _, _, err := net.SplitHostPort(hostport); err != nil {
+		return errors.New("出口地址要写成 socks5://[用户:密码@]主机:端口")
+	}
+	return nil
 }
 
 func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {

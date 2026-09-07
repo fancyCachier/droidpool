@@ -73,6 +73,13 @@ type Node struct {
 	Image      string `toml:"image"`
 	DataRoot   string `toml:"data_root"`
 	BootArgs   string `toml:"boot_args"`
+	// Egress 打开后每台设备多起两个辅助容器（tun 边车 + socks5 中继），
+	// 公网流量经中继落地，内网仍直连；具体出口地址每台设备各自在设备墙上设。
+	// 节点需要加载 tun 模块（modprobe tun）。
+	Egress bool `toml:"egress"`
+	// EgressDNS 隧道内用的解析器，如 223.5.5.5。留空则沿用 docker 默认，
+	// 但那通常是宿主的 resolver，在隧道里不可达，域名会全部解析不了。
+	EgressDNS string `toml:"egress_dns"`
 }
 
 // Duration 让 TOML 里能写 "4h" 这样的字符串。

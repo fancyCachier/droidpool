@@ -54,6 +54,7 @@ func run() error {
 	nd := &node.Node{
 		Name: nc.Name, DockerHost: nc.DockerHost, ADBHost: nc.ADBHost,
 		Image: nc.Image, DataRoot: nc.DataRoot, BootArgs: nc.BootArgs,
+		Egress: nc.Egress, EgressDNS: nc.EgressDNS,
 	}
 	mgr := &pool.Manager{
 		NodeName: nc.Name, ADBHost: nc.ADBHost, Driver: nd, Store: st,
@@ -140,6 +141,7 @@ func run() error {
 		Screen:      adbc,
 		Events:      hub,
 		Resetter:    mgr,
+		Egress:      mgr,
 		Scrcpy: api.ScrcpyConfig{
 			// 未设置时 H.264 端点返回 503，前端自动退回截图流
 			ServerJar: os.Getenv("SCRCPY_SERVER_JAR"),
