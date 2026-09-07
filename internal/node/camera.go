@@ -149,8 +149,16 @@ func (n *Node) rescanCamera(ctx context.Context, deviceID string) error {
 		return ctx.Err()
 	case <-time.After(n.settle()):
 	}
-	_, err := n.docker(ctx, "exec", ContainerName(deviceID),
-		"sh", "-c", "setprop ctl.restart "+camHALService)
+	// 权限要在**设备容器里**放开，不是宿主上。
+	//
+	// redroid 的 init 自己重建 /dev（Android 用 ueventd），宿主上的属主与
+	// udev 规则传不进去：实测宿主是 root:video 0666 而容器里是 root:root 0600。
+	// HAL 跑在 cameraserver 名下，于是 deviceAdded 报 Permission denied，
+	// 相机恒为 0——而宿主那边看权限是对的，极难往这里想。
+	//
+	// 每次换源都重设：容器重建后 /dev 又是 ueventd 那一份。
+	_, err := n.docker(ctx, "exec", ContainerName(deviceID), "sh", "-c",
+		"chmod 0666 "+n.CameraDevice(deviceID)+"; setprop ctl.restart "+camHALService)
 	return err
 }
 

@@ -294,6 +294,11 @@ func TestSetCameraRescansHAL(t *testing.T) {
 	if !strings.Contains(j, "vendor.camera.provider-ext") {
 		t.Errorf("未让 HAL 重扫，摄像头不会被认出来：%v", f.calls)
 	}
+	// 权限要在设备容器里放开：redroid 的 ueventd 自己重建 /dev，宿主上的
+	// 属主和 udev 规则传不进去，HAL 会报 Permission denied、相机恒为 0
+	if !strings.Contains(j, "chmod 0666 /dev/video23") {
+		t.Errorf("未在设备内放开节点权限，HAL 会 Permission denied：%s", j)
+	}
 	if !strings.Contains(j, "exec droidpool-3588-a-3") {
 		t.Errorf("该在设备容器里重启 HAL，而不是别处：%s", j)
 	}

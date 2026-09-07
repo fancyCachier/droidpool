@@ -21,11 +21,17 @@ if modinfo v4l2loopback >/dev/null 2>&1; then
   # （3588-a-1 … 3588-a-8），camera_video_base=20 加序号正好落在 21..28。
   # 按 20..27 建的话第 8 台的节点根本不存在——configure 时看不出来，
   # 要到给那台设备设摄像头才报错。
-  # exclusive_caps 要逐个写满 8 个：它是数组参数，写一个 1 只作用于第 0 个，
-  # 其余设备会同时暴露 Video Capture 与 Video Output（实测 video21 就是
-  # 0x05200003 两个都有），而 exclusive 模式才是摄像头 HAL 期望的形态。
+  # exclusive_caps 全关（0）。开着的话节点用过一轮就会掉进一个既不暴露
+  # Video Output 也不暴露 Video Capture 的死状态（实测 0x05200000），
+  # 之后 writer 写不进、HAL 也读不到，等于**每台设备的摄像头只能用一次**，
+  # 而且单个节点救不回来——set-caps / 重写一帧 / delete+add 都试过，
+  # 只能重载整个模块，那会影响全部 8 台。
+  #
+  # 关掉之后节点常驻 Capture+Output 两个能力位，反复起停都正常（实测停流后
+  # 能力位不变）。HAL 并不要求 exclusive——它只看有没有 VIDEO_CAPTURE。
+  # 注意它是数组参数，要逐个写满 8 个，写一个只作用于第 0 个。
   cat > /etc/modprobe.d/droidpool-v4l2.conf <<'MODCONF'
-options v4l2loopback devices=8 video_nr=21,22,23,24,25,26,27,28 card_label=droidpool-cam1,droidpool-cam2,droidpool-cam3,droidpool-cam4,droidpool-cam5,droidpool-cam6,droidpool-cam7,droidpool-cam8 exclusive_caps=1,1,1,1,1,1,1,1
+options v4l2loopback devices=8 video_nr=21,22,23,24,25,26,27,28 card_label=droidpool-cam1,droidpool-cam2,droidpool-cam3,droidpool-cam4,droidpool-cam5,droidpool-cam6,droidpool-cam7,droidpool-cam8 exclusive_caps=0,0,0,0,0,0,0,0
 MODCONF
   echo v4l2loopback > /etc/modules-load.d/droidpool-v4l2.conf
   # v4l2loopback-ctl 用来设 fps。不设的话设备报 30 fps，超出
