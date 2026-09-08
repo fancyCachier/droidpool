@@ -42,6 +42,15 @@ egress_dns = "223.5.5.5"
 # 一台一个节点，共用的话谁先打开谁独占。需要自建镜像（device/redroid-patches）
 # 与节点上的 v4l2loopback（deploy/node/setup-node.sh），画面用 rtsp-camera.sh 灌。
 camera_video_base = 0
+# 硬件身份：设备对外报的 Build.MODEL / BRAND / MANUFACTURER / DEVICE / PRODUCT。
+# 不配 = 镜像原样（redroid14_arm64_only）。manufacturer 默认同 brand，
+# device / name 默认由 model 派生；序列号每台按设备 id 派生。改了这里 golden
+# 基底会重造（fingerprint 变了，不重造的话每次复位都当成 OTA 升级跑一遍）。
+# 每台设备可经 droidpool identity / PUT /api/devices/{id}/identity 单独覆盖。
+# identity = { model = "X1", brand = "ACME" }
+# 默认 mock 定位 "纬度,经度"，不配 = 不 mock。运行中即时生效，复位后重放；
+# 每台设备可经 droidpool location / PUT /api/devices/{id}/location 单独覆盖。
+# mock_location = "23.1291,113.2644"
 boot_args = "androidboot.use_memfd=true androidboot.use_redroid_overlayfs=1 androidboot.redroid_width=1366 androidboot.redroid_height=768 androidboot.redroid_dpi=160 androidboot.redroid_gpu_mode=guest"
 
 # --- watchdog：防止 agent 僵死后一直占着机器 ---

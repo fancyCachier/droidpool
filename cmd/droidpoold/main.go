@@ -56,11 +56,13 @@ func run() error {
 		Image: nc.Image, DataRoot: nc.DataRoot, BootArgs: nc.BootArgs,
 		Egress: nc.Egress, EgressDNS: nc.EgressDNS,
 		CameraVideoBase: nc.CameraVideoBase,
+		DefaultIdentity: nc.DefaultIdentity(),
 	}
 	mgr := &pool.Manager{
 		NodeName: nc.Name, ADBHost: nc.ADBHost, Driver: nd, Store: st,
 		MaxDevices: nc.MaxDevices, PortBase: nc.PortRange[0] - 1,
 		OverlayBase: nc.DataRoot + "/base", Log: log,
+		DefaultIdentity: nc.DefaultIdentity(), DefaultLocation: nc.MockLocation,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -144,6 +146,8 @@ func run() error {
 		Resetter:    mgr,
 		Egress:      mgr,
 		Camera:      mgr,
+		Identity:    mgr,
+		Location:    mgr,
 		UI: api.UIConfig{
 			// 未设置时界面层级接口返回 503；deploy.sh 会把 dex 推过来
 			DexPath:  os.Getenv("DROIDPOOL_UIAGENT_DEX"),

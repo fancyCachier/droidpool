@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -429,5 +430,80 @@ func TestUpsertDeviceKeepsEgress(t *testing.T) {
 	got, _ := s.GetDevice("d1")
 	if got.EgressProxy != "socks5://up:1080" {
 		t.Errorf("健康检查回写把出口冲掉了：%q", got.EgressProxy)
+	}
+}
+
+// identity 与 mock_location 跟 egress 一样是用户设的，健康检查的 UpsertDevice
+// 不能把它们冲掉；撤销要能真的清空。
+func TestDeviceIdentityAndLocationRoundtrip(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	id := pool.Identity{Model: "X1", Brand: "ACME"}.Normalized()
+	if err := st.UpsertDevice(&pool.Device{ID: "d1", Node: "n", Container: "c", ADBAddr: "a", State: pool.StateReady,
+		Identity: &id, MockLocation: "23.1,113.2"}); err != nil {
+		t.Fatal(err)
+	}
+	d, err := st.GetDevice("d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Identity == nil || *d.Identity != id || d.MockLocation != "23.1,113.2" {
+		t.Errorf("读回不一致: identity=%+v location=%q", d.Identity, d.MockLocation)
+	}
+	// 健康检查式的回写：身份与定位字段空着
+	if err := st.UpsertDevice(&pool.Device{ID: "d1", Node: "n", Container: "c", ADBAddr: "a", State: pool.StateReady}); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = st.GetDevice("d1")
+	if d.Identity == nil || d.MockLocation == "" {
+		t.Errorf("UpsertDevice 冲掉了用户设置: identity=%+v location=%q", d.Identity, d.MockLocation)
+	}
+	if err := st.SetDeviceIdentity("d1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetDeviceLocation("d1", ""); err != nil {
+		t.Fatal(err)
+	}
+	d, _ = st.GetDevice("d1")
+	if d.Identity != nil || d.MockLocation != "" {
+		t.Errorf("撤销后应为空: identity=%+v location=%q", d.Identity, d.MockLocation)
+	}
+	if err := st.SetDeviceIdentity("没有这台", &id); !errors.Is(err, ErrNotFound) {
+		t.Errorf("不存在的设备应报 ErrNotFound，实际 %v", err)
+	}
+	if err := st.SetDeviceLocation("没有这台", "1,2"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("不存在的设备应报 ErrNotFound，实际 %v", err)
+	}
+}
+
+// 线上库是旧 schema 建的，新列必须由 Open 自己补上。
+func TestOpenMigratesOldDevicesTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE devices (
+  id TEXT PRIMARY KEY, node TEXT NOT NULL, container TEXT NOT NULL, adb_addr TEXT NOT NULL,
+  state TEXT NOT NULL, created_at INTEGER NOT NULL, last_health_at INTEGER NOT NULL DEFAULT 0,
+  health_fails INTEGER NOT NULL DEFAULT 0);
+  INSERT INTO devices (id, node, container, adb_addr, state, created_at) VALUES ('d1','n','c','a','ready',1)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("旧库应能打开并迁移: %v", err)
+	}
+	defer st.Close()
+	d, err := st.GetDevice("d1")
+	if err != nil {
+		t.Fatalf("迁移后读旧行失败: %v", err)
+	}
+	if d.Identity != nil || d.MockLocation != "" || d.EgressProxy != "" {
+		t.Errorf("旧行的新列应为空: %+v", d)
 	}
 }

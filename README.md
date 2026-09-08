@@ -69,6 +69,20 @@ once, zoom into one, and take over when an agent needs help.
   encoding dominates, and this ffmpeg build has no hardware JPEG encoder even
   though the SoC has one), so eight of them would eat most of the node. Needs a
   self-built image, see `device/redroid-patches/`.
+- **Hardware identity.** Devices can report whatever `Build.MODEL / BRAND /
+  MANUFACTURER / DEVICE / PRODUCT` and serial you want instead of
+  `redroid14_arm64_only`, so model-dependent code paths in the app under test
+  can be exercised. A pool-wide default lives in the node config; per-device
+  overrides come from the API or `droidpool identity`. These are boot-time
+  `ro.*` properties, so changing them rebuilds that one device (wiped, lease
+  kept, adb address unchanged). What stays visible: `ro.hardware=redroid`, a
+  SwiftShader GL renderer string, no sensors, no telephony. This is for
+  exercising your own app, not for defeating attestation.
+- **Mock location.** `droidpool location 23.1291,113.2644` (or the API, or a
+  pool-wide default) injects a fix into the `gps` and `network` providers
+  through Android's own test-provider mechanism, live, no rebuild. It is
+  replayed after every reset. Apps see `Location.isMock() == true`; SDKs that
+  filter mock fixes (Amap, Baidu) need their mock switch turned on.
 
 ## Measured on an 8-core RK3588S with 16 GB RAM
 
@@ -171,6 +185,8 @@ playbook, including the UI-driving pitfalls we hit.
 | `battery [--level 1..100]` | Fake a battery. Redroid has none, so apps read 0 % — `--status charging\|discharging\|full`, `--temp`, or `--reset` |
 | `ui-dump [--n 5]` | Dump the view hierarchy as XML through a resident agent (~25 ms vs ~380 ms for `uiautomator dump`) |
 | `camera --rtsp … \| --off` | Feed an RTSP stream to the device's camera, or stop it |
+| `identity --model … --brand … \| --reset` | Set the reported hardware model (rebuilds the device, keeps the lease) |
+| `location <lat,lng> \| --off` | Mock the device's location, live |
 
 ## Integrations
 
@@ -206,6 +222,9 @@ POST   /api/devices/{id}/input         {type: tap|swipe|key|text, …} (fallback
 GET    /api/devices/{id}/ui            view hierarchy XML via the resident agent
 PUT    /api/devices/{id}/egress        {proxy: "socks5://host:port"} — empty string means direct
 PUT    /api/devices/{id}/camera        {rtsp: "rtsp://host/live"} — empty string stops the feed
+PUT    /api/devices/{id}/identity      {model, brand, manufacturer?, device?, name?, serial?} — {} reverts to the
+                                       pool default; rebuilds the device synchronously (20–40 s)
+PUT    /api/devices/{id}/location      {location: "lat,lng"} — empty string reverts to the pool default
 ```
 
 ## What it deliberately does not do

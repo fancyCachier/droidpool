@@ -608,3 +608,126 @@ func TestSetCameraResponseIsMasked(t *testing.T) {
 		t.Errorf("响应泄露了凭据：%s", rec.Body)
 	}
 }
+
+type fakeIdentity struct {
+	mu    sync.Mutex
+	got   map[string]*pool.Identity
+	calls int
+}
+
+func (f *fakeIdentity) SetIdentity(_ context.Context, id string, ident *pool.Identity) (*pool.Identity, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.got == nil {
+		f.got = map[string]*pool.Identity{}
+	}
+	f.got[id] = ident
+	f.calls++
+	return ident, true, nil
+}
+
+type fakeLocation struct {
+	mu  sync.Mutex
+	got map[string]string
+}
+
+func (f *fakeLocation) SetLocation(_ context.Context, id, loc string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.got == nil {
+		f.got = map[string]string{}
+	}
+	f.got[id] = loc
+	return nil
+}
+
+func TestSetIdentityNormalizesAndValidates(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	fi := &fakeIdentity{}
+	s.Identity = fi
+	rec := do(t, h, "PUT", "/api/devices/dev1/identity", map[string]any{"model": "X1", "brand": "ACME"}, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态 %d：%s", rec.Code, rec.Body)
+	}
+	got := fi.got["dev1"]
+	if got == nil || got.Manufacturer != "ACME" || got.Device != "x1" || got.Name != "x1" {
+		t.Errorf("应把补齐后的身份交给后端: %+v", got)
+	}
+	resp := decode[map[string]any](t, rec)
+	if resp["rebuilt"] != true {
+		t.Errorf("响应应告知是否重建: %v", resp)
+	}
+	// 全空 = 撤销覆盖
+	if rec := do(t, h, "PUT", "/api/devices/dev1/identity", map[string]any{}, false); rec.Code != http.StatusOK {
+		t.Errorf("空身份应表示撤销，实际 %d", rec.Code)
+	}
+	if fi.got["dev1"] != nil {
+		t.Errorf("撤销应传 nil，实际 %+v", fi.got["dev1"])
+	}
+	// 非法值进不了 sed
+	for _, bad := range []map[string]any{
+		{"model": "a/b", "brand": "x"},
+		{"brand": "x"},   // 没型号
+		{"model": "X1"}, // 没品牌没厂商
+		{"model": "X1", "brand": "x", "serial": "AB-1"},
+	} {
+		if rec := do(t, h, "PUT", "/api/devices/dev1/identity", bad, false); rec.Code != http.StatusBadRequest {
+			t.Errorf("%v 应当被拒，实际 %d", bad, rec.Code)
+		}
+	}
+	if fi.calls != 2 {
+		t.Errorf("被拒的请求不该到后端，实际调用 %d 次", fi.calls)
+	}
+}
+
+func TestSetIdentityAndLocationNeedBackend(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	s.Identity, s.Location = nil, nil
+	if rec := do(t, h, "PUT", "/api/devices/dev1/identity", map[string]any{"model": "X1", "brand": "x"}, false); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("未接后端应当 503，实际 %d", rec.Code)
+	}
+	if rec := do(t, h, "PUT", "/api/devices/dev1/location", map[string]any{"location": "1,2"}, false); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("未接后端应当 503，实际 %d", rec.Code)
+	}
+}
+
+func TestSetLocationValidatesAndNormalizes(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	fl := &fakeLocation{}
+	s.Location = fl
+	rec := do(t, h, "PUT", "/api/devices/dev1/location", map[string]any{"location": " 23.1291, 113.2644 "}, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态 %d：%s", rec.Code, rec.Body)
+	}
+	if fl.got["dev1"] != "23.1291,113.2644" {
+		t.Errorf("应规范化后下发，实际 %q", fl.got["dev1"])
+	}
+	if rec := do(t, h, "PUT", "/api/devices/dev1/location", map[string]any{"location": ""}, false); rec.Code != http.StatusOK {
+		t.Errorf("留空应表示撤销，实际 %d", rec.Code)
+	}
+	for _, bad := range []string{"abc", "91,0", "1,2,3", "0,181"} {
+		if rec := do(t, h, "PUT", "/api/devices/dev1/location", map[string]any{"location": bad}, false); rec.Code != http.StatusBadRequest {
+			t.Errorf("%q 应当被拒，实际 %d", bad, rec.Code)
+		}
+	}
+}
+
+// 设备墙与 /api/devices 都要能看到当前的身份与定位覆盖，操作人员才知道这台机器在装谁。
+func TestWallExposesIdentityAndLocation(t *testing.T) {
+	s, h := newServer(t, 1, nil)
+	id := pool.Identity{Model: "X1", Brand: "ACME"}.Normalized()
+	if err := s.Store.SetDeviceIdentity("dev1", &id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.SetDeviceLocation("dev1", "23.1,113.2"); err != nil {
+		t.Fatal(err)
+	}
+	body := do(t, h, "GET", "/api/wall", nil, false).Body.String()
+	if !strings.Contains(body, `"model":"X1"`) || !strings.Contains(body, `"mock_location":"23.1,113.2"`) {
+		t.Errorf("设备墙数据缺身份或定位: %s", body)
+	}
+	body = do(t, h, "GET", "/api/devices", nil, true).Body.String()
+	if !strings.Contains(body, `"model":"X1"`) {
+		t.Errorf("/api/devices 缺身份: %s", body)
+	}
+}

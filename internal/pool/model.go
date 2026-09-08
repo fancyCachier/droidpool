@@ -4,6 +4,9 @@ package pool
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -68,6 +71,118 @@ type Device struct {
 	// CameraRTSP 这台设备摄像头画面的来源，空 = 不推流（相机报 0 个设备）。
 	// 每台设备一份，运行中可改，见 node/camera.go。
 	CameraRTSP string `json:"camera_rtsp"`
+	// Identity 这台设备对外报的硬件身份（Build.MODEL 等），nil = 用节点默认。
+	// 属性是开机时定死的（ro.*），改它要重建容器，见 Manager.SetIdentity。
+	Identity *Identity `json:"identity,omitempty"`
+	// MockLocation 这台设备的 mock 定位 "纬度,经度"，空 = 用节点默认。
+	// 运行中可改、即时生效；容器重建后要重放，见 node/identity.go。
+	MockLocation string `json:"mock_location"`
+}
+
+// Identity 设备对外报的硬件身份，对应 Android 的 Build.MODEL / BRAND /
+// MANUFACTURER / DEVICE / PRODUCT 与 Build.getSerial()。
+//
+// 这几项来自镜像里四个分区的 build.prop（ro.product.<分区>.model 等，
+// 取值顺序 product → odm → vendor → system_ext → system，所以四份都得覆盖），
+// 序列号则来自启动参数 androidboot.serialno。ro.build.fingerprint 由
+// brand/name/device 派生，会自动跟着变。ro.hardware=redroid 改不了——
+// init 靠它选 rc 与 HAL。
+type Identity struct {
+	Model        string `json:"model" toml:"model"`
+	Brand        string `json:"brand" toml:"brand"`
+	Manufacturer string `json:"manufacturer" toml:"manufacturer"`
+	Device       string `json:"device" toml:"device"`
+	Name         string `json:"name" toml:"name"`
+	// Serial 留空时按设备 id 派生，保证每台不同。
+	Serial string `json:"serial" toml:"serial"`
+}
+
+// IsZero 报告是否一个字段都没填。
+func (id Identity) IsZero() bool { return id == Identity{} }
+
+// Normalized 补齐没填的字段：品牌与厂商互相兜底，device/name 从型号派生。
+// 用户只给 --model 与 --brand 就够用。
+func (id Identity) Normalized() Identity {
+	if id.Brand == "" {
+		id.Brand = id.Manufacturer
+	}
+	if id.Manufacturer == "" {
+		id.Manufacturer = id.Brand
+	}
+	if id.Device == "" {
+		id.Device = slug(id.Model)
+	}
+	if id.Name == "" {
+		id.Name = id.Device
+	}
+	return id
+}
+
+// slug 把型号压成 device 名的形状：小写、只留字母数字。
+func slug(s string) string {
+	var b []byte
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b = append(b, byte(r))
+		case r >= 'A' && r <= 'Z':
+			b = append(b, byte(r+'a'-'A'))
+		}
+	}
+	return string(b)
+}
+
+// Validate 校验各字段。值会原样写进 build.prop 与启动参数（androidboot.serialno），
+// 所以只放行字母数字与少数标点，其余一律拒掉——比逐个转义可靠。
+func (id Identity) Validate() error {
+	if id.Model == "" {
+		return errors.New("identity 至少要有 model")
+	}
+	if id.Brand == "" && id.Manufacturer == "" {
+		return errors.New("identity 要有 brand 或 manufacturer")
+	}
+	for name, v := range map[string]string{
+		"model": id.Model, "brand": id.Brand, "manufacturer": id.Manufacturer,
+		"device": id.Device, "name": id.Name,
+	} {
+		if v == "" {
+			continue
+		}
+		if len(v) > 64 || !identityValue.MatchString(v) {
+			return fmt.Errorf("identity.%s %q 非法：只能是字母数字与空格 . _ + -，且不超过 64 字符", name, v)
+		}
+	}
+	if id.Serial != "" && !serialValue.MatchString(id.Serial) {
+		return fmt.Errorf("identity.serial %q 非法：只能是字母数字，1~32 位", id.Serial)
+	}
+	return nil
+}
+
+var (
+	identityValue = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._+-]*$`)
+	serialValue   = regexp.MustCompile(`^[A-Za-z0-9]{1,32}$`)
+)
+
+// ParseLocation 解析 "纬度,经度"。空串合法，表示不 mock。
+func ParseLocation(s string) (lat, lng float64, err error) {
+	if s == "" {
+		return 0, 0, nil
+	}
+	parts := strings.Split(s, ",")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("定位要写成 纬度,经度（如 23.1291,113.2644），得到 %q", s)
+	}
+	lat, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	lng, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err1 != nil || err2 != nil || lat < -90 || lat > 90 || lng < -180 || lng > 180 {
+		return 0, 0, fmt.Errorf("定位 %q 不是合法经纬度：纬度 -90~90，经度 -180~180", s)
+	}
+	return lat, lng, nil
+}
+
+// FormatLocation 把经纬度写回 "纬度,经度"，去掉多余的空白与位数。
+func FormatLocation(lat, lng float64) string {
+	return strconv.FormatFloat(lat, 'f', -1, 64) + "," + strconv.FormatFloat(lng, 'f', -1, 64)
 }
 
 // HealthFailThreshold 连续失败多少次判定设备损坏。

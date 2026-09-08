@@ -59,6 +59,10 @@ type Server struct {
 	Egress EgressSetter
 	// Camera 为 nil 时摄像头设置接口返回 503，其余不受影响。
 	Camera CameraSetter
+	// Identity 为 nil 时硬件身份接口返回 503，其余不受影响。
+	Identity IdentitySetter
+	// Location 为 nil 时 mock 定位接口返回 503，其余不受影响。
+	Location LocationSetter
 	// UI 配置界面层级接口；DexPath 为空时该接口返回 503。
 	UI UIConfig
 	ui uiSessions
@@ -80,6 +84,16 @@ type EgressSetter interface {
 // CameraSetter 改一台设备的摄像头画面源（由 pool.Manager 实现）。
 type CameraSetter interface {
 	SetCamera(ctx context.Context, deviceID, rtsp string) error
+}
+
+// IdentitySetter 改一台设备的硬件身份并重建它（由 pool.Manager 实现）。
+type IdentitySetter interface {
+	SetIdentity(ctx context.Context, deviceID string, ident *pool.Identity) (effective *pool.Identity, rebuilt bool, err error)
+}
+
+// LocationSetter 改一台设备的 mock 定位（由 pool.Manager 实现）。
+type LocationSetter interface {
+	SetLocation(ctx context.Context, deviceID, location string) error
 }
 
 // CloseSessions 收尾所有设备墙实时会话与 uiagent 会话，返回被取消的数量。关停前调用。
@@ -125,6 +139,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/devices/{id}/egress", s.handleSetEgress)
 	mux.HandleFunc("GET /api/devices/{id}/ui", s.handleUIDump)
 	mux.HandleFunc("PUT /api/devices/{id}/camera", s.handleSetCamera)
+	mux.HandleFunc("PUT /api/devices/{id}/identity", s.handleSetIdentity)
+	mux.HandleFunc("PUT /api/devices/{id}/location", s.handleSetLocation)
 	mux.HandleFunc("GET /{$}", s.servePage("web/wall.html"))
 	mux.HandleFunc("GET /device/{id}", s.servePage("web/device.html"))
 	return mux
@@ -454,6 +470,80 @@ func (s *Server) handleSetCamera(w http.ResponseWriter, r *http.Request) {
 	masked := maskURLCredentials(req.RTSP)
 	s.Events.Publish("camera", map[string]any{"device": id, "rtsp": masked})
 	writeJSON(w, http.StatusOK, map[string]any{"device": id, "camera_rtsp": masked})
+}
+
+// handleSetIdentity 改一台设备的硬件身份。身份是开机定死的，所以这里会**重建**
+// 设备（数据清空、租约保留、adb 地址不变），同步等它起来再返回，约 20~40 s。
+// 请求体所有字段为空 = 撤销覆盖、回到节点默认。
+func (s *Server) handleSetIdentity(w http.ResponseWriter, r *http.Request) {
+	if s.Identity == nil {
+		writeErr(w, http.StatusServiceUnavailable, "unavailable", "本实例未接硬件身份管理")
+		return
+	}
+	id := r.PathValue("id")
+	var req pool.Identity
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
+		return
+	}
+	var ident *pool.Identity
+	if !req.IsZero() {
+		n := req.Normalized()
+		if err := n.Validate(); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		ident = &n
+	}
+	// 重建要几十秒，不能跟着请求的 ctx 走：客户端一断，重建到一半的设备就成了孤儿
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	effective, rebuilt, err := s.Identity.SetIdentity(ctx, id, ident)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "设备不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.Events.Publish("identity", map[string]any{"device": id, "identity": effective, "rebuilt": rebuilt})
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "identity": effective, "rebuilt": rebuilt})
+}
+
+// handleSetLocation 改一台设备的 mock 定位，运行中即时生效。空串 = 撤销覆盖。
+func (s *Server) handleSetLocation(w http.ResponseWriter, r *http.Request) {
+	if s.Location == nil {
+		writeErr(w, http.StatusServiceUnavailable, "unavailable", "本实例未接定位管理")
+		return
+	}
+	id := r.PathValue("id")
+	var req struct {
+		Location string `json:"location"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "请求体不是合法 JSON")
+		return
+	}
+	req.Location = strings.TrimSpace(req.Location)
+	lat, lng, err := pool.ParseLocation(req.Location)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if req.Location != "" {
+		req.Location = pool.FormatLocation(lat, lng)
+	}
+	if err := s.Location.SetLocation(r.Context(), id, req.Location); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "设备不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.Events.Publish("location", map[string]any{"device": id, "location": req.Location})
+	writeJSON(w, http.StatusOK, map[string]any{"device": id, "mock_location": req.Location})
 }
 
 // maskURLCredentials 把 URL 里的用户名密码换成 ***，用于任何会被读到的地方。

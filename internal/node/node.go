@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fancyCachier/droidpool/internal/pool"
 )
 
 // Runner 执行一条命令并返回其标准输出。抽出接口是为了测试能替换掉真实的 docker/ssh 调用。
@@ -44,6 +46,9 @@ type Node struct {
 	EgressDNS string // 隧道内用的解析器，如 223.5.5.5；空则沿用 docker 默认
 	// CameraVideoBase 非 0 时给每台设备透传 /dev/video<base+序号>。见 CameraDevice。
 	CameraVideoBase int
+	// DefaultIdentity 节点默认的硬件身份，golden 基底按它起；设备的身份由
+	// Manager 在 Create 时传入（设备自己的覆盖优先）。nil = 镜像原样。
+	DefaultIdentity *pool.Identity
 	// camSettle 换源后等推流稳定的时长；0 = 用默认。只给测试用。
 	camSettle time.Duration
 	Runner    Runner
@@ -100,11 +105,16 @@ func ContainerName(deviceID string) string { return "droidpool-" + deviceID }
 
 // Create 起一个容器。overlayBase 非空时用 redroid 原生 overlayfs 共享 data
 // （/data-base 只读基底 + /data-diff 实例私有），复位即删 diff，零拷贝；
-// 空则退回独立 /data 挂载。
-func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBase string) error {
+// 空则退回独立 /data 挂载。ident 非 nil 时覆盖硬件身份，见 identity.go。
+func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBase string, ident *pool.Identity) error {
 	name := ContainerName(deviceID)
 	_, _ = n.docker(ctx, "rm", "-f", name) // 忽略「不存在」
+	identMounts, identBoot, err := n.identityArgs(ctx, deviceID, ident)
+	if err != nil {
+		return err
+	}
 	args := []string{"run", "-d", "--privileged", "--name", name}
+	args = append(args, identMounts...)
 	if n.Egress {
 		// 走出口链路时端口发布在边车上，redroid 自己不能带 -p（共享 netns 的
 		// 容器不允许发布端口），网络也改为加入边车的 netns。见 egress.go。
@@ -134,7 +144,8 @@ func (n *Node) Create(ctx context.Context, deviceID string, port int, overlayBas
 	}
 	args = append(args, n.Image)
 	args = append(args, strings.Fields(n.BootArgs)...)
-	_, err := n.docker(ctx, args...)
+	args = append(args, identBoot...)
+	_, err = n.docker(ctx, args...)
 	return err
 }
 
@@ -319,13 +330,17 @@ func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
 	// 8 台设备会拿着它去跑新镜像。同版本 Android 大概率能跑，但 fingerprint
 	// 变了，Android 可能触发首启逻辑，而且这种「跑起来了但不对」最难查。
 	// 靠人记得手工删目录同样不可靠，所以把镜像名记在基底里，对不上就重造。
+	//
+	// 默认身份也算进标记：基底里记着开机时的 fingerprint，设备以另一个
+	// fingerprint 起来会被当成 OTA 升级，每次复位都重跑一遍升级逻辑。
 	stamp := baseDir + "/.droidpool-image"
+	want := n.goldenStamp()
 	out, err := n.sshRun(ctx, "test -d "+baseDir+"/system && cat "+stamp+" 2>/dev/null || true")
-	if err == nil && strings.TrimSpace(out) == n.Image {
+	if err == nil && strings.TrimSpace(out) == want {
 		return nil
 	}
 	if strings.TrimSpace(out) != "" {
-		n.logf("golden 基底由 %q 造的，当前镜像是 %q，重造", strings.TrimSpace(out), n.Image)
+		n.logf("golden 基底由 %q 造的，当前是 %q，重造", strings.TrimSpace(out), want)
 	}
 	// 换镜像时必须清干净：残留的旧 /data 会和新镜像混在一起
 	if _, err := n.docker(ctx, "run", "--rm", "-v", baseDir+":/wipe",
@@ -334,9 +349,17 @@ func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
 	}
 	const name = "droidpool-golden"
 	_, _ = n.docker(ctx, "rm", "-f", name)
+	// golden 用节点默认身份起，让基底与设备的 fingerprint 一致（见上）
+	identMounts, identBoot, err := n.identityArgs(ctx, "golden", n.DefaultIdentity)
+	if err != nil {
+		return err
+	}
 	args := []string{"run", "-d", "--privileged", "--name", name,
-		"-p", strconv.Itoa(port) + ":5555", "-v", baseDir + ":/data", n.Image}
+		"-p", strconv.Itoa(port) + ":5555", "-v", baseDir + ":/data"}
+	args = append(args, identMounts...)
+	args = append(args, n.Image)
 	args = append(args, strings.Fields(n.BootArgs)...)
+	args = append(args, identBoot...)
 	// overlay 参数在造 base 时不能带：base 本身就是要写进去的普通 /data
 	for i := 0; i < len(args); i++ {
 		if strings.HasPrefix(args[i], "androidboot.use_redroid_overlayfs") {
@@ -373,15 +396,25 @@ func (n *Node) MakeGolden(ctx context.Context, baseDir string, port int) error {
 	}
 	// 让设置落盘再停
 	_, _ = n.docker(ctx, "exec", name, "sync")
-	// 写下是哪个镜像造的，下次好判断要不要重造
+	// 写下是哪个镜像、哪个身份造的，下次好判断要不要重造
 	if _, err := n.docker(ctx, "exec", name, "sh", "-c",
-		"printf '%s' "+shellQuote(n.Image)+" > /data/.droidpool-image"); err != nil {
+		"printf '%s' "+shellQuote(want)+" > /data/.droidpool-image"); err != nil {
 		return fmt.Errorf("写 golden 镜像标记: %w", err)
 	}
 	if _, err := n.docker(ctx, "stop", "-t", "10", name); err != nil {
 		return fmt.Errorf("停 golden 容器: %w", err)
 	}
 	return nil
+}
+
+// goldenStamp 基底标记的内容：镜像名，有默认身份时再加上身份。
+// 没配身份时就是纯镜像名，与旧版写的标记兼容，升级不会平白重造一次。
+func (n *Node) goldenStamp() string {
+	if n.DefaultIdentity == nil {
+		return n.Image
+	}
+	id := *n.DefaultIdentity
+	return n.Image + " " + strings.Join([]string{id.Model, id.Brand, id.Manufacturer, id.Device, id.Name}, "/")
 }
 
 // waitBootContainer 与 WaitBoot 相同但按容器名等待。
