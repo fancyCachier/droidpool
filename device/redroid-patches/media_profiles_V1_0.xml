@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     redroid 官方镜像不带 media_profiles.xml。缺了它，frameworks/av 的
+     MediaProfiles 会退回一份内置默认，而那份默认只有 H.263/MPEG-4-SP 两个
+     视频编码器，最大帧尺寸都是 352x288（CIF）。
+
+     后果不在录像，而在**相机能不能打开**：老式 Camera1 API 的
+     Parameters::initialize 会拿「所有视频编码器的最大帧尺寸」当可录制视频
+     尺寸的上界，再用 getFilteredSizes 把相机输出尺寸按这个界过滤。外接相机
+     只报 1280x720 一个尺寸，面积 921600 远超默认上界 352x288 的 101376，
+     于是被滤光，availableVideoSizes 为空，getFilteredSizes 返回错误并打印
+     误导性的 "generated preview size list is empty!!"，相机初始化失败，
+     应用弹「无法连接到相机」。AOSP 自带的 Camera2 应用走的正是 Camera1 API。
+
+     所以这里补一份，关键只有一处：声明一个 h264 VideoEncoderCap，最大帧
+     尺寸给到 1920x1080，把上界抬到 1280x720 之上。CamcorderProfiles 用
+     标准档，供 MediaRecorder / 录像用；redroid 是 SwiftShader 软件编码，
+     封顶 1080p 就够，且相机源本身也只有 720p。
+
+     安装路径见 apply-camera.sh：拷到 vendor/etc/media_profiles_V1_0.xml，
+     命中 MediaProfiles::getXmlPaths() 的搜索序（product/odm/vendor/system）。
+-->
+<!DOCTYPE MediaSettings SYSTEM "/system/etc/media_profiles_V1_0.dtd">
+<MediaSettings>
+    <CamcorderProfiles cameraId="0">
+        <EncoderProfile quality="low" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="192000" width="176" height="144" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <EncoderProfile quality="high" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="20000000" width="1920" height="1080" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <EncoderProfile quality="qcif" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="192000" width="176" height="144" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <EncoderProfile quality="cif" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="1200000" width="352" height="288" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <EncoderProfile quality="480p" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="6000000" width="720" height="480" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <EncoderProfile quality="720p" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="12000000" width="1280" height="720" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <EncoderProfile quality="1080p" fileFormat="mp4" duration="30">
+            <Video codec="h264" bitRate="20000000" width="1920" height="1080" frameRate="30" />
+            <Audio codec="aac" bitRate="96000" sampleRate="48000" channels="1" />
+        </EncoderProfile>
+        <ImageEncoding quality="95" />
+        <ImageEncoding quality="80" />
+        <ImageEncoding quality="70" />
+        <ImageDecoding memCap="20000000" />
+    </CamcorderProfiles>
+
+    <EncoderOutputFileFormat name="3gp" />
+    <EncoderOutputFileFormat name="mp4" />
+
+    <VideoEncoderCap name="h264" enabled="true"
+        minBitRate="64000" maxBitRate="20000000"
+        minFrameWidth="176" maxFrameWidth="1920"
+        minFrameHeight="144" maxFrameHeight="1080"
+        minFrameRate="15" maxFrameRate="30" />
+    <VideoEncoderCap name="h263" enabled="true"
+        minBitRate="64000" maxBitRate="1000000"
+        minFrameWidth="176" maxFrameWidth="352"
+        minFrameHeight="144" maxFrameHeight="288"
+        minFrameRate="15" maxFrameRate="30" />
+    <VideoEncoderCap name="m4v" enabled="true"
+        minBitRate="64000" maxBitRate="20000000"
+        minFrameWidth="176" maxFrameWidth="1920"
+        minFrameHeight="144" maxFrameHeight="1080"
+        minFrameRate="15" maxFrameRate="30" />
+
+    <AudioEncoderCap name="aac" enabled="true"
+        minBitRate="8000" maxBitRate="288000"
+        minSampleRate="8000" maxSampleRate="48000"
+        minChannels="1" maxChannels="2" />
+    <AudioEncoderCap name="amrnb" enabled="true"
+        minBitRate="5525" maxBitRate="12200"
+        minSampleRate="8000" maxSampleRate="8000"
+        minChannels="1" maxChannels="1" />
+
+    <VideoDecoderCap name="wmv" enabled="false" />
+    <AudioDecoderCap name="wma" enabled="false" />
+</MediaSettings>

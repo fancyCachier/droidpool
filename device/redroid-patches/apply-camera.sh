@@ -16,7 +16,7 @@ DEV="$SRC/device/redroid"
 install -m 644 "$HERE/external_camera_config.xml" "$DEV/external_camera_config.xml"
 
 # 2) redroid.mk：HAL 服务 + 权限声明 + 配置
-if grep -q 'camera.provider@2.7-external-service' "$DEV/redroid.mk"; then
+if grep -q 'etc/external_camera_config.xml' "$DEV/redroid.mk"; then
   echo "  redroid.mk 已含 camera 配置，跳过"
 else
   cat >> "$DEV/redroid.mk" <<'MK'
@@ -41,6 +41,25 @@ PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/external_camera_config.xml:$(TARGET_COPY_OUT_VENDOR)/etc/external_camera_config.xml
 MK
   echo "  redroid.mk 已追加"
+fi
+
+# 2.5) media_profiles：redroid 不带这个文件，MediaProfiles 退回内置默认，
+#      而默认只有 H.263/M4V 两个编码器、最大帧尺寸 352x288。老式 Camera1 API
+#      用「视频编码器最大帧尺寸」当可录制尺寸上界过滤相机输出，1280x720 超界
+#      被滤光，相机初始化失败报「无法连接到相机」（AOSP Camera2 应用走 Camera1）。
+#      补一份带 h264/1080p 的进去，把上界抬过 720p。详见该 xml 的头注释。
+install -m 644 "$HERE/media_profiles_V1_0.xml" "$DEV/media_profiles_V1_0.xml"
+if grep -q 'media_profiles_V1_0.xml' "$DEV/redroid.mk"; then
+  echo "  redroid.mk 已含 media_profiles，跳过"
+else
+  cat >> "$DEV/redroid.mk" <<'MK'
+
+# media_profiles：没有它相机应用打不开（见 apply-camera.sh 注释）。
+# 拷到 vendor/etc，命中 MediaProfiles 的搜索序（product/odm/vendor/system）。
+PRODUCT_COPY_FILES += \
+    $(LOCAL_PATH)/media_profiles_V1_0.xml:$(TARGET_COPY_OUT_VENDOR)/etc/media_profiles_V1_0.xml
+MK
+  echo "  redroid.mk 已追加 media_profiles"
 fi
 
 # 3) VINTF manifest：不声明的话 hwservicemanager 找不到这个 HAL，
