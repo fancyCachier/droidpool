@@ -667,7 +667,7 @@ func TestSetIdentityNormalizesAndValidates(t *testing.T) {
 	// 非法值进不了 sed
 	for _, bad := range []map[string]any{
 		{"model": "a/b", "brand": "x"},
-		{"brand": "x"},   // 没型号
+		{"brand": "x"},  // 没型号
 		{"model": "X1"}, // 没品牌没厂商
 		{"model": "X1", "brand": "x", "serial": "AB-1"},
 	} {

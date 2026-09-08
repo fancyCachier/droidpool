@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -83,7 +84,9 @@ func TestCreateWithIdentityOverridesAllFourPropFiles(t *testing.T) {
 	}
 	script := w[len(w)-1]
 	for _, want := range []string{
-		"mkdir -p /out/d1",
+		"set -e\nmkdir -p /out/d1\n",
+		// 结束符之后必须换行再接下一段，接 && 是语法错误（线上踩过）
+		"DROIDPOOLEOF\ncat > /out/d1/vendor.prop",
 		"cat > /out/d1/system.prop <<'DROIDPOOLEOF'",
 		"cat > /out/d1/vendor.prop <<'DROIDPOOLEOF'",
 		"cat > /out/d1/product.prop <<'DROIDPOOLEOF'",
@@ -152,11 +155,11 @@ func TestFirstFileInTar(t *testing.T) {
 func TestCreateWithExplicitSerial(t *testing.T) {
 	f := withProps(t, &fakeRunner{})
 	id := acme()
-	id.Serial = "T2S0001"
+	id.Serial = "X10001"
 	if err := testNode(f).Create(context.Background(), "d1", 5561, "", id); err != nil {
 		t.Fatal(err)
 	}
-	if run := strings.Join(f.lastMatching("run -d"), " "); !strings.Contains(run, "androidboot.serialno=T2S0001") {
+	if run := strings.Join(f.lastMatching("run -d"), " "); !strings.Contains(run, "androidboot.serialno=X10001") {
 		t.Errorf("应用显式序列号: %s", run)
 	}
 }
@@ -279,5 +282,25 @@ func TestMakeGoldenRebuildsWhenIdentityChanged(t *testing.T) {
 	}
 	if f.lastMatching("run -d") == nil {
 		t.Error("默认身份变了应重造 golden")
+	}
+}
+
+// 写回脚本是拼出来的 sh，语法错只有跑到节点上才会炸；这里用本机 sh -n 先把关。
+// 不是 adb / docker，只是本地 shell 的语法检查，不碰任何外部服务。
+func TestPropsScriptParsesAsShell(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("本机没有 sh")
+	}
+	f := withProps(t, &fakeRunner{})
+	if err := testNode(f).Create(context.Background(), "d1", 5561, "", acme()); err != nil {
+		t.Fatal(err)
+	}
+	w := f.lastMatching("cat > /out/d1/")
+	script := w[len(w)-1]
+	cmd := exec.Command(sh, "-n")
+	cmd.Stdin = strings.NewReader(script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("写回脚本过不了 sh -n: %v\n%s\n脚本:\n%s", err, out, script)
 	}
 }

@@ -72,8 +72,10 @@ func (n *Node) identityArgs(ctx context.Context, name string, ident *pool.Identi
 		return nil, nil, fmt.Errorf("从镜像取 build.prop: %w", err)
 	}
 	defer n.docker(context.Background(), "rm", "-f", tmp)
+	// 各段用换行分隔：heredoc 结束符之后那一行不能再接 &&（sh 报 unexpected "&&"，
+	// 2026-09-09 线上实测），靠 set -e 保证任一步失败即整体失败。
 	var script strings.Builder
-	fmt.Fprintf(&script, "mkdir -p /out/%s", name)
+	fmt.Fprintf(&script, "set -e\nmkdir -p /out/%s\n", name)
 	for _, f := range propFiles {
 		out, err := n.docker(ctx, "cp", tmp+":"+f.inContainer, "-")
 		if err != nil {
@@ -83,7 +85,7 @@ func (n *Node) identityArgs(ctx context.Context, name string, ident *pool.Identi
 		if err != nil {
 			return nil, nil, fmt.Errorf("解析 %s: %w", f.inContainer, err)
 		}
-		fmt.Fprintf(&script, " && cat > /out/%s/%s <<'DROIDPOOLEOF'\n%sDROIDPOOLEOF\n",
+		fmt.Fprintf(&script, "cat > /out/%s/%s <<'DROIDPOOLEOF'\n%sDROIDPOOLEOF\n",
 			name, f.name, rewriteProps(content, *ident))
 	}
 	if _, err := n.docker(ctx, "run", "--rm", "-v", n.DataRoot+"/props:/out", "busybox:stable",
