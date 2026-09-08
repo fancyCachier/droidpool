@@ -258,7 +258,12 @@ func (m *Manager) SetIdentity(ctx context.Context, deviceID string, ident *Ident
 	if err := m.Store.UpsertDevice(cur); err != nil {
 		return effective, true, err
 	}
-	m.log().Info("设备已按新身份重建", "device", deviceID, "model", effective.Model)
+	// 撤销覆盖且节点没配默认身份时 effective 为 nil（回到镜像原样），不能直接取 Model
+	model := "(镜像原样)"
+	if effective != nil {
+		model = effective.Model
+	}
+	m.log().Info("设备已按新身份重建", "device", deviceID, "model", model)
 	return effective, true, nil
 }
 

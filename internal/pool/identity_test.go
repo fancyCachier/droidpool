@@ -233,3 +233,25 @@ func TestResetSkipsLocationWhenUnset(t *testing.T) {
 		t.Error("没配定位不该下发")
 	}
 }
+
+// 节点没配默认身份时撤销覆盖 = 回到镜像原样：effective 为 nil，重建不能带身份，
+// 也不能因为取 nil 的字段而 panic（线上 --reset 撞到过，请求端只看到 EOF）。
+func TestSetIdentityNilWithoutNodeDefaultRebuildsToImage(t *testing.T) {
+	drv, st := &fakeDriver{}, newMemStore()
+	own := Identity{Model: "X1", Brand: "ACME"}.Normalized()
+	_ = st.UpsertDevice(&Device{ID: "3588-a-1", State: StateLeased, Identity: &own})
+	m := newManager(drv, st, 1)
+	eff, rebuilt, err := m.SetIdentity(context.Background(), "3588-a-1", nil)
+	if err != nil || !rebuilt {
+		t.Fatalf("rebuilt=%v err=%v", rebuilt, err)
+	}
+	if eff != nil {
+		t.Errorf("没有节点默认时撤销后应为 nil（镜像原样），实际 %+v", eff)
+	}
+	if got := drv.identities["3588-a-1"]; got != nil {
+		t.Errorf("重建不该带身份: %+v", got)
+	}
+	if d, _ := st.GetDevice("3588-a-1"); d.State != StateLeased || d.Identity != nil {
+		t.Errorf("租约应保留、覆盖应清掉: state=%s identity=%+v", d.State, d.Identity)
+	}
+}
