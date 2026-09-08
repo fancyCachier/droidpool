@@ -194,7 +194,7 @@ playbook, including the UI-driving pitfalls we hit.
 |---|---|
 | Claude Code | a skill that wraps the CLI and hooks into the worktree lifecycle |
 | DeepSeek harness (dsh) | `/droidpool` command plugin; usage and pitfalls are injected into the system prompt |
-| Any MCP client | `droidpool-mcp` (stdio) exposes `droidpool_claim / run / status / heartbeat / release / devices` |
+| Any MCP client | `droidpool-mcp` (stdio) exposes `droidpool_claim / run / status / heartbeat / release / devices / identity / location` |
 
 ```bash
 claude mcp add droidpool -e DROIDPOOL_URL=http://<control-plane>:8600 -e DROIDPOOL_TOKEN=<token> -- droidpool-mcp

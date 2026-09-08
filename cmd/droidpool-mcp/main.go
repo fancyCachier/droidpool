@@ -32,6 +32,11 @@ type client struct {
 }
 
 func (c *client) do(ctx context.Context, method, path string, body any) (int, []byte, error) {
+	return c.doWith(c.http, ctx, method, path, body)
+}
+
+// doWith 用指定的 http.Client 发请求：identity 要同步等设备重建（几十秒），默认 60 s 的客户端不够。
+func (c *client) doWith(h *http.Client, ctx context.Context, method, path string, body any) (int, []byte, error) {
 	var buf bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
@@ -44,7 +49,7 @@ func (c *client) do(ctx context.Context, method, path string, body any) (int, []
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	resp, err := h.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -247,6 +252,103 @@ func (c *client) devices(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}
 	return text(b.String()), nil, nil
 }
 
+// devErr 设备接口的错误：控制面给了原因就照抄（这里的 503 是「未接管理」之类，
+// 不是 claim 那种内存不足），否则退回 errText。
+func devErr(code int, raw []byte) string {
+	var e struct{ Error, Message string }
+	if json.Unmarshal(raw, &e) == nil && e.Message != "" {
+		return e.Message
+	}
+	return errText(code, raw)
+}
+
+type identityIn struct {
+	DeviceID     string `json:"device_id" jsonschema:"claim 返回的 device_id"`
+	Model        string `json:"model,omitempty" jsonschema:"Build.MODEL，如 X1。不 reset 时必填"`
+	Brand        string `json:"brand,omitempty" jsonschema:"Build.BRAND，如 ACME。brand 与 manufacturer 至少给一个，互相兜底"`
+	Manufacturer string `json:"manufacturer,omitempty" jsonschema:"Build.MANUFACTURER，默认同 brand"`
+	Device       string `json:"device,omitempty" jsonschema:"Build.DEVICE，默认由型号派生（小写字母数字）"`
+	Name         string `json:"name,omitempty" jsonschema:"Build.PRODUCT，默认同 device"`
+	Serial       string `json:"serial,omitempty" jsonschema:"序列号（字母数字），默认按设备派生、每台不同"`
+	Reset        bool   `json:"reset,omitempty" jsonschema:"true = 撤销覆盖，回到池子默认"`
+	ADBAddr      string `json:"adb_addr,omitempty" jsonschema:"claim 返回的 adb 地址；给了就在重建后顺手 adb connect"`
+}
+
+type identityOut struct {
+	Identity map[string]string `json:"identity,omitempty"`
+	Rebuilt  bool              `json:"rebuilt"`
+}
+
+func (c *client) identity(ctx context.Context, _ *mcp.CallToolRequest, in identityIn) (*mcp.CallToolResult, identityOut, error) {
+	if in.DeviceID == "" {
+		return fail("需要 device_id（claim 返回）。"), identityOut{}, nil
+	}
+	body := map[string]string{}
+	if !in.Reset {
+		if in.Model == "" {
+			return fail("要么给 model（可带 brand / manufacturer / device / name / serial），要么 reset=true。"), identityOut{}, nil
+		}
+		body = map[string]string{
+			"model": in.Model, "brand": in.Brand, "manufacturer": in.Manufacturer,
+			"device": in.Device, "name": in.Name, "serial": in.Serial,
+		}
+	}
+	// 重建同步等，60 s 不够；控制面自己的上限是 3 分钟
+	code, raw, err := c.doWith(&http.Client{Timeout: 3 * time.Minute}, ctx, "PUT", "/api/devices/"+in.DeviceID+"/identity", body)
+	if err != nil {
+		return fail("连不上控制面: " + err.Error()), identityOut{}, nil
+	}
+	if code >= 400 {
+		return fail(devErr(code, raw)), identityOut{}, nil
+	}
+	var out identityOut
+	_ = json.Unmarshal(raw, &out)
+	var b strings.Builder
+	if out.Identity == nil {
+		b.WriteString("已回到镜像原样（redroid 默认型号）。")
+	} else {
+		fmt.Fprintf(&b, "型号: %s / %s / %s（device=%s product=%s serial=%s）。",
+			out.Identity["brand"], out.Identity["model"], out.Identity["manufacturer"],
+			out.Identity["device"], out.Identity["name"], out.Identity["serial"])
+	}
+	if !out.Rebuilt {
+		b.WriteString("\n型号没变或设备正在重建中，本次未重建。")
+		return text(b.String()), out, nil
+	}
+	b.WriteString("\n设备已重建：数据清空、之前装的包没了，接着用 droidpool_run 装包。")
+	if in.ADBAddr != "" {
+		// 容器换了，adb 那头的连接已断，顺手接回来；失败不阻断
+		_ = exec.CommandContext(ctx, "adb", "connect", in.ADBAddr).Run()
+	}
+	return text(b.String()), out, nil
+}
+
+type locationIn struct {
+	DeviceID string `json:"device_id" jsonschema:"claim 返回的 device_id"`
+	Location string `json:"location,omitempty" jsonschema:"纬度,经度（WGS84），如 23.1291,113.2644；留空 = 撤销覆盖，回到池子默认"`
+}
+
+func (c *client) location(ctx context.Context, _ *mcp.CallToolRequest, in locationIn) (*mcp.CallToolResult, any, error) {
+	if in.DeviceID == "" {
+		return fail("需要 device_id（claim 返回）。"), nil, nil
+	}
+	code, raw, err := c.do(ctx, "PUT", "/api/devices/"+in.DeviceID+"/location", map[string]string{"location": in.Location})
+	if err != nil {
+		return fail("连不上控制面: " + err.Error()), nil, nil
+	}
+	if code >= 400 {
+		return fail(devErr(code, raw)), nil, nil
+	}
+	var out struct {
+		MockLocation string `json:"mock_location"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	if out.MockLocation == "" {
+		return text("已撤销定位覆盖，回到池子默认。"), nil, nil
+	}
+	return text(fmt.Sprintf("mock 定位: %s（gps 与 network provider，Location.isMock() 为 true）。", out.MockLocation)), nil, nil
+}
+
 func mustCwd() string {
 	d, err := os.Getwd()
 	if err != nil {
@@ -269,6 +371,7 @@ func main() {
 2. droidpool_run 装包、写后端端点、过首启引导到登录页
 3. 用 adb -s <adb_addr> 驱动 UI
 4. droidpool_release 归还
+要改设备报的机型（Build.MODEL 等）用 droidpool_identity：在 claim 之后、run 之前做，会重建设备；mock 定位用 droidpool_location，即时生效。
 别绕过池子直接 adb connect 节点。30 分钟无活动租约会被收回，长任务定期 droidpool_heartbeat。
 droidpool_status 报人工接管时立刻停手。池里测不了微信登录/扫码/蓝牙/USB。`,
 	})
@@ -285,6 +388,10 @@ droidpool_status 报人工接管时立刻停手。池里测不了微信登录/�
 		Description: "归还设备。设备会被清空重建，装的包与登录态全部消失。"}, c.release)
 	mcp.AddTool(srv, &mcp.Tool{Name: "droidpool_devices",
 		Description: "列出池中所有设备及占用情况，看池满时谁占着。"}, c.devices)
+	mcp.AddTool(srv, &mcp.Tool{Name: "droidpool_identity",
+		Description: "改设备对外报的硬件型号（Build.MODEL/BRAND/MANUFACTURER/DEVICE/PRODUCT + 序列号）。会重建设备：数据清空、租约保留、adb 地址不变，约 20~40 s，所以在 claim 之后、droidpool_run 之前做。reset=true 撤销覆盖。"}, c.identity)
+	mcp.AddTool(srv, &mcp.Tool{Name: "droidpool_location",
+		Description: "给设备设 mock 定位（纬度,经度），即时生效，复位后由控制面重放；Location.isMock() 为 true，高德/百度 SDK 默认丢弃 mock 位置。location 留空 = 撤销覆盖。"}, c.location)
 
 	if err := srv.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatal(err)

@@ -191,7 +191,7 @@ claude mcp add droidpool \
 ```
 
 工具：`droidpool_claim` / `droidpool_run` / `droidpool_status` / `droidpool_heartbeat` /
-`droidpool_release` / `droidpool_devices`。server 的 instructions 里已写明流程与坑，
+`droidpool_release` / `droidpool_devices` / `droidpool_identity`（改机型，会重建）/ `droidpool_location`（mock 定位）。server 的 instructions 里已写明流程与坑，
 agent 连上就知道该怎么用。三种方式背后是同一个控制面与同一份 CLI 逻辑，行为一致。
 
 ## 11. 环境变量
