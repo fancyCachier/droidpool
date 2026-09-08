@@ -21,7 +21,7 @@ func egressReplies() []reply {
 
 func TestCreateWithEgressWiresSidecars(t *testing.T) {
 	f := &fakeRunner{replies: egressReplies()}
-	if err := egressNode(f).Create(context.Background(), "d1", 5561, ""); err != nil {
+	if err := egressNode(f).Create(context.Background(), "d1", 5561, "", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -55,7 +55,7 @@ func TestCreateWithEgressWiresSidecars(t *testing.T) {
 
 func TestCreateWithoutEgressUnchanged(t *testing.T) {
 	f := &fakeRunner{}
-	if err := testNode(f).Create(context.Background(), "d1", 5561, ""); err != nil {
+	if err := testNode(f).Create(context.Background(), "d1", 5561, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(f.lastMatching("--name droidpool-d1"), " ")
@@ -237,7 +237,7 @@ func TestCreatePassesCameraDevice(t *testing.T) {
 	f := &fakeRunner{}
 	n := testNode(f)
 	n.CameraVideoBase = 20
-	if err := n.Create(context.Background(), "3588-a-3", 5563, ""); err != nil {
+	if err := n.Create(context.Background(), "3588-a-3", 5563, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if j := strings.Join(f.lastMatching("--name droidpool-3588-a-3"), " "); !strings.Contains(j, "--device /dev/video23") {
@@ -247,7 +247,7 @@ func TestCreatePassesCameraDevice(t *testing.T) {
 
 func TestCreateOmitsCameraWhenDisabled(t *testing.T) {
 	f := &fakeRunner{}
-	if err := testNode(f).Create(context.Background(), "3588-a-3", 5563, ""); err != nil {
+	if err := testNode(f).Create(context.Background(), "3588-a-3", 5563, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if j := strings.Join(f.lastMatching("--name droidpool-3588-a-3"), " "); strings.Contains(j, "/dev/video") {
@@ -365,7 +365,7 @@ func TestCreateMountsPerDeviceCameraConfig(t *testing.T) {
 	f := &fakeRunner{}
 	n := testNode(f)
 	n.CameraVideoBase = 20
-	if err := n.Create(context.Background(), "3588-a-3", 5563, ""); err != nil {
+	if err := n.Create(context.Background(), "3588-a-3", 5563, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	j := strings.Join(f.lastMatching("--name droidpool-3588-a-3"), " ")

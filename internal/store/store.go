@@ -4,6 +4,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -32,7 +33,10 @@ CREATE TABLE IF NOT EXISTS devices (
   last_health_at INTEGER NOT NULL DEFAULT 0,
   health_fails  INTEGER NOT NULL DEFAULT 0,
   egress_proxy  TEXT NOT NULL DEFAULT '',
-  camera_rtsp   TEXT NOT NULL DEFAULT ''
+  camera_rtsp   TEXT NOT NULL DEFAULT '',
+  -- identity 是 pool.Identity 的 JSON，空 = 用节点默认
+  identity      TEXT NOT NULL DEFAULT '',
+  mock_location TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS leases (
   id            TEXT PRIMARY KEY,
@@ -74,7 +78,7 @@ func Open(path string) (*Store, error) {
 	}
 	// schema 用的是 CREATE TABLE IF NOT EXISTS，对已存在的库不会补列，
 	// 所以新增列要单独 ALTER。重复执行会报 duplicate column name，忽略即可。
-	for _, col := range []string{"egress_proxy", "camera_rtsp"} {
+	for _, col := range []string{"egress_proxy", "camera_rtsp", "identity", "mock_location"} {
 		if _, err := db.Exec(`ALTER TABLE devices ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
 			db.Close()
@@ -104,22 +108,47 @@ func fromUnix(v int64) time.Time {
 
 func (s *Store) UpsertDevice(d *pool.Device) error {
 	_, err := s.db.Exec(`
-		INSERT INTO devices (id, node, container, adb_addr, state, created_at, last_health_at, health_fails, egress_proxy, camera_rtsp)
-		VALUES (?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO devices (id, node, container, adb_addr, state, created_at, last_health_at, health_fails, egress_proxy, camera_rtsp, identity, mock_location)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  node=excluded.node, container=excluded.container, adb_addr=excluded.adb_addr,
 		  state=excluded.state, last_health_at=excluded.last_health_at, health_fails=excluded.health_fails`,
 		d.ID, d.Node, d.Container, d.ADBAddr, string(d.State),
-		unix(d.CreatedAt), unix(d.LastHealthy), d.HealthFails, d.EgressProxy, d.CameraRTSP)
+		unix(d.CreatedAt), unix(d.LastHealthy), d.HealthFails, d.EgressProxy, d.CameraRTSP,
+		encodeIdentity(d.Identity), d.MockLocation)
 	return err
+}
+
+// encodeIdentity 把身份编成 JSON 存库，nil 存空串。
+func encodeIdentity(id *pool.Identity) string {
+	if id == nil {
+		return ""
+	}
+	b, _ := json.Marshal(id)
+	return string(b)
+}
+
+func decodeIdentity(s string) (*pool.Identity, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var id pool.Identity
+	if err := json.Unmarshal([]byte(s), &id); err != nil {
+		return nil, fmt.Errorf("解析 identity %q: %w", s, err)
+	}
+	return &id, nil
 }
 
 func scanDevice(sc interface{ Scan(...any) error }) (*pool.Device, error) {
 	var d pool.Device
-	var st string
+	var st, ident string
 	var created, health int64
 	if err := sc.Scan(&d.ID, &d.Node, &d.Container, &d.ADBAddr, &st, &created, &health,
-		&d.HealthFails, &d.EgressProxy, &d.CameraRTSP); err != nil {
+		&d.HealthFails, &d.EgressProxy, &d.CameraRTSP, &ident, &d.MockLocation); err != nil {
+		return nil, err
+	}
+	var err error
+	if d.Identity, err = decodeIdentity(ident); err != nil {
 		return nil, err
 	}
 	d.State = pool.DeviceState(st)
@@ -128,7 +157,7 @@ func scanDevice(sc interface{ Scan(...any) error }) (*pool.Device, error) {
 	return &d, nil
 }
 
-const deviceCols = `id, node, container, adb_addr, state, created_at, last_health_at, health_fails, egress_proxy, camera_rtsp`
+const deviceCols = `id, node, container, adb_addr, state, created_at, last_health_at, health_fails, egress_proxy, camera_rtsp, identity, mock_location`
 
 func (s *Store) GetDevice(id string) (*pool.Device, error) {
 	row := s.db.QueryRow(`SELECT `+deviceCols+` FROM devices WHERE id=?`, id)
@@ -175,6 +204,31 @@ func (s *Store) SetDeviceEgress(id, proxy string) error {
 // 与 SetDeviceEgress 同理，单独一个方法免得被健康检查的 UpsertDevice 冲掉。
 func (s *Store) SetDeviceCamera(id, rtsp string) error {
 	res, err := s.db.Exec(`UPDATE devices SET camera_rtsp=? WHERE id=?`, rtsp, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetDeviceIdentity 记录一台设备的硬件身份覆盖，nil 表示撤销、回到节点默认。
+// 单独一个方法，理由同 SetDeviceEgress。
+func (s *Store) SetDeviceIdentity(id string, ident *pool.Identity) error {
+	res, err := s.db.Exec(`UPDATE devices SET identity=? WHERE id=?`, encodeIdentity(ident), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetDeviceLocation 记录一台设备的 mock 定位，空表示撤销、回到节点默认。
+func (s *Store) SetDeviceLocation(id, location string) error {
+	res, err := s.db.Exec(`UPDATE devices SET mock_location=? WHERE id=?`, location, id)
 	if err != nil {
 		return err
 	}

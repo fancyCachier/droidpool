@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fancyCachier/droidpool/internal/pool"
 	"github.com/fancyCachier/droidpool/internal/scrcpy"
 )
 
@@ -194,6 +195,10 @@ type wallDevice struct {
 	Egress string `json:"egress_proxy,omitempty"`
 	// Camera 这台设备的摄像头画面源，空 = 未推流。凭据已打码。
 	Camera string `json:"camera_rtsp,omitempty"`
+	// Identity 这台设备的硬件身份覆盖，nil = 节点默认。
+	Identity *pool.Identity `json:"identity,omitempty"`
+	// MockLocation 这台设备的 mock 定位覆盖，空 = 节点默认。
+	MockLocation string `json:"mock_location,omitempty"`
 }
 
 // wallSnapshot 组装设备墙需要的完整状态。SSE 与 HTTP 两条路共用它，
@@ -213,7 +218,8 @@ func (s *Server) wallSnapshot() map[string]any {
 	}
 	out := make([]wallDevice, 0, len(devices))
 	for _, d := range devices {
-		wd := wallDevice{ID: d.ID, ADBAddr: d.ADBAddr, State: string(d.State), Egress: d.EgressProxy, Camera: maskURLCredentials(d.CameraRTSP)}
+		wd := wallDevice{ID: d.ID, ADBAddr: d.ADBAddr, State: string(d.State), Egress: d.EgressProxy, Camera: maskURLCredentials(d.CameraRTSP),
+			Identity: d.Identity, MockLocation: d.MockLocation}
 		if i, ok := byDevice[d.ID]; ok {
 			l := leases[i]
 			exp := l.ExpiresAt

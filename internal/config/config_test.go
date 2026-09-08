@@ -201,3 +201,41 @@ wall_url = "https://droidpool.example.com/"
 		t.Errorf("wall_url 应去掉尾部斜杠，得到 %q", c.TLS.WallURL)
 	}
 }
+
+func TestNodeIdentityAndLocation(t *testing.T) {
+	c, err := Load(write(t, minimal+`
+identity = { model = "X1", brand = "ACME" }
+mock_location = "23.1291,113.2644"
+`))
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	id := c.Nodes[0].DefaultIdentity()
+	if id == nil || id.Model != "X1" || id.Manufacturer != "ACME" || id.Device != "x1" {
+		t.Errorf("默认身份应补齐派生字段: %+v", id)
+	}
+	if c.Nodes[0].MockLocation != "23.1291,113.2644" {
+		t.Errorf("mock_location = %q", c.Nodes[0].MockLocation)
+	}
+	// 没配就是 nil，Create 时不多做任何事
+	c, err = Load(write(t, minimal))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Nodes[0].DefaultIdentity() != nil {
+		t.Error("没配 identity 时应为 nil")
+	}
+}
+
+func TestNodeIdentityAndLocationValidated(t *testing.T) {
+	for name, extra := range map[string]string{
+		"型号带斜杠":  `identity = { model = "a/b", brand = "x" }`,
+		"只有品牌":   `identity = { brand = "ACME" }`,
+		"定位不是坐标": `mock_location = "广州"`,
+		"纬度越界":   `mock_location = "91,0"`,
+	} {
+		if _, err := Load(write(t, minimal+"\n"+extra+"\n")); err == nil {
+			t.Errorf("%s 应在加载时被拒", name)
+		}
+	}
+}

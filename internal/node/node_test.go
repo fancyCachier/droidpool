@@ -69,7 +69,7 @@ func TestContainerName(t *testing.T) {
 func TestCreateWithOverlay(t *testing.T) {
 	f := &fakeRunner{}
 	n := testNode(f)
-	if err := n.Create(context.Background(), "d1", 5561, "/data/droidpool/base"); err != nil {
+	if err := n.Create(context.Background(), "d1", 5561, "/data/droidpool/base", nil); err != nil {
 		t.Fatal(err)
 	}
 	run := f.lastMatching("run -d")
@@ -103,7 +103,7 @@ func TestCreateWithOverlay(t *testing.T) {
 func TestCreateWithoutOverlay(t *testing.T) {
 	f := &fakeRunner{}
 	n := testNode(f)
-	if err := n.Create(context.Background(), "d2", 5562, ""); err != nil {
+	if err := n.Create(context.Background(), "d2", 5562, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(f.lastMatching("run -d"), " ")
@@ -222,7 +222,7 @@ func TestCreatePropagatesError(t *testing.T) {
 	boom := errors.New("ssh 不通")
 	f := &fakeRunner{replies: []reply{{match: "run -d", err: boom}}}
 	n := testNode(f)
-	if err := n.Create(context.Background(), "d1", 5561, ""); !errors.Is(err, boom) {
+	if err := n.Create(context.Background(), "d1", 5561, "", nil); !errors.Is(err, boom) {
 		t.Errorf("docker run 失败应向上传递，得到 %v", err)
 	}
 }

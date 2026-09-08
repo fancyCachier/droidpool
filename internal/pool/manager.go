@@ -9,7 +9,9 @@ import (
 
 // NodeDriver 是 Manager 需要的节点能力子集（由 internal/node.Node 实现）。
 type NodeDriver interface {
-	Create(ctx context.Context, deviceID string, port int, overlayBase string) error
+	// Create 起容器。ident 非 nil 时把硬件身份写进镜像的 build.prop 并设序列号，
+	// 这些是开机就定死的 ro.* 属性，所以只能在这里给。
+	Create(ctx context.Context, deviceID string, port int, overlayBase string, ident *Identity) error
 	Remove(ctx context.Context, deviceID string) error
 	// WipeData 清空设备数据目录。复位真正生效的一步——只重建容器的话，
 	// 宿主上的数据目录还在，上一个 agent 的状态会留给下一个。
@@ -22,6 +24,8 @@ type NodeDriver interface {
 	SetEgress(ctx context.Context, deviceID, proxy string) error
 	// SetCamera 换这台设备的摄像头画面源。只重建推流容器，设备不重启。
 	SetCamera(ctx context.Context, deviceID, rtsp string) error
+	// SetLocation 给运行中的设备设 mock 定位（"纬度,经度"），空串撤销。
+	SetLocation(ctx context.Context, deviceID, location string) error
 }
 
 // DeviceStore 是 Manager 需要的存储能力子集。
@@ -32,6 +36,8 @@ type DeviceStore interface {
 	SetDeviceState(id string, to DeviceState) error
 	SetDeviceEgress(id, proxy string) error
 	SetDeviceCamera(id, rtsp string) error
+	SetDeviceIdentity(id string, ident *Identity) error
+	SetDeviceLocation(id, location string) error
 }
 
 // Manager 负责把设备拉起来、复位、以及节点上的容器与库内记录对账。
@@ -44,7 +50,28 @@ type Manager struct {
 	PortBase    int
 	OverlayBase string // 非空则用 overlayfs 共享 data（零拷贝复位）
 	BootTimeout time.Duration
-	Log         *slog.Logger
+	// DefaultIdentity 节点上所有设备的默认硬件身份，nil = 镜像原样。
+	// 设备各自的 Identity 非 nil 时优先。
+	DefaultIdentity *Identity
+	// DefaultLocation 节点默认的 mock 定位，空 = 不 mock。设备各自的优先。
+	DefaultLocation string
+	Log             *slog.Logger
+}
+
+// effectiveIdentity 这台设备实际该用的身份：自己的优先，否则节点默认。
+func (m *Manager) effectiveIdentity(d *Device) *Identity {
+	if d != nil && d.Identity != nil {
+		return d.Identity
+	}
+	return m.DefaultIdentity
+}
+
+// effectiveLocation 这台设备实际该用的 mock 定位：自己的优先，否则节点默认。
+func (m *Manager) effectiveLocation(d *Device) string {
+	if d != nil && d.MockLocation != "" {
+		return d.MockLocation
+	}
+	return m.DefaultLocation
 }
 
 func (m *Manager) log() *slog.Logger {
@@ -97,7 +124,11 @@ func (m *Manager) createOne(ctx context.Context, i int) error {
 	if err := m.Store.UpsertDevice(d); err != nil {
 		return err
 	}
-	if err := m.Driver.Create(ctx, id, m.Port(i), m.OverlayBase); err != nil {
+	// 库里可能已有这台设备的身份覆盖（broken 重建时），要带上
+	if old, err := m.Store.GetDevice(id); err == nil {
+		d.Identity = old.Identity
+	}
+	if err := m.Driver.Create(ctx, id, m.Port(i), m.OverlayBase, m.effectiveIdentity(d)); err != nil {
 		d.State = StateBroken
 		_ = m.Store.UpsertDevice(d)
 		return err
@@ -144,7 +175,104 @@ func (m *Manager) applyDeviceSettings(ctx context.Context, deviceID string) erro
 			return err
 		}
 	}
+	// mock 定位是运行态的（test provider 不落盘），容器一重建就没了，必须重放
+	if loc := m.effectiveLocation(d); loc != "" {
+		if err := m.Driver.SetLocation(ctx, deviceID, loc); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// SetLocation 改一台设备的 mock 定位并落库。运行中即时生效，设备与租约都不动。
+// location 为空表示撤销覆盖、回到节点默认（节点默认也为空时就是不 mock）。
+func (m *Manager) SetLocation(ctx context.Context, deviceID, location string) error {
+	d, err := m.Store.GetDevice(deviceID)
+	if err != nil {
+		return err
+	}
+	if err := m.Store.SetDeviceLocation(deviceID, location); err != nil {
+		return err
+	}
+	d.MockLocation = location
+	// 设备没在跑就只落库，等它起来时 applyDeviceSettings 会重放
+	if d.State != StateReady && d.State != StateLeased {
+		return nil
+	}
+	return m.Driver.SetLocation(ctx, deviceID, m.effectiveLocation(d))
+}
+
+// SetIdentity 改一台设备的硬件身份并落库，然后**重建**这台设备让它生效。
+//
+// 身份是开机定死的 ro.* 属性，没有运行中改的办法（改 build.prop 要重启，
+// setprop 对 ro.* 无效）。重建等价于复位：数据清空、容器重开，约 20~40 s。
+// 租约保留——agent 拿到手先设身份再装包，代价就只是等这几十秒；
+// adb 端口不变，重连即可。ident 为 nil 表示撤销覆盖、回到节点默认。
+//
+// 返回实际生效的身份，以及这次有没有真的重建：身份没变、或设备正处于
+// creating/resetting/broken（已经有人在重建它）时只落库不重建。
+func (m *Manager) SetIdentity(ctx context.Context, deviceID string, ident *Identity) (effective *Identity, rebuilt bool, err error) {
+	d, err := m.Store.GetDevice(deviceID)
+	if err != nil {
+		return nil, false, err
+	}
+	if ident != nil {
+		n := ident.Normalized()
+		if err := n.Validate(); err != nil {
+			return nil, false, err
+		}
+		ident = &n
+	}
+	before := m.effectiveIdentity(d)
+	if err := m.Store.SetDeviceIdentity(deviceID, ident); err != nil {
+		return nil, false, err
+	}
+	d.Identity = ident
+	effective = m.effectiveIdentity(d)
+	if sameIdentity(before, effective) {
+		return effective, false, nil
+	}
+	if d.State != StateReady && d.State != StateLeased {
+		return effective, false, nil
+	}
+	if d.State == StateReady {
+		// 先摘出池子，免得重建到一半被 claim 走：agent 拿到的是一台还在开机的设备，
+		// 而重建结束时的回写又会把 leased 冲成 ready。
+		if err := m.Store.SetDeviceState(deviceID, StateResetting); err != nil {
+			return effective, false, err
+		}
+	}
+	if err := m.rebuild(ctx, d); err != nil {
+		return effective, false, err
+	}
+	// 重建期间状态可能变了（leased 设备被归还），以库里的为准，不用 d 上的旧值
+	cur, err := m.Store.GetDevice(deviceID)
+	if err != nil {
+		return effective, true, err
+	}
+	if cur.State == StateResetting {
+		cur.State = StateReady
+	}
+	cur.LastHealthy = time.Now()
+	cur.HealthFails = 0
+	if err := m.Store.UpsertDevice(cur); err != nil {
+		return effective, true, err
+	}
+	// 撤销覆盖且节点没配默认身份时 effective 为 nil（回到镜像原样），不能直接取 Model
+	model := "(镜像原样)"
+	if effective != nil {
+		model = effective.Model
+	}
+	m.log().Info("设备已按新身份重建", "device", deviceID, "model", model)
+	return effective, true, nil
+}
+
+// sameIdentity 比较两份身份（nil 安全）。
+func sameIdentity(a, b *Identity) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // SetCamera 改一台设备的摄像头画面源并落库。推流容器重建不影响设备与租约。
@@ -213,6 +341,24 @@ func (m *Manager) Reset(ctx context.Context, deviceID string) error {
 	if err != nil {
 		return err
 	}
+	if err := m.rebuild(ctx, d); err != nil {
+		return err
+	}
+	d.State = StateReady
+	d.LastHealthy = time.Now()
+	d.HealthFails = 0
+	if err := m.Store.UpsertDevice(d); err != nil {
+		return err
+	}
+	m.log().Info("设备已复位", "device", deviceID)
+	return nil
+}
+
+// rebuild 删容器 → 清数据 → 按当前身份重建 → 等 boot → 重放每设备设置。
+// 不改库里的状态字段，由调用方决定重建完算 ready 还是保持 leased。
+// 失败时标 broken。
+func (m *Manager) rebuild(ctx context.Context, d *Device) error {
+	deviceID := d.ID
 	i, err := m.indexOf(deviceID)
 	if err != nil {
 		return err
@@ -227,7 +373,7 @@ func (m *Manager) Reset(ctx context.Context, deviceID string) error {
 		_ = m.Store.UpsertDevice(d)
 		return fmt.Errorf("清空设备数据失败，已标记 broken: %w", err)
 	}
-	if err := m.Driver.Create(ctx, deviceID, m.Port(i), m.OverlayBase); err != nil {
+	if err := m.Driver.Create(ctx, deviceID, m.Port(i), m.OverlayBase, m.effectiveIdentity(d)); err != nil {
 		d.State = StateBroken
 		_ = m.Store.UpsertDevice(d)
 		return err
@@ -241,13 +387,6 @@ func (m *Manager) Reset(ctx context.Context, deviceID string) error {
 		// 同 createOne：出口没接上时设备是直连，可用但不是预期状态，必须留痕
 		m.log().Error("每设备设置未落上，该设备为直连且无摄像头", "device", deviceID, "err", err)
 	}
-	d.State = StateReady
-	d.LastHealthy = time.Now()
-	d.HealthFails = 0
-	if err := m.Store.UpsertDevice(d); err != nil {
-		return err
-	}
-	m.log().Info("设备已复位", "device", deviceID)
 	return nil
 }
 

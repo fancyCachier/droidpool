@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/fancyCachier/droidpool/internal/pool"
 )
 
 // 默认值来自 Phase 1 实测（docs/2026-09-03-phase1-baseline.md）：
@@ -84,6 +86,20 @@ type Node struct {
 	// 配合自建镜像里的外接摄像头 HAL。画面由宿主侧的 rtsp-camera.sh 灌进去。
 	// 需要节点跑过 deploy/node/setup-node.sh（v4l2loopback）。
 	CameraVideoBase int `toml:"camera_video_base"`
+	// Identity 节点上所有设备默认报的硬件身份（Build.MODEL 等），不填 = 镜像原样
+	// （redroid14_arm64_only）。每台设备可经 API / CLI 单独覆盖。
+	Identity pool.Identity `toml:"identity"`
+	// MockLocation 默认 mock 定位 "纬度,经度"，不填 = 不 mock。每台设备可单独覆盖。
+	MockLocation string `toml:"mock_location"`
+}
+
+// DefaultIdentity 节点默认身份，没配时为 nil。已补齐派生字段。
+func (n Node) DefaultIdentity() *pool.Identity {
+	if n.Identity.IsZero() {
+		return nil
+	}
+	id := n.Identity.Normalized()
+	return &id
 }
 
 // Duration 让 TOML 里能写 "4h" 这样的字符串。
@@ -224,6 +240,14 @@ func (c *Config) validate() error {
 		}
 		if hi-lo+1 < n.MaxDevices {
 			return fmt.Errorf("节点 %s 端口区间 %d~%d 容纳不下 max_devices=%d", n.Name, lo, hi, n.MaxDevices)
+		}
+		if id := n.DefaultIdentity(); id != nil {
+			if err := id.Validate(); err != nil {
+				return fmt.Errorf("节点 %s 的 identity: %w", n.Name, err)
+			}
+		}
+		if _, _, err := pool.ParseLocation(n.MockLocation); err != nil {
+			return fmt.Errorf("节点 %s 的 mock_location: %w", n.Name, err)
 		}
 	}
 	return nil

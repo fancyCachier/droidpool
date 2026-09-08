@@ -70,6 +70,10 @@ type client struct {
 }
 
 func (c *client) do(method, path string, body any, out any) (int, error) {
+	return c.doWithTimeout(30*time.Second, method, path, body, out)
+}
+
+func (c *client) doWithTimeout(timeout time.Duration, method, path string, body any, out any) (int, error) {
 	var buf bytes.Buffer
 	if body != nil {
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
@@ -82,7 +86,7 @@ func (c *client) do(method, path string, body any, out any) (int, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -194,6 +198,12 @@ func main() {
 	case "camera":
 		touchIfLeased(c)
 		cmdCamera(c, os.Args[2:])
+	case "identity":
+		touchIfLeased(c)
+		cmdIdentity(c, os.Args[2:])
+	case "location":
+		touchIfLeased(c)
+		cmdLocation(c, os.Args[2:])
 	case "run":
 		touchIfLeased(c)
 		cmdRun(os.Args[2:])
@@ -368,6 +378,95 @@ func cmdCamera(c *client, args []string) {
 		fmt.Println("已停流（相机随之报 0 个设备）")
 	} else {
 		fmt.Printf("摄像头画面源: %s\n", resp.CameraRTSP)
+	}
+}
+
+// cmdIdentity 改这台设备对外报的硬件型号（Build.MODEL / BRAND / …）。
+//
+// 型号是开机定死的属性，控制面会**重建**这台设备来让它生效：数据清空、
+// 租约保留、adb 地址不变。所以要在 claim 之后、装包之前做，做完重连 adb。
+func cmdIdentity(c *client, args []string) {
+	fs := flag.NewFlagSet("identity", flag.ExitOnError)
+	model := fs.String("model", "", "Build.MODEL，如 X1（必填，除非 --reset）")
+	brand := fs.String("brand", "", "Build.BRAND，如 ACME（与 --manufacturer 至少给一个，互相兜底）")
+	manufacturer := fs.String("manufacturer", "", "Build.MANUFACTURER，默认同 --brand")
+	device := fs.String("device", "", "Build.DEVICE，默认由型号派生（小写字母数字）")
+	name := fs.String("name", "", "Build.PRODUCT，默认同 --device")
+	serial := fs.String("serial", "", "序列号（字母数字），默认按设备 id 派生、每台不同")
+	reset := fs.Bool("reset", false, "撤销覆盖，回到池子默认")
+	fs.Parse(args)
+	body := map[string]string{}
+	if !*reset {
+		if *model == "" {
+			fatal("要么 --model <型号> [--brand <品牌>]，要么 --reset")
+		}
+		body = map[string]string{
+			"model": *model, "brand": *brand, "manufacturer": *manufacturer,
+			"device": *device, "name": *name, "serial": *serial,
+		}
+	}
+	st, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println("→ 设备将按新型号重建（数据清空、租约保留），约 20~40 s…")
+	var resp struct {
+		Identity *struct {
+			Model, Brand, Manufacturer, Device, Name, Serial string
+		} `json:"identity"`
+		Rebuilt bool `json:"rebuilt"`
+	}
+	// 重建同步等，30 s 不够
+	if _, err := c.doWithTimeout(3*time.Minute, "PUT", "/api/devices/"+st.DeviceID+"/identity", body, &resp); err != nil {
+		fatal("设置型号失败: %v", err)
+	}
+	if resp.Identity == nil {
+		fmt.Println("已回到镜像原样（redroid 默认型号）")
+	} else {
+		id := resp.Identity
+		fmt.Printf("型号: %s / %s / %s（device=%s product=%s serial=%s）\n",
+			id.Brand, id.Model, id.Manufacturer, id.Device, id.Name, id.Serial)
+	}
+	if !resp.Rebuilt {
+		fmt.Println("型号没变或设备正在重建中，本次未重建")
+		return
+	}
+	// 容器换了，adb 那头的连接已断，顺手接回来
+	if out, err := exec.Command("adb", "connect", st.ADBAddr).CombinedOutput(); err == nil {
+		fmt.Printf("  %s", out)
+	}
+}
+
+// cmdLocation 给这台设备设 mock 定位，即时生效、复位后由控制面重放。
+//
+// 走 Android 自带的 test provider：Location.isMock() 为 true，高德/百度 SDK
+// 默认会丢弃 mock 位置（高德要 setMockEnable(true)）。
+func cmdLocation(c *client, args []string) {
+	fs := flag.NewFlagSet("location", flag.ExitOnError)
+	off := fs.Bool("off", false, "撤销覆盖，回到池子默认（池子也没配就是不 mock）")
+	fs.Parse(args)
+	loc := ""
+	if !*off {
+		if fs.NArg() != 1 {
+			fatal("用法：droidpool location <纬度,经度>（如 23.1291,113.2644）| --off")
+		}
+		loc = fs.Arg(0)
+	}
+	st, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	var resp struct {
+		MockLocation string `json:"mock_location"`
+	}
+	if _, err := c.do("PUT", "/api/devices/"+st.DeviceID+"/location",
+		map[string]string{"location": loc}, &resp); err != nil {
+		fatal("设置定位失败: %v", err)
+	}
+	if resp.MockLocation == "" {
+		fmt.Println("已撤销定位覆盖，回到池子默认")
+	} else {
+		fmt.Printf("mock 定位: %s（gps 与 network provider，isMock=true）\n", resp.MockLocation)
 	}
 }
 
@@ -682,6 +781,11 @@ func usage() {
             [--dex uiagent.dex] [--n 1]，或设 DROIDPOOL_UIAGENT_DEX
   camera    给设备接一路 RTSP 当摄像头（redroid 自身没有摄像头）
             --rtsp rtsp://host/live | --off
+  identity  改设备对外报的硬件型号（Build.MODEL/BRAND/MANUFACTURER/DEVICE/PRODUCT + 序列号）
+            --model X1 --brand ACME [--manufacturer] [--device] [--name] [--serial] | --reset
+            会重建设备（数据清空、租约保留、adb 地址不变），在 claim 之后、装包之前做
+  location  设 mock 定位，即时生效（Location.isMock() 为 true）
+            <纬度,经度> | --off
   run       一步到位：装包 → seed-edge → 启动 → 自动过引导页到登录页
             [--apk build/app/outputs/flutter-apk/app-debug.apk] [--no-seed] [--no-onboard]
   heartbeat 发一次心跳（告诉 watchdog 自己还活着）

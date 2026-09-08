@@ -21,10 +21,22 @@ type fakeDriver struct {
 	bootErr     map[string]error
 	egress      map[string]string
 	camera      map[string]string
+	location    map[string]string
+	identities  map[string]*Identity // Create 时收到的身份，nil 也记
 	finished    []string
 }
 
-func (f *fakeDriver) Create(_ context.Context, id string, port int, overlayBase string) error {
+func (f *fakeDriver) SetLocation(_ context.Context, id, loc string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.location == nil {
+		f.location = map[string]string{}
+	}
+	f.location[id] = loc
+	return nil
+}
+
+func (f *fakeDriver) Create(_ context.Context, id string, port int, overlayBase string, ident *Identity) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.createErr[id]; ok {
@@ -33,6 +45,10 @@ func (f *fakeDriver) Create(_ context.Context, id string, port int, overlayBase 
 	f.created = append(f.created, id)
 	f.ports = append(f.ports, port)
 	f.overlayArgs = append(f.overlayArgs, overlayBase)
+	if f.identities == nil {
+		f.identities = map[string]*Identity{}
+	}
+	f.identities[id] = ident
 	return nil
 }
 
@@ -91,8 +107,9 @@ func (f *fakeDriver) WaitBoot(_ context.Context, id string, _ time.Duration) err
 
 // memStore 内存版 DeviceStore，走真实的状态机校验。
 type memStore struct {
-	mu sync.Mutex
-	m  map[string]*Device
+	mu      sync.Mutex
+	m       map[string]*Device
+	history []string // 状态写入的先后记录，"id:state"
 }
 
 func newMemStore() *memStore { return &memStore{m: map[string]*Device{}} }
@@ -111,8 +128,37 @@ func (s *memStore) UpsertDevice(d *Device) error {
 		if c.CameraRTSP == "" {
 			c.CameraRTSP = old.CameraRTSP
 		}
+		// identity 与 mock_location 同理：健康检查回写不能把它们冲掉
+		if c.Identity == nil {
+			c.Identity = old.Identity
+		}
+		if c.MockLocation == "" {
+			c.MockLocation = old.MockLocation
+		}
 	}
 	s.m[d.ID] = &c
+	return nil
+}
+
+func (s *memStore) SetDeviceIdentity(id string, ident *Identity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.m[id]
+	if !ok {
+		return errors.New("不存在")
+	}
+	d.Identity = ident
+	return nil
+}
+
+func (s *memStore) SetDeviceLocation(id, loc string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.m[id]
+	if !ok {
+		return errors.New("不存在")
+	}
+	d.MockLocation = loc
 	return nil
 }
 
@@ -171,7 +217,20 @@ func (s *memStore) SetDeviceState(id string, to DeviceState) error {
 		return err
 	}
 	d.State = to
+	s.history = append(s.history, id+":"+string(to))
 	return nil
+}
+
+// sawState 报告某台设备是否经历过某个状态（经 SetDeviceState 或 UpsertDevice 写入）。
+func (s *memStore) sawState(id string, st DeviceState) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, h := range s.history {
+		if h == id+":"+string(st) {
+			return true
+		}
+	}
+	return false
 }
 
 func newManager(drv NodeDriver, st DeviceStore, max int) *Manager {

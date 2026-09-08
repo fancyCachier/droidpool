@@ -50,6 +50,8 @@ adb 会报 `more than one device`，或者更糟——命令打到别人的设�
 | `droidpool seed-edge [--host --port]` | 单独写 Edge 端点 + 证书 pin（`run` 已包含） |
 | `droidpool release` | 归还设备 |
 | `droidpool devices` | 列出池里所有设备 |
+| `droidpool identity --model X1 --brand ACME` | 改设备对外报的硬件型号（`Build.MODEL/BRAND/MANUFACTURER/DEVICE/PRODUCT` + 序列号）。**会重建设备**（数据清空、租约保留、adb 地址不变，约 20~40 s），所以要在 claim 之后、装包之前做；`--reset` 回到池子默认 |
+| `droidpool location 23.1291,113.2644` | 设 mock 定位，即时生效，复位后控制面会重放；`--off` 回到池子默认。走的是 Android 的 test provider，`Location.isMock()` 为 true，高德/百度 SDK 默认丢弃 mock 位置（高德要 `setMockEnable(true)`） |
 
 ## 3. 设备拿到手之后
 
@@ -189,7 +191,7 @@ claude mcp add droidpool \
 ```
 
 工具：`droidpool_claim` / `droidpool_run` / `droidpool_status` / `droidpool_heartbeat` /
-`droidpool_release` / `droidpool_devices`。server 的 instructions 里已写明流程与坑，
+`droidpool_release` / `droidpool_devices` / `droidpool_identity`（改机型，会重建）/ `droidpool_location`（mock 定位）。server 的 instructions 里已写明流程与坑，
 agent 连上就知道该怎么用。三种方式背后是同一个控制面与同一份 CLI 逻辑，行为一致。
 
 ## 11. 环境变量
