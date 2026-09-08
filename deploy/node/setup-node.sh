@@ -30,8 +30,14 @@ if modinfo v4l2loopback >/dev/null 2>&1; then
   # 关掉之后节点常驻 Capture+Output 两个能力位，反复起停都正常（实测停流后
   # 能力位不变）。HAL 并不要求 exclusive——它只看有没有 VIDEO_CAPTURE。
   # 注意它是数组参数，要逐个写满 8 个，写一个只作用于第 0 个。
+  #
+  # max_buffers=8：v4l2loopback 默认只给 2 个缓冲。external camera HAL 的
+  # NumVideoBuffers=4（external_camera_config.xml），configure 时 VIDIOC_REQBUFS
+  # 申请 4 个，默认上限 2 顶不住，报 "VIDIOC_REQBUFS expected 4 buffers, got 2
+  # instead"，流配置失败、预览起不来。给到 8 留足余量（8 台各自的节点，单缓冲
+  # 约 sizeimage=3.7MB，全开也才几十 MB）。
   cat > /etc/modprobe.d/droidpool-v4l2.conf <<'MODCONF'
-options v4l2loopback devices=8 video_nr=21,22,23,24,25,26,27,28 card_label=droidpool-cam1,droidpool-cam2,droidpool-cam3,droidpool-cam4,droidpool-cam5,droidpool-cam6,droidpool-cam7,droidpool-cam8 exclusive_caps=0,0,0,0,0,0,0,0
+options v4l2loopback devices=8 video_nr=21,22,23,24,25,26,27,28 card_label=droidpool-cam1,droidpool-cam2,droidpool-cam3,droidpool-cam4,droidpool-cam5,droidpool-cam6,droidpool-cam7,droidpool-cam8 exclusive_caps=0,0,0,0,0,0,0,0 max_buffers=8
 MODCONF
   echo v4l2loopback > /etc/modules-load.d/droidpool-v4l2.conf
   # v4l2loopback-ctl 用来设 fps。不设的话设备报 30 fps，超出
