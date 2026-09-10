@@ -161,6 +161,9 @@ droidpool release
 
 Long task? `droidpool watch &` keeps the heartbeat alive.
 
+The local lease record (`.droidpool`) lives at the top of the git worktree, so `claim` at the top and
+`run` from `cashier-app/` see the same device.
+
 Several agents on one machine sharing one checkout? Give each a distinct
 `DROIDPOOL_SESSION`: it becomes part of the idempotency key and of the local
 state file name, so the agents stop reusing one lease and piling onto a single
@@ -180,7 +183,7 @@ playbook, including the UI-driving pitfalls we hit.
 | `seed-edge [--host --port]` | Write backend endpoint + certificate pin into the app's prefs |
 | `status` | Show lease; exit 10 while a human has taken over |
 | `heartbeat` / `watch` | Prove liveness once / continuously |
-| `release` | Return the device (it gets wiped and rebuilt) |
+| `release` | Return the device (it gets wiped and rebuilt). Exits 1 and keeps the local record if the control plane refuses, so a failed release is never reported as success |
 | `devices` | List the pool |
 | `battery [--level 1..100]` | Fake a battery. Redroid has none, so apps read 0 % — `--status charging\|discharging\|full`, `--temp`, or `--reset` |
 | `ui-dump [--n 5]` | Dump the view hierarchy as XML through a resident agent (~25 ms vs ~380 ms for `uiautomator dump`) |

@@ -29,32 +29,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fancyCachier/droidpool/internal/localstate"
 	"github.com/fancyCachier/droidpool/internal/uiagent"
 )
 
-// stateFile 本地租约记录的路径。设了会话键就带后缀，多个会话共用一个目录时各记各的。
-func stateFile() string {
-	if s := sessionKey(); s != "" {
-		return ".droidpool." + s
-	}
-	return ".droidpool"
-}
-
-// sessionKey 返回 DROIDPOOL_SESSION（已做文件名安全化），未设置时为空。
-//
-// 幂等键原本只有 (host, worktree)，假设「同一主机同一目录再来一次 = 同一个 agent 在重试」。
-// dsh 这类多会话宿主在同一台机器、同一个检出里跑好几个 agent，这个假设不成立：
-// 后来者全都「复用既有租约」挤到同一台设备上（2026-09-04 线上 20 条租约 19 条在 1 号机）。
-// 会话键把每个会话分开，本地记录也随之分开；dsh 插件会自动注入，人手工用时可以不设。
-func sessionKey() string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
-			return r
-		}
-		return '-'
-	}, os.Getenv("DROIDPOOL_SESSION"))
-}
+// statePath 本地租约记录的位置：worktree 顶层（与幂等键同一口径），见 internal/localstate。
+func statePath() string { return localstate.Path(".") }
 
 // claimWorktree 组装发给控制面的幂等键后半段：worktree 名，带会话键时加 @会话。
 func claimWorktree(worktree, session string) string {
@@ -133,11 +113,11 @@ type leaseState struct {
 
 func saveState(s leaseState) error {
 	b, _ := json.MarshalIndent(s, "", "  ")
-	return os.WriteFile(stateFile(), b, 0o600)
+	return os.WriteFile(statePath(), b, 0o600)
 }
 
 func loadState() (leaseState, error) {
-	return loadStateFrom(stateFile())
+	return loadStateFrom(statePath())
 }
 
 func loadStateFrom(path string) (leaseState, error) {
@@ -222,14 +202,14 @@ func main() {
 }
 
 func cmdClaim(c *client) {
-	top, wt, branch, head := gitInfo()
+	_, wt, branch, head := gitInfo()
 	if wt == "" {
 		fatal("当前目录不是 git 仓库，无法推导 worktree 名")
 	}
 	host, _ := os.Hostname()
 	req := map[string]any{
 		"owner": os.Getenv("USER") + "@" + host, "host": host,
-		"worktree": claimWorktree(wt, sessionKey()), "branch": branch, "head_sha": head,
+		"worktree": claimWorktree(wt, localstate.SessionKey()), "branch": branch, "head_sha": head,
 	}
 	var resp struct {
 		leaseState
@@ -247,11 +227,11 @@ func cmdClaim(c *client) {
 		}
 		fatal("claim 失败: %v", err)
 	}
-	if resp.Reused && !heldHere(resp.LeaseID, top) {
+	if resp.Reused && !heldHere(resp.LeaseID) {
 		fmt.Fprint(os.Stderr, reuseWarning)
 	}
 	if err := saveState(resp.leaseState); err != nil {
-		fatal("写 %s 失败: %v", stateFile(), err)
+		fatal("写 %s 失败: %v", statePath(), err)
 	}
 	verb := "已分配"
 	if resp.Reused {
@@ -270,16 +250,12 @@ const reuseWarning = `⚠️  复用了既有租约，但本地没有它的记�
   （dsh 插件会自动注入），或者到各自的 worktree 里 claim。
 `
 
-// heldHere 报告复用到的租约是不是本目录（或本 worktree 顶层）自己 claim 出来的。
-// 都不是，就是幂等键撞了：同一主机上另一个会话正拿着这台设备。
-// 两处都查是因为 agent 常在 worktree 顶层 claim、再进子目录干活。
-func heldHere(leaseID, top string) bool {
-	for _, dir := range []string{".", top} {
-		if s, err := loadStateFrom(filepath.Join(dir, stateFile())); err == nil && s.LeaseID == leaseID {
-			return true
-		}
-	}
-	return false
+// heldHere 报告复用到的租约是不是本 worktree（+ 会话键）自己 claim 出来的。
+// 不是，就是幂等键撞了：同一主机上另一个会话正拿着这台设备。
+// 记录固定在 worktree 顶层，从子目录 claim 也读同一份（原先要同时查当前目录与顶层两处）。
+func heldHere(leaseID string) bool {
+	s, err := loadStateFrom(statePath())
+	return err == nil && s.LeaseID == leaseID
 }
 
 // heartbeat 告诉 watchdog「这个 agent 还活着」。失败只提示不中断——
@@ -739,11 +715,35 @@ func cmdRelease(c *client) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	if _, err := c.do("DELETE", "/api/leases/"+s.LeaseID, nil, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "归还接口报错（仍清理本地记录）: %v\n", err)
+	if s.LeaseID == "" {
+		// 例如 MCP run 只写了 adb 地址：DELETE /api/leases/ 会被路由层回 404，被误当成「租约已不在」
+		fatal("本地记录里没有租约 id（%s），没法归还：到设备墙释放，或用 MCP 的 droidpool_release", statePath())
 	}
-	_ = os.Remove(stateFile())
-	fmt.Printf("已归还设备 %s\n", s.DeviceID)
+	code, err := c.do("DELETE", "/api/leases/"+s.LeaseID, nil, nil)
+	msg, clear, ok := releaseOutcome(code, err, s.DeviceID)
+	if clear {
+		_ = os.Remove(statePath())
+	}
+	if !ok {
+		fatal("%s", msg)
+	}
+	fmt.Println(msg)
+}
+
+// releaseOutcome 归还的结果怎么落地：成功与「租约已不在」（404：已被回收或已归还）都清本地记录；
+// 其余失败保留记录、非零退出，让人或脚本能重试。原先一律打印「已归还」——调用方（如 merge 收尾）
+// 靠它判断，谎报会让设备白占到空闲回收。
+func releaseOutcome(code int, err error, deviceID string) (msg string, clear, ok bool) {
+	switch {
+	case err == nil:
+		return "已归还设备 " + deviceID, true, true
+	// 只认控制面业务层的 not_found：路由不匹配（地址写错、路径前缀不对）同样回 404，
+	// 那种情况设备还占着，清掉记录就再也还不了了
+	case code == http.StatusNotFound && strings.HasPrefix(err.Error(), "not_found:"):
+		return "租约已不在（已被回收或已归还），已清理本地记录", true, true
+	default:
+		return fmt.Sprintf("归还失败（本地记录保留，稍后重试 droidpool release）: %v", err), false, false
+	}
 }
 
 func cmdDevices(c *client) {
