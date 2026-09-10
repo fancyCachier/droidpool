@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -125,5 +127,24 @@ func TestLocationSetAndOff(t *testing.T) {
 	}
 	if res, _, _ := c.location(context.Background(), nil, locationIn{Location: "1,2"}); !res.IsError {
 		t.Error("没 device_id 应被拒")
+	}
+}
+
+// run 写本地租约记录：已有 CLI 记录时只更新 adb 地址，不能把 lease_id 冲掉（否则之后 CLI release 还不了）
+func TestWriteADBAddrKeepsExistingFields(t *testing.T) {
+	p := filepath.Join(t.TempDir(), ".droidpool")
+	if err := writeADBAddr(p, "10.0.0.1:5555"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"lease_id":"L1","device_id":"n-1","adb_addr":"old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeADBAddr(p, "10.0.0.2:5555"); err != nil {
+		t.Fatal(err)
+	}
+	var rec map[string]string
+	b, _ := os.ReadFile(p)
+	if err := json.Unmarshal(b, &rec); err != nil || rec["lease_id"] != "L1" || rec["device_id"] != "n-1" || rec["adb_addr"] != "10.0.0.2:5555" {
+		t.Errorf("应保留已有字段、只换 adb 地址，得到 %s", b)
 	}
 }

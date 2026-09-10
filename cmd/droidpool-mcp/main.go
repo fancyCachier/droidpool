@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/fancyCachier/droidpool/internal/localstate"
 )
 
 type client struct {
@@ -202,10 +204,11 @@ func (c *client) run(ctx context.Context, _ *mcp.CallToolRequest, in runIn) (*mc
 	if err != nil {
 		return fail("宿主 PATH 里没有 droidpool CLI；run 依赖它做装包与引导。装好后重试，或自己用 adb install + seed 端点。"), nil, nil
 	}
-	// CLI 靠 .droidpool 状态文件找设备；MCP 场景下直接写一份
-	st, _ := json.Marshal(map[string]string{"adb_addr": in.ADBAddr})
-	if err := os.WriteFile(".droidpool", st, 0o600); err != nil {
-		return fail("写 .droidpool 失败: " + err.Error()), nil, nil
+	// CLI 靠本地租约记录找设备：写到 CLI 会读的那个位置（worktree 顶层 + 会话键，共用 internal/localstate）。
+	// 原先固定写当前目录的 .droidpool：带会话键时 CLI 读的是另一个文件；已有 CLI 记录时还会把 lease_id 冲掉，
+	// 之后 droidpool release 就还不了。所以已有记录只更新 adb 地址。
+	if err := writeADBAddr(localstate.Path("."), in.ADBAddr); err != nil {
+		return fail("写本地租约记录失败: " + err.Error()), nil, nil
 	}
 	args := []string{"run", "--apk", in.APK}
 	if in.EdgeHost != "" {
@@ -221,6 +224,17 @@ func (c *client) run(ctx context.Context, _ *mcp.CallToolRequest, in runIn) (*mc
 		return fail(string(out)), nil, nil
 	}
 	return text(string(out)), nil, nil
+}
+
+// writeADBAddr 在本地租约记录里写入 adb 地址，保留已有字段（lease_id、device_id 等）。
+func writeADBAddr(path, addr string) error {
+	rec := map[string]any{}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &rec)
+	}
+	rec["adb_addr"] = addr
+	b, _ := json.MarshalIndent(rec, "", "  ")
+	return os.WriteFile(path, b, 0o600)
 }
 
 func (c *client) devices(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {

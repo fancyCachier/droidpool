@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,32 +11,6 @@ import (
 	"strings"
 	"testing"
 )
-
-func TestSessionKeySanitized(t *testing.T) {
-	cases := map[string]string{
-		"":            "",
-		"abc-123_x.y": "abc-123_x.y",
-		"a b/c\\d":    "a-b-c-d", // 要进文件名，路径分隔符与空白都不能留
-		"会话":          "--",
-	}
-	for in, want := range cases {
-		t.Setenv("DROIDPOOL_SESSION", in)
-		if got := sessionKey(); got != want {
-			t.Errorf("sessionKey(%q) = %q，期望 %q", in, got, want)
-		}
-	}
-}
-
-func TestStateFileFollowsSession(t *testing.T) {
-	t.Setenv("DROIDPOOL_SESSION", "")
-	if got := stateFile(); got != ".droidpool" {
-		t.Errorf("无会话键时状态文件应为 .droidpool，得到 %q", got)
-	}
-	t.Setenv("DROIDPOOL_SESSION", "s1")
-	if got := stateFile(); got != ".droidpool.s1" {
-		t.Errorf("有会话键时状态文件应带后缀，得到 %q", got)
-	}
-}
 
 func TestClaimWorktree(t *testing.T) {
 	if got := claimWorktree("big-boss", ""); got != "big-boss" {
@@ -239,4 +214,109 @@ func indexOfCall(calls []string, want string) int {
 		}
 	}
 	return -1
+}
+
+// 记录固定在 worktree 顶层：从子目录 claim 也写到顶层，子目录里执行别的命令读得到顶层的记录。
+// 原先落在当前目录——skill 的流程是顶层 claim 后 cd cashier-app 再 run，run 就报「先跑 droidpool claim」。
+func TestStateAnchoredAtWorktreeTop(t *testing.T) {
+	repo, _ := claimEnv(t)
+	t.Setenv("DROIDPOOL_SESSION", "")
+	sub := filepath.Join(repo, "cashier-app")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+	srv, _ := fakeClaimServer(t, false)
+
+	cmdClaim(&client{base: srv.URL, token: "t"})
+
+	if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err != nil {
+		t.Errorf("从子目录 claim，记录应写到 worktree 顶层: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sub, ".droidpool")); err == nil {
+		t.Error("子目录里不该再写一份记录")
+	}
+	if s, err := loadState(); err != nil || s.LeaseID != "L1" {
+		t.Errorf("子目录里应读得到顶层的记录：%+v %v", s, err)
+	}
+}
+
+func TestReleaseOutcome(t *testing.T) {
+	cases := []struct {
+		name            string
+		code            int
+		err             error
+		clear, ok       bool
+		msgContains     string
+		msgMustNotClaim bool // 失败时不许出现「已归还」
+	}{
+		{"成功", 200, nil, true, true, "已归还设备 n-1", false},
+		{"租约已不在", 404, errors.New("not_found"), true, true, "租约已不在", false},
+		{"服务端出错", 500, errors.New("internal: boom"), false, false, "本地记录保留", true},
+		{"连不上", 0, errors.New("dial tcp: refused"), false, false, "稍后重试", true},
+	}
+	for _, c := range cases {
+		msg, clear, ok := releaseOutcome(c.code, c.err, "n-1")
+		if clear != c.clear || ok != c.ok || !strings.Contains(msg, c.msgContains) {
+			t.Errorf("%s：msg=%q clear=%v ok=%v", c.name, msg, clear, ok)
+		}
+		if c.msgMustNotClaim && strings.Contains(msg, "已归还") {
+			t.Errorf("%s：失败时不能谎报已归还：%q", c.name, msg)
+		}
+	}
+}
+
+// fakeReleaseServer DELETE 一律回 code。
+func fakeReleaseServer(t *testing.T, code int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/api/leases/L1" {
+			t.Errorf("请求打错了地方：%s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"error":"x","message":"y"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestReleaseClearsRecordOnSuccessAndGone(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusNotFound} {
+		repo, _ := claimEnv(t)
+		t.Setenv("DROIDPOOL_SESSION", "")
+		if err := saveState(leaseState{LeaseID: "L1", DeviceID: "n-1"}); err != nil {
+			t.Fatal(err)
+		}
+		cmdRelease(&client{base: fakeReleaseServer(t, code).URL, token: "t"})
+		if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err == nil {
+			t.Errorf("HTTP %d 后本地记录应清掉", code)
+		}
+	}
+}
+
+// 失败分支会 os.Exit(1)：在子进程里跑 cmdRelease，断言退出码与记录还在。
+func TestReleaseFailureKeepsRecordAndExitsNonZero(t *testing.T) {
+	if os.Getenv("DP_RELEASE_CHILD") == "1" {
+		t.Chdir(os.Getenv("DP_REPO"))
+		cmdRelease(&client{base: os.Getenv("DP_URL"), token: "t"})
+		return
+	}
+	repo, _ := claimEnv(t)
+	t.Setenv("DROIDPOOL_SESSION", "")
+	if err := saveState(leaseState{LeaseID: "L1", DeviceID: "n-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReleaseFailureKeepsRecordAndExitsNonZero$")
+	cmd.Env = append(os.Environ(), "DP_RELEASE_CHILD=1", "DP_REPO="+repo, "DP_URL="+fakeReleaseServer(t, http.StatusInternalServerError).URL)
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Fatalf("归还失败应以退出码 1 结束，得到 %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "已归还") {
+		t.Errorf("失败时不能打印「已归还」：%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err != nil {
+		t.Errorf("归还失败应保留本地记录以便重试: %v", err)
+	}
 }
