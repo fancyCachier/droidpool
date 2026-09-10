@@ -1,5 +1,7 @@
 # 设备墙 HTTPS 与证书链路（2026-09-06）
 
+> **2026-09-10 起 TLS 改由同机 nginx 终止**，§1 的拓扑与 §2 的「换证」一行已被 §5 取代；证书的签发与推送链路不变。
+
 > 起因见 `2026-09-03-远程操作方案对比.md` §5.6.2：WebCodecs 只在安全上下文里存在，
 > `http://192.168.14.32:8600` 上的放大视图只有 3 fps 截图流。
 
@@ -75,3 +77,55 @@ ssh office-devopt 'sudo journalctl -u droidpoold --no-pager | grep -E "换用新
 | 浏览器报证书过期 | gateway 上 `acme.sh --list` 看续签时间；推送是否失败（cron 输出）；devopt `tls/` 的 mtime |
 | 推送失败 `Permission denied` | devopt `authorized_keys` 里那行 forced command 还在不在 |
 | droidpoold 起不来「HTTPS 证书」 | 配置开了 `[tls]` 但 `tls/` 没文件；deploy.sh 会先拦 |
+
+## 5. 2026-09-10 起：nginx 统一终止 TLS
+
+同机要多挂一个 HTTPS 服务（另一个域名），`:443` 不能再由 droidpoold 独占，改为：
+
+```
+浏览器 ──https──▶ nginx :443 ──按 SNI/Host──▶ droidpool.daboshi.cn → droidpoold http 127.0.0.1:8600
+                                            └▶ （同机另一个服务的域名）→ 它自己的本机端口
+agent CLI / MCP ──http──▶ 192.168.14.32:8600 ──▶ droidpoold（不变）
+```
+
+- **droidpoold 不再开 `[tls]`**（`deploy/config.toml` 已删）。`wall_url` 的跳转条件是 `r.TLS == nil`，放在反代后面恒成立、会无限重定向，所以连同 `wall_url` 一起去掉；
+  代价是直接打开 `http://192.168.14.32:8600/` 不再自动跳到 https。
+- **证书**：acme.sh 那张重签成同时覆盖 `droidpool.daboshi.cn` 与另一个域名（仍是 `droidpool.daboshi.cn_ecc`，DNS-01，同一个推送钩子），下次续签 2026-11-09。
+- **换证**：推送与接收不变（`recv-cert.sh` 仍写 `/opt/droidpool/tls/`）；由 systemd path 单元盯 `fullchain.pem`，变了就 `nginx -t && systemctl reload nginx`。
+- `droidpoold.service` 里的 `CAP_NET_BIND_SERVICE` 已用不到，留着无害。
+
+droidpool 这一段 nginx server（完整配置还含另一个服务的 server 与 :80 跳转）：
+
+```nginx
+map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name droidpool.daboshi.cn;
+    ssl_certificate     /opt/droidpool/tls/fullchain.pem;
+    ssl_certificate_key /opt/droidpool/tls/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8600;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;          # /api/devices/{id}/ws 的 H.264
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;                             # 设备墙的 SSE 与 MJPEG 截图流
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}
+```
+
+切换后实测：设备墙 8 台缩略图正常刷新；放大页 `wss://droidpool.daboshi.cn/api/devices/3588-a-1/ws` 8 秒收到 21 帧（H.264，WebCodecs 可用）；
+`http://droidpool.daboshi.cn/` 301 到 https；未知 SNI 在握手阶段被拒（`ssl_reject_handshake`）。
+
+排查（替代 §4 里 droidpoold 换证那条）：
+
+```bash
+ssh office-devopt 'systemctl status nginx-reload-cert.path; sudo journalctl -u nginx-reload-cert --no-pager | tail'
+echo | openssl s_client -connect 192.168.14.32:443 -servername droidpool.daboshi.cn 2>/dev/null | openssl x509 -noout -ext subjectAltName -dates
+```

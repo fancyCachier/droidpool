@@ -3,7 +3,8 @@
 # 作为 authorized_keys 里的 forced command 运行，对端拿不到 shell：
 #   command="/opt/droidpool/bin/recv-cert.sh",restrict ssh-ed25519 AAAA... acme-cert-deploy@office-gateway
 # 只接受一个含 fullchain.cer 与 *.key 的 tar；证书与私钥配对校验通过才落盘。
-# droidpoold 看 fullchain.pem 的 mtime 自动换证，不需要重启。
+# 2026-09-10 起证书由同机 nginx 使用：systemd path 单元盯着 fullchain.pem，一变就 nginx -t && reload。
+# （此前是 droidpoold 自己看 fullchain.pem 的 mtime 换证。两种都以 fullchain.pem 为信号，所以私钥必须先就位。）
 set -eu
 DST=${DROIDPOOL_TLS_DIR:-/opt/droidpool/tls}
 umask 077

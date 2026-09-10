@@ -276,6 +276,14 @@ a forced-command receiver next to `droidpoold`). Binding port 443 as a
 non-root user needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the systemd
 unit, which `deploy/droidpoold.service` sets.
 
+Behind a reverse proxy that terminates TLS, leave `[tls]` out entirely:
+`wall_url` redirects whenever the request itself is not TLS, which is always the
+case behind a proxy, so it would loop. Proxy everything to the http listener
+with WebSocket upgrade enabled (`/api/devices/{id}/ws` carries the video) and
+response buffering off (the wall uses server-sent events and an MJPEG
+fallback). Our own deployment has worked this way since 2026-09-10; the nginx
+server block is in `docs/2026-09-06-https-cert.md` §5.
+
 ## Development
 
 ```bash
