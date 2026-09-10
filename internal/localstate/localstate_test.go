@@ -62,7 +62,8 @@ func TestPathAnchorsAtWorktreeTop(t *testing.T) {
 }
 
 func TestPathOutsideGitStaysInDir(t *testing.T) {
-	dir := t.TempDir() // 假定临时目录不在 git 仓库里
+	dir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir)) // 临时目录恰好在某个 git 仓库里时，别让 git 往上找到它
 	t.Setenv("DROIDPOOL_SESSION", "")
 	if got := Path(dir); got != filepath.Join(dir, ".droidpool") {
 		t.Errorf("不在 git 仓库里应放在目录本身，得到 %s", got)

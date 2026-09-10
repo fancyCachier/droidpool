@@ -227,10 +227,17 @@ func (c *client) run(ctx context.Context, _ *mcp.CallToolRequest, in runIn) (*mc
 }
 
 // writeADBAddr 在本地租约记录里写入 adb 地址，保留已有字段（lease_id、device_id 等）。
+// 已有记录属于另一台设备时拒绝：拼出来的记录会让心跳打到一个租约、装包打到另一台设备。
 func writeADBAddr(path, addr string) error {
-	rec := map[string]any{}
+	var rec map[string]any
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &rec)
+	}
+	if rec == nil { // 没有记录，或内容是 null / 坏的
+		rec = map[string]any{}
+	}
+	if old, _ := rec["adb_addr"].(string); old != "" && old != addr {
+		return fmt.Errorf("%s 里已有另一台设备（%s）的租约记录：先 droidpool release，或换一个 worktree / 会话", path, old)
 	}
 	rec["adb_addr"] = addr
 	b, _ := json.MarshalIndent(rec, "", "  ")

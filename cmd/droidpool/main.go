@@ -33,7 +33,6 @@ import (
 	"github.com/fancyCachier/droidpool/internal/uiagent"
 )
 
-// stateFile 本地租约记录的路径。设了会话键就带后缀，多个会话共用一个目录时各记各的。
 // statePath 本地租约记录的位置：worktree 顶层（与幂等键同一口径），见 internal/localstate。
 func statePath() string { return localstate.Path(".") }
 
@@ -716,6 +715,10 @@ func cmdRelease(c *client) {
 	if err != nil {
 		fatal("%v", err)
 	}
+	if s.LeaseID == "" {
+		// 例如 MCP run 只写了 adb 地址：DELETE /api/leases/ 会被路由层回 404，被误当成「租约已不在」
+		fatal("本地记录里没有租约 id（%s），没法归还：到设备墙释放，或用 MCP 的 droidpool_release", statePath())
+	}
 	code, err := c.do("DELETE", "/api/leases/"+s.LeaseID, nil, nil)
 	msg, clear, ok := releaseOutcome(code, err, s.DeviceID)
 	if clear {
@@ -734,7 +737,9 @@ func releaseOutcome(code int, err error, deviceID string) (msg string, clear, ok
 	switch {
 	case err == nil:
 		return "已归还设备 " + deviceID, true, true
-	case code == http.StatusNotFound:
+	// 只认控制面业务层的 not_found：路由不匹配（地址写错、路径前缀不对）同样回 404，
+	// 那种情况设备还占着，清掉记录就再也还不了了
+	case code == http.StatusNotFound && strings.HasPrefix(err.Error(), "not_found:"):
 		return "租约已不在（已被回收或已归还），已清理本地记录", true, true
 	default:
 		return fmt.Sprintf("归还失败（本地记录保留，稍后重试 droidpool release）: %v", err), false, false

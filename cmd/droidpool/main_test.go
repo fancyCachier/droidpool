@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -251,7 +252,10 @@ func TestReleaseOutcome(t *testing.T) {
 		msgMustNotClaim bool // 失败时不许出现「已归还」
 	}{
 		{"成功", 200, nil, true, true, "已归还设备 n-1", false},
-		{"租约已不在", 404, errors.New("not_found"), true, true, "租约已不在", false},
+		// c.do 把错误拼成「<error 字段>: <message>」
+		{"租约已不在", 404, errors.New("not_found: 租约不存在或已归还"), true, true, "租约已不在", false},
+		{"路由层的 404（地址写错）", 404, errors.New(": 404 page not found"), false, false, "本地记录保留", true},
+		{"token 错", 401, errors.New("unauthorized: token 无效"), false, false, "本地记录保留", true},
 		{"服务端出错", 500, errors.New("internal: boom"), false, false, "本地记录保留", true},
 		{"连不上", 0, errors.New("dial tcp: refused"), false, false, "稍后重试", true},
 	}
@@ -266,57 +270,90 @@ func TestReleaseOutcome(t *testing.T) {
 	}
 }
 
-// fakeReleaseServer DELETE 一律回 code。
-func fakeReleaseServer(t *testing.T, code int) *httptest.Server {
+// fakeReleaseServer 按 kind 回应 DELETE，并记下收到几次：ok / gone（业务层 not_found）/ route404（路由层纯文本 404）/ 500 / 401。
+func fakeReleaseServer(t *testing.T, kind string) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
+	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
 		if r.Method != http.MethodDelete || r.URL.Path != "/api/leases/L1" {
 			t.Errorf("请求打错了地方：%s %s", r.Method, r.URL.Path)
 		}
-		w.WriteHeader(code)
-		_, _ = w.Write([]byte(`{"error":"x","message":"y"}`))
+		switch kind {
+		case "ok":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "gone":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not_found","message":"租约不存在或已归还"}`))
+		case "route404":
+			http.NotFound(w, r) // 与 Go 路由不匹配时一样：纯文本 404 page not found
+		case "401":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized","message":"token 无效"}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"internal","message":"boom"}`))
+		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, &hits
 }
 
 func TestReleaseClearsRecordOnSuccessAndGone(t *testing.T) {
-	for _, code := range []int{http.StatusOK, http.StatusNotFound} {
+	for _, kind := range []string{"ok", "gone"} {
 		repo, _ := claimEnv(t)
 		t.Setenv("DROIDPOOL_SESSION", "")
 		if err := saveState(leaseState{LeaseID: "L1", DeviceID: "n-1"}); err != nil {
 			t.Fatal(err)
 		}
-		cmdRelease(&client{base: fakeReleaseServer(t, code).URL, token: "t"})
-		if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err == nil {
-			t.Errorf("HTTP %d 后本地记录应清掉", code)
+		srv, hits := fakeReleaseServer(t, kind)
+		cmdRelease(&client{base: srv.URL, token: "t"})
+		if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err == nil || hits.Load() != 1 {
+			t.Errorf("%s：应发一次 DELETE 并清掉本地记录（hits=%d, stat err=%v）", kind, hits.Load(), err)
 		}
 	}
 }
 
-// 失败分支会 os.Exit(1)：在子进程里跑 cmdRelease，断言退出码与记录还在。
+// 失败分支会 os.Exit(1)：在子进程里跑 cmdRelease，断言退出码、记录还在、DELETE 真的发过（或该拦的没发）。
 func TestReleaseFailureKeepsRecordAndExitsNonZero(t *testing.T) {
 	if os.Getenv("DP_RELEASE_CHILD") == "1" {
 		t.Chdir(os.Getenv("DP_REPO"))
 		cmdRelease(&client{base: os.Getenv("DP_URL"), token: "t"})
 		return
 	}
-	repo, _ := claimEnv(t)
-	t.Setenv("DROIDPOOL_SESSION", "")
-	if err := saveState(leaseState{LeaseID: "L1", DeviceID: "n-1"}); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestReleaseFailureKeepsRecordAndExitsNonZero$")
-	cmd.Env = append(os.Environ(), "DP_RELEASE_CHILD=1", "DP_REPO="+repo, "DP_URL="+fakeReleaseServer(t, http.StatusInternalServerError).URL)
-	out, err := cmd.CombinedOutput()
-	var ee *exec.ExitError
-	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
-		t.Fatalf("归还失败应以退出码 1 结束，得到 %v\n%s", err, out)
-	}
-	if strings.Contains(string(out), "已归还") {
-		t.Errorf("失败时不能打印「已归还」：%s", out)
-	}
-	if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err != nil {
-		t.Errorf("归还失败应保留本地记录以便重试: %v", err)
+	for _, c := range []struct {
+		kind      string
+		leaseID   string
+		wantHits  int32
+		wantInOut string
+	}{
+		{"500", "L1", 1, "本地记录保留"},
+		{"401", "L1", 1, "本地记录保留"},
+		{"route404", "L1", 1, "本地记录保留"}, // 地址写错：不能当成「租约已不在」
+		{"ok", "", 0, "没有租约 id"},        // MCP run 只写了 adb 地址的记录：本地就拦下，不发 DELETE /api/leases/
+	} {
+		repo, _ := claimEnv(t)
+		t.Setenv("DROIDPOOL_SESSION", "")
+		if err := saveState(leaseState{LeaseID: c.leaseID, DeviceID: "n-1"}); err != nil {
+			t.Fatal(err)
+		}
+		srv, hits := fakeReleaseServer(t, c.kind)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestReleaseFailureKeepsRecordAndExitsNonZero$")
+		cmd.Env = append(os.Environ(), "DP_RELEASE_CHILD=1", "DP_REPO="+repo, "DP_URL="+srv.URL)
+		out, err := cmd.CombinedOutput()
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+			t.Errorf("%s：归还失败应以退出码 1 结束，得到 %v\n%s", c.kind, err, out)
+		}
+		if strings.Contains(string(out), "已归还") || !strings.Contains(string(out), c.wantInOut) {
+			t.Errorf("%s：输出不对（失败时不能打印「已归还」）：%s", c.kind, out)
+		}
+		if _, err := os.Stat(filepath.Join(repo, ".droidpool")); err != nil {
+			t.Errorf("%s：归还失败应保留本地记录以便重试: %v", c.kind, err)
+		}
+		if hits.Load() != c.wantHits {
+			t.Errorf("%s：DELETE 应发 %d 次，实际 %d 次", c.kind, c.wantHits, hits.Load())
+		}
 	}
 }
